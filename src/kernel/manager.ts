@@ -16,6 +16,7 @@ import { existsSync } from 'node:fs'
 import { mkdir } from 'node:fs/promises'
 import { resolve } from 'node:path'
 import { createInterface, type Interface as ReadlineInterface } from 'node:readline'
+import { fileURLToPath } from 'node:url'
 import {
   KernelCancelledError, KernelExecutionError, KernelProtocolError, KernelTimeoutError,
   ApprovalPendingError, asError,
@@ -329,7 +330,7 @@ export class KernelManager implements KernelExecutor {
     this.options = {
       pythonCommand: options.pythonCommand ?? process.env['AGENT_OS_PYTHON']
         ?? (existsSync(localPython) ? localPython : process.platform === 'win32' ? 'python' : 'python3'),
-      runnerPath: resolve(options.runnerPath ?? process.env['AGENT_OS_KERNEL_RUNNER'] ?? 'kernel/runner.py'),
+      runnerPath: resolve(options.runnerPath ?? process.env['AGENT_OS_KERNEL_RUNNER'] ?? fileURLToPath(new URL('../../../kernel/runner.py', import.meta.url))),
       homesRoot: resolve(options.homesRoot ?? process.env['AGENT_OS_HOMES_ROOT'] ?? '.agent-os/homes'),
       idleMs: options.idleMs ?? positiveInteger(process.env['AGENT_OS_KERNEL_IDLE_MS'] ?? 90 * 60_000, 'AGENT_OS_KERNEL_IDLE_MS'),
       maxKernels: options.maxKernels === undefined && process.env['AGENT_OS_MAX_KERNELS'] === undefined
