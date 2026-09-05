@@ -4,7 +4,10 @@
   "description": "LingxiOS — a purpose-built, production-grade Agent OS: durable work orchestration, sandboxed code-act kernels, and a policy-extensible agent runtime.",
   "type": "module",
   "license": "MIT",
-  "repository": "github:lyyzka/LingxiOS",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lyyzka/LingxiOS.git"
+  },
   "files": [
     "dist/src",
     "db/schema.sql",
