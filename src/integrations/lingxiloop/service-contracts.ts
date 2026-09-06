@@ -66,6 +66,7 @@ export interface NativeMessage {
   channelId: string
   channelType: number
   fromUid: string
+  timestamp?: number
   payload: { version: 1; kind: string; body?: string; replyToClientMsgNo?: string; refs?: { agentId?: unknown; handoffId?: unknown; toAgentId?: unknown }; data?: Record<string, unknown> }
 }
 
@@ -298,6 +299,14 @@ export interface LingxiLoopServices {
     getActivity(activityId: string, companyId: string, projectId: string): Promise<unknown>
   }
   advanceAgentReadReceipt?(input: { companyId: string; channelId: string; agentId: string; readThroughSeq: number }): Promise<unknown>
+  retrieveKnowledge?(input: { companyId: string; conversationId: string; authorizationUserId: string; query: string; contextQuery?: string; limit?: number }): Promise<Array<{
+    marker: string; sourceId: string; sourceTitle: string; chunkId: string; excerpt: string; sourceVersion?: string; sourceUrl?: string
+  }>>
+  publishAssistantStream?(event: {
+    type: 'assistant.stream'; companyId: string; conversationId: string; messageId: string; authorId: string; sequence: number
+    chunks: Array<Record<string, unknown>>
+  }): Promise<void>
+  setCanvasStatus?(input: { companyId: string; canvasId: string; actorId: string; actorKind: 'agent'; status: 'working' }): Promise<unknown>
   directory?: {
     getAgentCliIdentity(id: string): Promise<unknown>
     listAgentCliParticipants(actorId: string, kind: string | null): Promise<unknown[]>
@@ -358,7 +367,7 @@ export interface LingxiLoopServices {
   storage?: { readObjectBounded(key: string, maxBytes: number): Promise<Uint8Array> }
   wukongClient(): {
     syncMessages(channelId: string, channelType: number, limit: number, loginUid: string): Promise<NativeMessage[]>
-    sendMessage(channelId: string, channelType: number, fromUid: string, payload: NativeTextMessage | (Omit<NativeTextMessage, 'kind'> & { kind: 'questionnaire' | 'learning_mission' })): Promise<{ messageId: string; messageSeq: number }>
+    sendMessage(channelId: string, channelType: number, fromUid: string, payload: NativeTextMessage | (Omit<NativeTextMessage, 'kind'> & { kind: 'questionnaire' | 'learning_mission' | 'tool_activity' | 'approval' })): Promise<{ messageId: string; messageSeq: number }>
   }
   permissionService: {
     assertCan(request: {

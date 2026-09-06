@@ -38,6 +38,10 @@ import { executeMemorySynthesis } from '../../memory/synthesis.js'
 import { createSemanticMemory } from '../../memory/semantic.js'
 import type { EmbeddingOptions } from '../../model/embeddings.js'
 import type { LingxiLoopServices } from './service-contracts.js'
+import { createLingxiLoopRuntimePolicy } from './policy.js'
+import { enrichLingxiLoopContext } from './context.js'
+import { deliverLingxiLoopEvent, finishLingxiLoopStream } from './delivery.js'
+import { sweepLingxiLoopWatchdog } from './watchdog.js'
 
 export interface LingxiLoopOptions extends LingxiOSOptions {
   services: LingxiLoopServices
@@ -164,8 +168,9 @@ export async function createLingxiLoop(options: LingxiLoopOptions) {
     return row
   }
   let nextRoutineTick = 0
+  let nextWatchdogTick = 0
   const logger = createLogger()
-  const app = await assembleApp(options, {
+  const app = await assembleApp({ ...options, policy: options.policy ?? createLingxiLoopRuntimePolicy() }, {
     beforeClaim: async () => {
       await flushCalendarEvents(database, services)
       await flushDocumentEvents(database, services)
@@ -173,6 +178,11 @@ export async function createLingxiLoop(options: LingxiLoopOptions) {
         try { await reconcileCanvasWork(database, services) }
         catch { logger.warn('Canvas scheduling failed; retrying on the next worker poll') }
         await flushCanvasEvents(database, services)
+      }
+      if (Date.now() >= nextWatchdogTick) {
+        nextWatchdogTick = Date.now() + 5_000
+        try { await sweepLingxiLoopWatchdog(database, new Date(), Number(process.env['AGENT_OS_RUN_WATCHDOG_MS'] ?? 120_000), Number(process.env['AGENT_OS_RUN_WATCHDOG_GRACE_MS'] ?? 30_000)) }
+        catch { logger.warn('work watchdog failed; retrying on the next worker poll') }
       }
       if (Date.now() < nextRoutineTick) return
       nextRoutineTick = Date.now() + 30_000
@@ -207,9 +217,10 @@ export async function createLingxiLoop(options: LingxiLoopOptions) {
         if (!capabilities.includes('canvas')) throw new Error('Canvas reporter capability was revoked')
         capabilities.splice(0, capabilities.length, 'canvas')
       }
+      let productTeacherContext: Awaited<ReturnType<typeof teacherContext>> | undefined
       if (personaRow['teacher_managed']) {
-        const context = await teacherContext(work, services, database)
-        if (work.kind === 'teacher_digest') await assertTeacherDigestWork(database, work, context)
+        productTeacherContext = await teacherContext(work, services, database)
+        if (work.kind === 'teacher_digest') await assertTeacherDigestWork(database, work, productTeacherContext)
         capabilities.splice(0, capabilities.length, 'teacher')
       }
       const persona = { name: String(personaRow['name'] ?? 'Assistant'), role: String(personaRow['role'] ?? 'assistant'),
@@ -242,10 +253,21 @@ export async function createLingxiLoop(options: LingxiLoopOptions) {
       if (typeof text !== 'string') throw new Error('original request is missing')
       const memory = capabilities.includes('memory') ? await recallMemoryContext(work, services, database, semantic)
         .catch(() => ({ id: 'memory:unavailable', status: 'unavailable' as const, items: [], omitted: 0 })) : undefined
-      return { persona, capabilities, ...(memory ? { memory } : {}),
-        messages: [{ ref: work.triggerRef, authorId: work.principalId, authorName: String(work.meta?.['authorName'] ?? 'User'), authorKind: 'human', body: text, createdAt: work.createdAt ?? '' }],
-        promptContextCandidate: { version: 2, epoch: 0, assembledAt: '', systemInstructions: '', persona, capabilities, sourceVersions: { persona: JSON.stringify(persona), ...(memory ? { memory: memory.id } : {}) } },
+      let roleCompletion: boolean | undefined
+      if (work.kind === 'canvas_worker' || work.kind === 'canvas_summary') {
+        const assignmentId = work.kind === 'canvas_worker' ? work.meta?.['assignmentId'] : null
+        const role = work.kind === 'canvas_summary' ? 'reporter' : work.meta?.['executionRole']
+        const report = await database.query(`SELECT 1 FROM canvas_assignment_reports
+          WHERE company_id=$1 AND canvas_id=$2 AND assignment_id IS NOT DISTINCT FROM $3
+            AND author_agent_id=$4 AND execution_role=$5 LIMIT 1`,
+        [work.tenantId, work.meta?.['canvasId'], assignmentId, work.agentId, role])
+        roleCompletion = report.rows.length === 1
       }
+      const base = { persona, capabilities, ...(memory ? { memory } : {}), ...((roleCompletion === undefined && !productTeacherContext) ? {} : { dynamic: { ...(roleCompletion === undefined ? {} : { roleCompletion }), ...(productTeacherContext ? { teacherContext: productTeacherContext } : {}) } }),
+        messages: [{ ref: work.triggerRef, authorId: work.principalId, authorName: String(work.meta?.['authorName'] ?? 'User'), authorKind: 'human' as const, body: text, createdAt: work.createdAt ?? '' }],
+        promptContextCandidate: { version: 2 as const, epoch: 0, assembledAt: '', systemInstructions: '', persona, capabilities, sourceVersions: { persona: JSON.stringify(persona), ...(memory ? { memory: memory.id } : {}) } },
+      }
+      return enrichLingxiLoopContext(database, work, services, await binding(work.tenantId, work.sessionId, work.agentId), base)
     } },
     capabilityResolver: { resolve: async (work) => {
       await binding(work.tenantId, work.sessionId, work.agentId)
@@ -334,14 +356,20 @@ export async function createLingxiLoop(options: LingxiLoopOptions) {
       return { ok: true, value: action.action === 'calendar.update' ? await updateCalendar(database, services, work, action) : action.action.startsWith('calendar.') ? await executeCalendar(database, services, work, action) : action.action === 'documents.rename' ? await renameDocument(database, services, work, action) : action.action.startsWith('documents.') ? await executeDocument(database, services, work, action) : action.action.startsWith('teacher.') ? await executeTeacher(work, action, services, database) : action.action.startsWith('canvas.') ? await executeCanvas(work, action, services) : action.action.startsWith('learning.') ? await executeLearning(work, action, services) : action.action.startsWith('research.') ? await executeResearch(work, action, services) : action.action.startsWith('directory.') ? await executeDirectory(work, action, services) : action.action.startsWith('handoffs.') ? await executeHandoff(work, action, services) : action.action.startsWith('chat.') ? await executeChat(work, action, services, channelType) : action.action.startsWith('email.') ? await executeEmail(work, action, services) : action.action.startsWith('presentations.') ? await executePresentation(work, action, services) : action.action.startsWith('polls.') ? await executePoll(work, action, services) : await executeKnowledge(work, action, services, channelType) }
     } },
     delivery: {
-      onEvent: async () => {},
+      onEvent: async (work, event) => deliverLingxiLoopEvent(database, services, work, event, await binding(work.tenantId, work.sessionId, work.agentId)),
       deliverMessage: async (work, message) => {
+        if (work.kind === 'canvas_worker') return
+        if (work.kind === 'canvas_summary' && typeof work.meta?.['canvasId'] === 'string') {
+          const canvas = await database.query('SELECT status FROM canvases WHERE id=$1 AND company_id=$2', [work.meta['canvasId'], work.tenantId])
+          if (canvas.rows[0]?.['status'] !== 'summarizing') return
+        }
         if (!work.principalId) throw new Error('missing delivery principal')
         const channelType = await binding(work.tenantId, work.sessionId, work.agentId)
         await services.permissionService.assertCan({ actorUserId: work.principalId, companyId: work.tenantId, action: 'conversation:write', resource: { type: 'conversation', id: work.sessionId } })
         if (work.kind === 'routine') await assertRoutineWork(database, services, work)
         if (work.kind === 'mission_coordinator') await assertMissionCoordinatorWork(database, services, work)
         if (work.kind === 'teacher_digest') await assertTeacherDigestWork(database, work, await teacherContext(work, services, database))
+        await finishLingxiLoopStream(database, services, work)
         await services.wukongClient().sendMessage(work.sessionId, channelType, work.agentId, {
           version: 1, kind: 'text', clientMsgNo: `agent-${work.id}`, body: message.body,
           ...(work.threadId ? { replyToClientMsgNo: work.threadId } : {}),
