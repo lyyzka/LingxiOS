@@ -1,17 +1,19 @@
 import { snapshotEvidence } from '../src/context/evidence.js'
-import type { AssistantMessage } from '../src/protocol/types.js'
+import type { AssistantMessage, ModelItem } from '../src/protocol/types.js'
 import { createTaskContract } from '../src/context/task-contract.js'
 import assert from 'node:assert/strict'
 import { it } from 'node:test'
 import { ControlPlaneServer, ControlPlaneService } from '../src/control-plane/http-server.js'
 import { MemoryActionLedger, MemoryEventStore, MemorySessionStore, MemoryWorkStore } from '../src/control-plane/memory-store.js'
-import { HttpHostClient } from '../src/host/http-client.js'
+import { HostRequestError, HttpHostClient } from '../src/host/http-client.js'
+import { createHash } from 'node:crypto'
 
 it('preserves goal outcomes and enforces session leases over real HTTP', async () => {
   const workStore = new MemoryWorkStore()
   let resourceGranted = true
   let resourceVersion = 2
   let readbacks = 0
+  let staged = ''
   const service = new ControlPlaneService({
     work: workStore, sessions: new MemorySessionStore(), events: new MemoryEventStore(), actions: new MemoryActionLedger(),
     contextProvider: { loadContext: async () => { throw new Error('unexpected') } },
@@ -25,6 +27,7 @@ it('preserves goal outcomes and enforces session leases over real HTTP', async (
       ? { ok: false, executionState: 'unknown', error: 'lost acknowledgement' }
       : { ok: true, value: { id: 'r', version: 2, saved: true } } },
     delivery: { onEvent: async () => {}, deliverMessage: async () => {} },
+    artifactStager: { stage: async (_work, _artifact, bytes) => { staged = Buffer.from(bytes).toString('utf8') } },
   })
   const server = new ControlPlaneServer({ service, claimWork: workerId => service.claim(workerId), serviceToken: 'test-secret' })
   const port = await server.listen(0, '127.0.0.1')
@@ -45,6 +48,10 @@ it('preserves goal outcomes and enforces session leases over real HTTP', async (
     const attachment = { id: 'source', sourceVersion: 'version-1', name: 'notes.txt', mimeType: 'text/plain', size: 5, text: 'Notes' }
     await service.enqueue({ id: 'w', tenantId: 't', agentId: 'a', principalId: 'u', sessionId: 's', kind: 'turn', lane: 'interactive', triggerRef: 'm', meta: { text: 'Original', attachments: [attachment] } })
     const work = (await client.claimWork())!
+    const artifactBytes = Buffer.from('artifact')
+    await client.stageArtifact(work, { path: 'result.txt', size: artifactBytes.length, mime: 'text/plain',
+      sha256: createHash('sha256').update(artifactBytes).digest('hex') }, artifactBytes)
+    assert.equal(staged, 'artifact')
     for (const fence of ['1', true, [1], 0, 1.5]) {
       const response = await fetch(`http://127.0.0.1:${port}/v2/work/${work.id}/heartbeat`, { method: 'POST',
         headers: { authorization: 'Bearer test-secret', 'content-type': 'application/json' }, body: JSON.stringify({ fence, leaseToken: work.leaseToken }) })
@@ -53,7 +60,7 @@ it('preserves goal outcomes and enforces session leases over real HTTP', async (
     }
 
     assert.equal(await client.loadSession(work, '[\"t\",\"a\",\"s\",null]'), null)
-    const session = { key: '[\"t\",\"a\",\"s\",null]', tenantId: 't', agentId: 'a', sessionId: 's', revision: 0, compactionEpoch: 0, history: [], appliedWorkIds: [],
+    const session = { key: '[\"t\",\"a\",\"s\",null]', tenantId: 't', agentId: 'a', sessionId: 's', revision: 0, compactionEpoch: 0, history: [] as ModelItem[], appliedWorkIds: [],
       request: { version: 1 as const, workId: 'w', tenantId: 't', sessionId: 's', authorId: 'u', sourceRef: 'm', evidence: snapshotEvidence('w:evidence:1', []), attachments: [attachment], originalText: 'Original', revisions: [] } }
     const { evidence: _evidence, ...withoutEvidence } = session.request
     await assert.rejects(client.saveSession(work, { ...session, request: withoutEvidence as typeof session.request }), /invalid request evidence snapshot/)
@@ -62,9 +69,32 @@ it('preserves goal outcomes and enforces session leases over real HTTP', async (
     for (const change of [{ authorId: 'forged' }, { sourceRef: 'other' }, { originalText: 'Replaced' }]) {
       await assert.rejects(client.saveSession(work, { ...session, request: { ...session.request, ...change } }), /invalid session/)
     }
+    const staleCopy = structuredClone(session)
     await client.saveSession(work, session)
+    await assert.rejects(client.saveSession(work, { ...staleCopy, history: [{ role: 'user', content: 'different' }] }),
+      (error: unknown) => error instanceof HostRequestError && error.responseCode === 'session_conflict')
+    let droppedSaveResponse = false
+    const retryClient = new HttpHostClient({
+      baseUrl: `http://127.0.0.1:${port}`, serviceToken: 'test-secret', workerId: 'worker', retryBaseMs: 1,
+      fetchImpl: async (url, init) => {
+        const response = await fetch(url, init)
+        if (!droppedSaveResponse && init?.method === 'PUT') {
+          droppedSaveResponse = true
+          await response.text()
+          throw new TypeError('simulated lost response')
+        }
+        return response
+      },
+    })
+    session.history.push({ role: 'user', content: 'checkpoint' })
+    await retryClient.saveSession(work, session)
+    assert.equal(session.revision, 2)
     const businessAction = { runId: work.id, cellId: 'business', callIndex: 0, idempotencyKey: JSON.stringify([work.id, 'business', 0]), action: 'resource.write', args: {} }
     await client.executeAction(work, businessAction)
+    assert.deepEqual(await client.recoverCell(work, 'business'), [{
+      action: 'resource.write', idempotencyKey: businessAction.idempotencyKey,
+      result: { ok: true, value: { id: 'r', version: 2, saved: true } },
+    }])
     let checkIndex = 0
     const checkReceipt = (args: Record<string, unknown>) => {
       const cellId = `check-${checkIndex++}`
@@ -170,7 +200,8 @@ it('preserves goal outcomes and enforces session leases over real HTTP', async (
     await service.enqueue({ id: 'cancelled', tenantId: 't', agentId: 'a', sessionId: 's', kind: 'turn', lane: 'interactive', triggerRef: 'm2' })
     const cancelled = (await client.claimWork())!
     assert.equal(await service.requestCancel(cancelled.id), true)
-    await assert.rejects(client.completeWork(cancelled, { status: 'completed' }), /lease lost/)
+    await assert.rejects(client.completeWork(cancelled, { status: 'completed' }),
+      (error: unknown) => error instanceof HostRequestError && error.responseCode === 'work_state_conflict')
     await assert.rejects(client.commitMessage(cancelled, { version: 2, runId: cancelled.id, agentId: 'a', sessionId: 's', body: 'Must not be delivered' } as AssistantMessage), /cancelled/)
     await client.completeWork(cancelled, { status: 'cancelled' })
     assert.equal(workStore.inspect(cancelled.id)?.status, 'cancelled')

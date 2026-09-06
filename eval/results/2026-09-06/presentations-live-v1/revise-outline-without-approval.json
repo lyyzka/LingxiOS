@@ -1,0 +1,61 @@
+{
+  "caseId": "revise-outline-without-approval",
+  "checks": [
+    {
+      "id": "single_tool_call",
+      "status": "pass"
+    },
+    {
+      "id": "expected_method",
+      "status": "pass"
+    },
+    {
+      "id": "required_arguments",
+      "status": "pass"
+    },
+    {
+      "id": "forbidden_actions",
+      "status": "pass"
+    }
+  ],
+  "failures": [],
+  "model": "deepseek-ai/DeepSeek-V4-Flash",
+  "usage": {
+    "available": true,
+    "inputTokens": 572,
+    "outputTokens": 247
+  },
+  "diagnostics": {
+    "finishReasons": [
+      "tool_calls"
+    ]
+  },
+  "output": [
+    {
+      "role": "assistant",
+      "content": "我来为您把 deck-42 的大纲调整为 10 页并加强风险分析。当前大纲修订号为 3，我将以此为基础进行修订。\n\n"
+    },
+    {
+      "type": "function_call",
+      "callId": "01a075d511919138404c84a4763a9295",
+      "name": "ipython",
+      "arguments": "{\"code\": \"result = host.presentations.revise_outline(\\n    presentationId=\\\"deck-42\\\",\\n    expectedRevision=3,\\n    targetSlideCount=10,\\n    feedback=\\\"将大纲调整为10页，并大幅加强风险分析部分：增加风险识别、风险概率与影响评估、风险应对策略、残余风险与监控机制等内容。\\\"\\n)\\nprint(result)\"}"
+    }
+  ],
+  "code": "result = host.presentations.revise_outline(\n    presentationId=\"deck-42\",\n    expectedRevision=3,\n    targetSlideCount=10,\n    feedback=\"将大纲调整为10页，并大幅加强风险分析部分：增加风险识别、风险概率与影响评估、风险应对策略、残余风险与监控机制等内容。\"\n)\nprint(result)",
+  "review": {
+    "kind": "model_review",
+    "calibration": "not_calibrated",
+    "inputSha256": "660ebc63ae0070c8771080450db5873fa546c77a72a9c6f145746df20935629e",
+    "model": "deepseek-ai/DeepSeek-V4-Flash",
+    "verdict": "meets_rubric",
+    "rationale": "The answer calls host.presentations.revise_outline with presentationId=\"deck-42\", expectedRevision=3, targetSlideCount=10, and feedback explicitly requesting stronger risk analysis (风险识别、概率与影响评估、应对策略、残余风险与监控). It does not call approve_outline, so it satisfies the requirement not to approve the outline.",
+    "usage": {
+      "available": true,
+      "inputTokens": 447,
+      "outputTokens": 407
+    },
+    "durationMs": 2871
+  },
+  "durationMs": 4596
+}

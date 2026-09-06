@@ -3,17 +3,20 @@
  * and runtime together from environment configuration, then run until
  * SIGINT/SIGTERM drains the process.
  */
-import { loadWorkerConfig } from '../config.js'
+import { boolEnv, loadWorkerConfig } from '../config.js'
 import { HttpHostClient } from '../host/http-client.js'
-import { KernelManager } from '../kernel/manager.js'
+import { KernelManager, type KernelHostBridge, type ManagedKernelExecutor } from '../kernel/manager.js'
 import { createLogger } from '../logging.js'
 import { MetricsRegistry } from '../metrics.js'
 import { OpenAIChatDriver } from '../model/openai.js'
 import { AgentRuntime } from '../runtime/runtime.js'
 import { AgentWorker } from './worker.js'
 import { memorySynthesisProcessor, memoryIndexProcessor } from '../memory/processor.js'
+import { ConfigError } from '../errors.js'
 
-export async function startWorker(env: NodeJS.ProcessEnv = process.env): Promise<AgentWorker> {
+export async function startWorker(env: NodeJS.ProcessEnv = process.env, options: {
+  kernelFactory?: (bridge: KernelHostBridge) => ManagedKernelExecutor
+} = {}): Promise<AgentWorker> {
   const config = loadWorkerConfig(env)
   const logger = createLogger().child({ service: 'agent-os-worker' })
   const metrics = new MetricsRegistry()
@@ -28,10 +31,13 @@ export async function startWorker(env: NodeJS.ProcessEnv = process.env): Promise
     baseUrl: config.model.baseUrl,
     reasoningEffort: config.model.reasoningEffort,
   })
-  const kernels = new KernelManager(
-    { execute: (work, action) => host.executeAction(work, action) },
-    { logger, maxKernels: config.maxConcurrentRuns },
-    env,
+  const bridge: KernelHostBridge = { execute: (work, action) => host.executeAction(work, action) }
+  if (!options.kernelFactory && env['NODE_ENV'] === 'production'
+    && !boolEnv('AGENT_OS_TRUST_PROCESS_KERNEL', false, env)) {
+    throw new ConfigError('production worker requires an OS-isolated kernelFactory; set AGENT_OS_TRUST_PROCESS_KERNEL=true only for trusted model code')
+  }
+  const kernels = options.kernelFactory?.(bridge) ?? new KernelManager(
+    bridge, { logger, maxKernels: config.maxConcurrentRuns }, env,
   )
   const runtime = new AgentRuntime(host, model, kernels, { logger })
   runtime.registerProcessor('memory_synthesis', memorySynthesisProcessor)
@@ -63,3 +69,4 @@ export async function startWorker(env: NodeJS.ProcessEnv = process.env): Promise
 }
 
 export type { AgentWorker } from './worker.js'
+export type { KernelExecutor, ManagedKernelExecutor, KernelHostBridge } from '../kernel/manager.js'

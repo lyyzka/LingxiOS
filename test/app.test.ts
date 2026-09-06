@@ -194,7 +194,7 @@ it('assembles the public app through HTTP model and Python, persisting results a
     const remoteWorker = await startWorker({ ...process.env, AGENT_OS_CONTROL_PLANE_URL: `http://127.0.0.1:${controlPort}`,
       AGENT_OS_SERVICE_TOKEN: 'test-worker-secret', AGENT_OS_WORKER_ID: 'remote-worker', AGENT_OS_WORKER_PORT: '0',
       AGENT_OS_MODEL: 'test', AGENT_OS_MODEL_API_KEY: 'test', AGENT_OS_MODEL_BASE_URL: options.model.baseUrl,
-      AGENT_OS_HOMES_ROOT: options.kernel.homesRoot, AGENT_OS_POLL_IDLE_MS: '50', AGENT_OS_MAX_CONCURRENT_RUNS: '1' })
+      AGENT_OS_HOMES_ROOT: join(directory, 'remote-worker-homes'), AGENT_OS_POLL_IDLE_MS: '50', AGENT_OS_MAX_CONCURRENT_RUNS: '1' })
     try {
       const deadline = Date.now() + 10000
       while (!(await app.readMessage(remoteIdentity)) && Date.now() < deadline) await delay(25)

@@ -69,6 +69,7 @@ export class MemoryWorkStore implements WorkStore {
   private readonly routes = new Map<string, SessionRoute>()
   private readonly sessionLeases = new Map<string, SessionLease>()
   private readonly workerLastSeen = new Map<string, number>()
+  private readonly claims = new Map<string, { workerId: string; work: WorkItem | null }>()
   private readonly leaseTtlMs: number
   private readonly workerTimeoutMs: number
 
@@ -131,7 +132,15 @@ export class MemoryWorkStore implements WorkStore {
     return seen !== undefined && now - seen < this.workerTimeoutMs
   }
 
-  async claim(workerId: string): Promise<WorkItem | null> {
+  async claim(workerId: string, requestId?: string): Promise<WorkItem | null> {
+    if (requestId) {
+      const prior = this.claims.get(requestId)
+      if (prior) {
+        if (prior.workerId !== workerId) throw new Error('claim request identity reused by another worker')
+        return structuredClone(prior.work)
+      }
+      if (this.claims.size >= 10_000) this.claims.delete(this.claims.keys().next().value!)
+    }
     const now = this.now()
     this.workerLastSeen.set(workerId, now)
     for (const [key, lease] of this.sessionLeases) {
@@ -155,7 +164,10 @@ export class MemoryWorkStore implements WorkStore {
         || (b.priority - a.priority)
         || (Date.parse(a.createdAt) - Date.parse(b.createdAt)))
     const row = candidates[0]
-    if (!row) return null
+    if (!row) {
+      if (requestId) this.claims.set(requestId, { workerId, work: null })
+      return null
+    }
 
     const sessionKey = this.sessionKey(row)
     const existingRoute = this.routes.get(sessionKey)
@@ -179,7 +191,9 @@ export class MemoryWorkStore implements WorkStore {
     row.leaseExpiresAt = now + this.leaseTtlMs
     row.attempts += 1
     this.sessionLeases.set(sessionKey, { workId: row.id, fence: row.fence, expiresAt: now + this.leaseTtlMs })
-    return this.toWorkItem(row, token, homeEpoch)
+    const work = this.toWorkItem(row, token, homeEpoch)
+    if (requestId) this.claims.set(requestId, { workerId, work: structuredClone(work) })
+    return work
   }
 
   private toWorkItem(row: WorkRow, leaseToken: string, homeEpoch?: number): WorkItem {
@@ -371,7 +385,7 @@ export class MemoryActionLedger implements ActionLedgerStore {
   async hasWait(workId: string, requestVersion: number, wait: { approvalId: string } | { question: string }): Promise<boolean> {
     for (const [key, intent] of this.intentDetails) {
       if (intent.workId !== workId || intent.requestVersion !== requestVersion) continue
-      const result = this.results.get(key)
+      const result = this.effectiveResult(key)
       if (!result || result.executionState === 'unknown') continue
       if ('approvalId' in wait ? result.approval?.status === 'PENDING' && result.approval.id === wait.approvalId
         : intent.action.action === 'task.ask' && result.ok && result.directive?.type === 'defer'
@@ -383,7 +397,7 @@ export class MemoryActionLedger implements ActionLedgerStore {
     const pending: Array<{ actionKey: string; action: string; state: 'unknown' | 'awaiting_approval' }> = []
     for (const [actionKey, intent] of this.intentDetails) {
       if (intent.workId !== workId || intent.action.action.startsWith('task.')) continue
-      const result = this.results.get(actionKey)
+      const result = this.effectiveResult(actionKey)
       const state = result?.approval?.status === 'PENDING' ? 'awaiting_approval' : !result || result.executionState === 'unknown' ? 'unknown' : undefined
       if (state) pending.push({ actionKey, action: intent.action.action, state })
       if (pending.length === 65) break
@@ -393,6 +407,12 @@ export class MemoryActionLedger implements ActionLedgerStore {
   private readonly results = new Map<string, HostActionResult>()
   private readonly intents = new Map<string, string>()
   private readonly intentDetails = new Map<string, ActionIntent>()
+  private readonly resolutions = new Map<string, import('./stores.js').ActionResolution[]>()
+  private readonly resolutionIds = new Map<string, import('./stores.js').ActionResolution>()
+
+  private effectiveResult(key: string): HostActionResult | undefined {
+    return this.resolutions.get(key)?.at(-1)?.result ?? this.results.get(key)
+  }
 
   async reserve(idempotencyKey: string, fingerprint: string, intent: ActionIntent): Promise<'started' | 'existing'> {
     if (!intent || intent.action?.idempotencyKey !== idempotencyKey) throw new Error('action intent is required and must match its key')
@@ -411,8 +431,16 @@ export class MemoryActionLedger implements ActionLedgerStore {
   }
 
   async find(idempotencyKey: string): Promise<HostActionResult | null> {
-    const stored = this.results.get(idempotencyKey)
+    const stored = this.effectiveResult(idempotencyKey)
     return stored ? structuredClone(stored) : null
+  }
+
+  async listCell(workId: string, cellId: string, requestVersion: number | null) {
+    return [...this.intentDetails.entries()]
+      .filter(([, intent]) => intent.workId === workId && intent.action.cellId === cellId
+        && intent.requestVersion === requestVersion)
+      .sort(([, left], [, right]) => left.action.callIndex - right.action.callIndex)
+      .map(([key, intent]) => ({ intent: structuredClone(intent), result: structuredClone(this.effectiveResult(key) ?? null) }))
   }
 
   async record(idempotencyKey: string, result: HostActionResult): Promise<HostActionResult> {
@@ -421,5 +449,18 @@ export class MemoryActionLedger implements ActionLedgerStore {
     if (existing) return structuredClone(existing)
     this.results.set(idempotencyKey, structuredClone(result))
     return result
+  }
+
+  async recordResolution(resolution: import('./stores.js').ActionResolution): Promise<'recorded' | 'existing'> {
+    if (!this.intents.has(resolution.actionKey)) throw new Error('action intent is required before reconciliation')
+    const prior = this.resolutionIds.get(resolution.id)
+    if (prior) {
+      if (!isDeepStrictEqual(prior, resolution)) throw new Error('resolution identity reused with different evidence')
+      return 'existing'
+    }
+    const saved = structuredClone(resolution)
+    this.resolutionIds.set(saved.id, saved)
+    this.resolutions.set(saved.actionKey, [...(this.resolutions.get(saved.actionKey) ?? []), saved])
+    return 'recorded'
   }
 }

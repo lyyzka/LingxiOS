@@ -21,6 +21,14 @@ export interface HostPort {
   /** Execute one host action under the work's lease and capability grant. */
   executeAction(work: WorkItem, action: HostAction): Promise<HostActionResult>
 
+  /** Rebuild durable host-action observations for an interrupted Python cell. */
+  recoverCell?(work: WorkItem, cellId: string): Promise<Array<{
+    action: string; idempotencyKey: string; result: HostActionResult
+  }> | null>
+
+  /** Upload checked artifact bytes when worker and control plane do not share a filesystem. */
+  stageArtifact?(work: WorkItem, artifact: import('../protocol/types.js').KernelArtifact, bytes: Uint8Array): Promise<void>
+
   /** Append one durable run event (also drives user-visible streaming). */
   emitEvent(work: WorkItem, event: RunEvent): Promise<void>
 

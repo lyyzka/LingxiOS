@@ -120,13 +120,9 @@ export class DefaultRuntimePolicy implements RuntimePolicy {
   }
 
   validateAssistantText(text: string): string | null {
-    if (/<\/?(?:think|thinking|analysis|reasoning|tool_call|function)>/i.test(text)) {
-      return 'hidden reasoning or tool markup is not user-visible content'
-    }
-    const sdkPattern = new RegExp(`\\b(?:from|import)\\s+${KERNEL_SDK_MODULE}\\b|\\b${KERNEL_SDK_MODULE}\\.[a-z_]+\\.[a-z_]+\\(`, 'i')
-    if (sdkPattern.test(text) || /```[^`]*\bipython\b/i.test(text)) {
-      return 'SDK or tool code must be executed through ipython, never shown to the user'
-    }
+    // Visible answer text is data. Tool calls and private reasoning are
+    // separated structurally by the model protocol, not guessed from words.
+    void text
     return null
   }
 

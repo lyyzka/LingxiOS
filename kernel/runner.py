@@ -47,6 +47,25 @@ ROOT.mkdir(parents=True, exist_ok=True)
 os.chdir(ROOT)
 
 
+class OutputBudget:
+    def __init__(self, limit: int):
+        self.remaining = limit
+        self.truncated = False
+
+
+class BoundedTextIO(io.StringIO):
+    def __init__(self, budget: OutputBudget):
+        super().__init__()
+        self.budget = budget
+
+    def write(self, value: str) -> int:
+        accepted = value[:self.budget.remaining]
+        self.budget.remaining -= len(accepted)
+        self.budget.truncated |= len(accepted) < len(value)
+        super().write(accepted)
+        return len(value)
+
+
 # ---------------------------------------------------------------------------
 # Wire helpers
 # ---------------------------------------------------------------------------
@@ -429,8 +448,9 @@ def execute(message: dict[str, Any]) -> None:
     code = str(message["code"])
     bridge.begin(execution_id, message.get("context") or {})
     attached_files.clear()
-    stdout = io.StringIO()
-    stderr = io.StringIO()
+    output_budget = OutputBudget(MAX_STREAM_CHARS)
+    stdout = BoundedTextIO(output_budget)
+    stderr = BoundedTextIO(output_budget)
     started = time.monotonic()
     files_before = file_snapshot()
     result_value: Any = None
@@ -451,12 +471,7 @@ def execute(message: dict[str, Any]) -> None:
 
     out = stdout.getvalue()
     err = stderr.getvalue()
-    truncated = len(out) + len(err) > MAX_STREAM_CHARS
-    if truncated:
-        remaining = MAX_STREAM_CHARS
-        out = out[:remaining]
-        remaining -= len(out)
-        err = err[: max(0, remaining)]
+    truncated = output_budget.truncated
     try:
         artifacts = changed_artifacts(files_before)
     except (OSError, ValueError) as exc:

@@ -1,0 +1,57 @@
+{
+  "caseId": "create-deck-from-sources",
+  "checks": [
+    {
+      "id": "single_tool_call",
+      "status": "pass"
+    },
+    {
+      "id": "expected_method",
+      "status": "pass"
+    },
+    {
+      "id": "required_arguments",
+      "status": "pass"
+    },
+    {
+      "id": "forbidden_actions",
+      "status": "pass"
+    }
+  ],
+  "failures": [],
+  "model": "deepseek-ai/DeepSeek-V4-Flash",
+  "usage": {
+    "available": true,
+    "inputTokens": 573,
+    "outputTokens": 195
+  },
+  "diagnostics": {
+    "finishReasons": [
+      "tool_calls"
+    ]
+  },
+  "output": [
+    {
+      "type": "function_call",
+      "callId": "01a075d4fee7c1f8563f438853055fde",
+      "name": "ipython",
+      "arguments": "{\"code\": \"host.presentations.create(\\n    requirements=\\\"Create an 8-page English sales enablement deck titled 'Q3 Sales Brief'. Base the content on the two knowledge sources: source-sales-q3 and source-roadmap. The deck should be tailored for the sales team for Q3.\\\",\\n    title=\\\"Q3 Sales Brief\\\",\\n    sourceIds=[\\\"source-sales-q3\\\", \\\"source-roadmap\\\"],\\n    targetSlideCount=8,\\n    language=\\\"en\\\",\\n)\"}"
+    }
+  ],
+  "code": "host.presentations.create(\n    requirements=\"Create an 8-page English sales enablement deck titled 'Q3 Sales Brief'. Base the content on the two knowledge sources: source-sales-q3 and source-roadmap. The deck should be tailored for the sales team for Q3.\",\n    title=\"Q3 Sales Brief\",\n    sourceIds=[\"source-sales-q3\", \"source-roadmap\"],\n    targetSlideCount=8,\n    language=\"en\",\n)",
+  "review": {
+    "kind": "model_review",
+    "calibration": "not_calibrated",
+    "inputSha256": "5ff04afab35b82854088000bd446a636b9c99e95f0689371505e517362b94ca7",
+    "model": "deepseek-ai/DeepSeek-V4-Flash",
+    "verdict": "meets_rubric",
+    "rationale": "The answer invokes host.presentations.create with the required title \"Q3 Sales Brief\", both specified sourceIds (source-sales-q3 and source-roadmap), targetSlideCount=8, language=\"en\", and an English sales-enablement requirement. It does not omit either source and does not claim async generation has completed.",
+    "usage": {
+      "available": true,
+      "inputTokens": 466,
+      "outputTokens": 280
+    },
+    "durationMs": 3260
+  },
+  "durationMs": 4872
+}

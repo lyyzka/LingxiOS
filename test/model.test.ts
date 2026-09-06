@@ -34,6 +34,16 @@ function driver(delta: unknown, finishReason: string | null = 'stop') {
   })
 }
 
+it('does not send provider-specific reasoning settings unless configured', async () => {
+  const model = new OpenAIChatDriver('compatible-model', { apiKey: 'test', fetchImpl: async (_url, init) => {
+    const body = JSON.parse(String(init?.body))
+    assert.equal(body.reasoning_effort, undefined)
+    assert.equal(body.enable_thinking, undefined)
+    return new Response('data: {"choices":[{"delta":{"content":"answer"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n')
+  } })
+  await model.run({ instructions: '', items: [] })
+})
+
 it('keeps incremental text and rejects truncated or unfinished streams', async () => {
   const deltas: string[] = []
   const result = await driver({ content: 'hello' }).run({ instructions: '', items: [], onTextDelta: (text) => deltas.push(text) })

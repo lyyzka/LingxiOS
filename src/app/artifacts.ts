@@ -42,28 +42,45 @@ async function checkedFile(root: string, directory: string, filename: string, ar
   } finally { await handle.close() }
 }
 
+async function storeArtifactBytes(root: string, directory: string, artifact: KernelArtifact, bytes: Uint8Array) {
+  if (bytes.length !== artifact.size || createHash('sha256').update(bytes).digest('hex') !== artifact.sha256.toLowerCase()) {
+    throw new Error('artifact content does not match its commitment')
+  }
+  await mkdir(directory, { recursive: true, mode: 0o700 })
+  if (await realpath(directory) !== directory) throw new Error('artifact storage must not traverse directory links')
+  const destination = resolve(directory, artifact.sha256.toLowerCase())
+  try { await checkedFile(root, directory, artifact.sha256.toLowerCase(), artifact); return }
+  catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error }
+  const temporary = resolve(directory, randomUUID())
+  const handle = await open(temporary, 'wx', 0o600)
+  try {
+    await handle.writeFile(bytes)
+    await handle.sync()
+    await handle.close()
+    try { await link(temporary, destination) }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error }
+    await checkedFile(root, directory, artifact.sha256.toLowerCase(), artifact)
+  } finally { await handle.close(); await unlink(temporary) }
+}
+
+export async function stageArtifact(homesRoot: string, work: Omit<WorkItem, 'leaseToken'>,
+  artifact: KernelArtifact, bytes: Uint8Array) {
+  if (artifact.size > 16 * 1024 * 1024) throw new Error('artifact exceeds the 16 MiB limit')
+  await mkdir(homesRoot, { recursive: true, mode: 0o700 })
+  const root = await realpath(homesRoot)
+  await storeArtifactBytes(root, artifactDirectory(root, { ...work, runId: work.id }), artifact, bytes)
+}
+
 export async function persistArtifacts(homesRoot: string, work: Omit<WorkItem, 'leaseToken'>, message: AssistantMessage) {
   const artifacts = snapshotArtifacts(message.envelope.artifacts)
   if (!artifacts.length) return
   const root = await realpath(homesRoot)
   const directory = artifactDirectory(root, { ...work, runId: work.id })
-  await mkdir(directory, { recursive: true, mode: 0o700 })
-  if (await realpath(directory) !== directory) throw new Error('artifact storage must not traverse directory links')
   for (const artifact of artifacts) {
-    const destination = resolve(directory, artifact.sha256.toLowerCase())
     try { await checkedFile(root, directory, artifact.sha256.toLowerCase(), artifact); continue }
     catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error }
     const { bytes } = await checkedFile(root, kernelHome(root, work), artifact.path, artifact)
-    const temporary = resolve(directory, randomUUID())
-    const handle = await open(temporary, 'wx', 0o600)
-    try {
-      await handle.writeFile(bytes)
-      await handle.sync()
-      await handle.close()
-      try { await link(temporary, destination) }
-      catch (error) { if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error }
-      await checkedFile(root, directory, artifact.sha256.toLowerCase(), artifact)
-    } finally { await handle.close(); await unlink(temporary) }
+    await storeArtifactBytes(root, directory, artifact, bytes)
   }
 }
 

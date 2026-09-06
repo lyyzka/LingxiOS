@@ -13,8 +13,8 @@
 import { type ChildProcessWithoutNullStreams, spawn } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
 import { existsSync } from 'node:fs'
-import { mkdir } from 'node:fs/promises'
-import { resolve } from 'node:path'
+import { lstat, mkdir, readFile, stat } from 'node:fs/promises'
+import { isAbsolute, relative, resolve } from 'node:path'
 import { createInterface, type Interface as ReadlineInterface } from 'node:readline'
 import { fileURLToPath } from 'node:url'
 import {
@@ -44,6 +44,13 @@ export interface KernelExecutor {
     work: WorkItem, runId: string, cellId: string, code: string,
     signal?: AbortSignal, options?: KernelExecutionOptions,
   ): Promise<KernelExecution>
+  /** Read a checked artifact for transfer to a separate control plane. */
+  readArtifact?(work: WorkItem, artifact: import('../protocol/types.js').KernelArtifact): Promise<Uint8Array>
+}
+
+export interface ManagedKernelExecutor extends KernelExecutor {
+  readonly size: number
+  close(): void
 }
 
 export interface KernelManagerOptions {
@@ -53,6 +60,8 @@ export interface KernelManagerOptions {
   idleMs?: number
   maxKernels?: number
   executionTimeoutMs?: number
+  startupTimeoutMs?: number
+  hostActionTimeoutMs?: number
   maxOutputChars?: number
   allowNetwork?: boolean
   logger?: Logger
@@ -137,7 +146,27 @@ class PersistentKernel {
         `kernel ${this.key} exited (${code ?? signal ?? 'unknown'})${stderrTail ? `: ${stderrTail}` : ''}`,
       ))
     })
-    return this.ready
+    const timer = setTimeout(() => this.terminate(
+      new KernelProtocolError(`kernel ${this.key} did not become ready within ${this.options.startupTimeoutMs}ms`), 'SIGKILL',
+    ), this.options.startupTimeoutMs)
+    timer.unref?.()
+    return this.ready.finally(() => clearTimeout(timer))
+  }
+
+  private async startForExecution(signal: AbortSignal | undefined, cellId: string): Promise<void> {
+    if (!signal) return this.start()
+    let abort!: () => void
+    const cancelled = new Promise<never>((_resolve, reject) => {
+      abort = () => {
+        const error = new KernelCancelledError(cellId)
+        this.terminate(error, 'SIGKILL')
+        reject(error)
+      }
+      if (signal.aborted) abort()
+      else signal.addEventListener('abort', abort, { once: true })
+    })
+    try { await Promise.race([this.start(), cancelled]) }
+    finally { signal.removeEventListener('abort', abort) }
   }
 
   private write(message: ManagerToKernel): void {
@@ -218,10 +247,19 @@ class PersistentKernel {
       return
     }
     let result: HostActionResult
+    let hostTimer: NodeJS.Timeout | undefined
     try {
-      result = await this.bridge.execute(pending.work, action)
+      const deadline = new Promise<never>((_resolve, reject) => {
+        hostTimer = setTimeout(() => reject(new Error(
+          `host action exceeded ${this.options.hostActionTimeoutMs}ms; outcome requires reconciliation`,
+        )), this.options.hostActionTimeoutMs)
+        hostTimer.unref?.()
+      })
+      result = await Promise.race([this.bridge.execute(pending.work, action), deadline])
     } catch (error) {
-      result = { ok: false, error: asError(error).message }
+      result = { ok: false, executionState: 'unknown', error: asError(error).message }
+    } finally {
+      if (hostTimer) clearTimeout(hostTimer)
     }
     try {
       await pending.options?.onHostAction?.({ stage: 'completed', action, result })
@@ -240,7 +278,7 @@ class PersistentKernel {
     this.queued++
     const operation = this.tail.then(async () => {
       signal?.throwIfAborted()
-      await this.start()
+      await this.startForExecution(signal, cellId)
       this.lastUsedAt = Date.now()
       const executionId = randomUUID()
       return await new Promise<KernelExecution>((resolveExecution, rejectExecution) => {
@@ -323,7 +361,8 @@ export function kernelHome(homesRoot: string, work: Pick<WorkItem, 'tenantId' | 
     segment(JSON.stringify([work.sessionId, work.threadId ?? null])), `epoch-${work.homeEpoch}`)
 }
 
-export class KernelManager implements KernelExecutor {
+/** Trusted/local process backend. Use a ManagedKernelExecutor with OS isolation for untrusted production code. */
+export class KernelManager implements ManagedKernelExecutor {
   private readonly kernels = new Map<string, PersistentKernel>()
   private readonly options: Required<Omit<KernelManagerOptions, 'logger'>>
   private readonly logger: Logger
@@ -344,6 +383,8 @@ export class KernelManager implements KernelExecutor {
         ? Number.POSITIVE_INFINITY
         : positiveInteger(options.maxKernels ?? env['AGENT_OS_MAX_KERNELS']!, 'AGENT_OS_MAX_KERNELS'),
       executionTimeoutMs: options.executionTimeoutMs ?? 120_000,
+      startupTimeoutMs: options.startupTimeoutMs ?? 30_000,
+      hostActionTimeoutMs: options.hostActionTimeoutMs ?? 30_000,
       maxOutputChars: options.maxOutputChars ?? 8_000,
       allowNetwork: options.allowNetwork ?? false,
     }
@@ -357,6 +398,26 @@ export class KernelManager implements KernelExecutor {
 
   /** Identifiers are data, never path components: hash every segment. */
   private homeOf(work: WorkItem): string { return kernelHome(this.options.homesRoot, work) }
+
+  async readArtifact(work: WorkItem, artifact: import('../protocol/types.js').KernelArtifact): Promise<Uint8Array> {
+    if (artifact.size > 16 * 1024 * 1024) throw new Error('artifact exceeds the 16 MiB transfer limit')
+    const home = this.homeOf(work)
+    const target = resolve(home, artifact.path)
+    const path = relative(home, target)
+    if (!path || path === '..' || path.startsWith('../') || path.startsWith('..\\') || isAbsolute(path)) {
+      throw new Error('artifact is outside its kernel home')
+    }
+    if ((await lstat(target)).isSymbolicLink()) throw new Error('artifact links cannot be transferred')
+    const before = await stat(target)
+    if (!before.isFile() || before.size !== artifact.size) throw new Error('artifact changed before transfer')
+    const bytes = await readFile(target)
+    const after = await stat(target)
+    if (after.size !== before.size || after.mtimeMs !== before.mtimeMs
+      || createHash('sha256').update(bytes).digest('hex') !== artifact.sha256.toLowerCase()) {
+      throw new Error('artifact changed during transfer')
+    }
+    return bytes
+  }
 
   private evictLeastRecentlyUsedIdle(): boolean {
     let candidate: [string, PersistentKernel] | undefined

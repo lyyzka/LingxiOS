@@ -7,6 +7,7 @@
  * seq, actions dedupe on idempotency key). Lease-invalid responses (409) are
  * surfaced as {@link LeaseLostError} so the runtime can stop cleanly.
  */
+import { randomUUID } from 'node:crypto'
 import { AgentOSError, LeaseLostError, errorMessage } from '../errors.js'
 import type {
   AssistantMessage, HeartbeatResult, HostAction, HostActionResult,
@@ -26,7 +27,7 @@ export interface HttpHostClientOptions {
 }
 
 export class HostRequestError extends AgentOSError {
-  constructor(readonly status: number, message: string) {
+  constructor(readonly status: number, message: string, readonly responseCode?: string) {
     super('host_request', message)
   }
 }
@@ -77,17 +78,19 @@ export class HttpHostClient implements HostPort {
       if (response.ok) return await response.json() as T
       const detail = await response.text().catch(() => '')
       let message = detail
+      let responseCode: string | undefined
       try {
-        const parsed = JSON.parse(detail) as { error?: unknown }
+        const parsed = JSON.parse(detail) as { error?: unknown; code?: unknown }
         if (typeof parsed.error === 'string') message = parsed.error
+        if (typeof parsed.code === 'string') responseCode = parsed.code
       } catch { /* plain-text error body */ }
-      if (response.status === 409) throw new LeaseLostError(message || 'lease rejected by control plane')
+      if (responseCode === 'lease_lost') throw new LeaseLostError(message || 'lease rejected by control plane')
       if (response.status >= 500 && attempt < this.maxAttempts) {
         lastError = new HostRequestError(response.status, message)
         await this.sleep(this.retryBaseMs * 2 ** (attempt - 1))
         continue
       }
-      throw new HostRequestError(response.status, message || `control plane returned ${response.status}`)
+      throw new HostRequestError(response.status, message || `control plane returned ${response.status}`, responseCode)
     }
     throw new HostRequestError(0, `control plane unreachable after ${this.maxAttempts} attempts: ${errorMessage(lastError)}`)
   }
@@ -97,7 +100,9 @@ export class HttpHostClient implements HostPort {
   }
 
   async claimWork(signal?: AbortSignal): Promise<WorkItem | null> {
-    return this.request<WorkItem | null>('POST', '/v2/work/claim', { workerId: this.options.workerId }, signal)
+    return this.request<WorkItem | null>('POST', '/v2/work/claim', {
+      workerId: this.options.workerId, requestId: randomUUID(),
+    }, signal)
   }
 
   async heartbeat(work: WorkItem): Promise<HeartbeatResult> {
@@ -115,6 +120,17 @@ export class HttpHostClient implements HostPort {
   async executeAction(work: WorkItem, action: HostAction): Promise<HostActionResult> {
     return this.request<HostActionResult>('POST', `/v2/work/${encodeURIComponent(work.id)}/actions`, {
       ...this.proof(work), action,
+    })
+  }
+
+  async recoverCell(work: WorkItem, cellId: string) {
+    return this.request<Array<{ action: string; idempotencyKey: string; result: HostActionResult }> | null>(
+      'POST', `/v2/work/${encodeURIComponent(work.id)}/reconcile`, { ...this.proof(work), cellId })
+  }
+
+  async stageArtifact(work: WorkItem, artifact: import('../protocol/types.js').KernelArtifact, bytes: Uint8Array): Promise<void> {
+    await this.request('POST', `/v2/work/${encodeURIComponent(work.id)}/artifacts`, {
+      ...this.proof(work), artifact, contentBase64: Buffer.from(bytes).toString('base64'),
     })
   }
 

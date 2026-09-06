@@ -49,6 +49,6 @@ The default model is `deepseek-ai/DeepSeek-V4-Flash` at SiliconFlow, with `reaso
 
 Goal status is separate from worker lifecycle. `satisfied` records the model's requirement assessment; it is not independent proof of correctness. Unknown actions, missing receipts and known resource failures prevent a satisfied result. Input/approval waits retain the same request and version. Committed files are hashed snapshots; recovering an interrupted worker does not blindly repeat unknown effects.
 
-Python execution needs deployment isolation suitable for your trust model; Python-level guards are not an OS security boundary. Committed artifacts currently require shared persistent filesystem storage and are limited to 16 MiB each.
+Python execution needs deployment isolation suitable for your trust model; Python-level guards are not an OS security boundary. Production rejects the process kernel by default: inject an OS-isolated `kernelFactory`, or explicitly opt into trusted model code. Remote workers upload hash-checked artifacts to the control plane, so their workspace does not need to share a filesystem; artifacts are limited to 16 MiB each.
 
 See [runtime API and deployment details](docs/packaged-runtime.md). `npm test` includes standalone tarball installation. `npm run check:release` also requires isolated PostgreSQL fixtures and the native LingxiLoop reference checkout; it does not deploy a product or contact real email recipients.

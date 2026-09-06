@@ -77,6 +77,7 @@ export class CapabilityDeniedError extends AgentOSError {
 // Model ---------------------------------------------------------------------
 
 export interface ModelDiagnostics {
+  kind?: 'provider' | 'protocol'
   status?: number
   finishReasons: string[]
   requestId?: string

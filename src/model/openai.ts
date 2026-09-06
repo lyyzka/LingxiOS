@@ -43,7 +43,7 @@ const IPYTHON_TOOL = {
   function: {
     name: IPYTHON_TOOL_NAME,
     description:
-      'Execute Python in this session\'s persistent sandboxed kernel. Product capabilities are '
+      'Execute Python in this session\'s persistent guarded kernel. Product capabilities are '
       + 'available as host.<namespace>.<method>(keyword=value, ...). Strict JSON arguments with '
       + 'exactly one non-empty "code" string.',
     parameters: {
@@ -186,7 +186,8 @@ export class OpenAIChatDriver implements ModelDriver {
             'content-type': 'application/json',
             authorization: `Bearer ${this.options.apiKey}`,
           },
-          body: JSON.stringify({ max_tokens: this.maxOutputTokens, reasoning_effort: this.options.reasoningEffort ?? DEFAULT_MODEL.reasoningEffort,
+          body: JSON.stringify({ max_tokens: this.maxOutputTokens,
+            ...(this.options.reasoningEffort ? { reasoning_effort: this.options.reasoningEffort } : {}),
             ...(this.modelId === DEFAULT_MODEL.id ? { enable_thinking: true } : {}), ...body }),
           signal: combined,
         })
@@ -246,7 +247,7 @@ export class OpenAIChatDriver implements ModelDriver {
       try {
         chunk = JSON.parse(data)
       } catch {
-        throw new ModelDriverError('model stream contained invalid JSON', { finishReasons: accumulator.finishReasons })
+        throw new ModelDriverError('model stream contained invalid JSON', { kind: 'provider', finishReasons: accumulator.finishReasons })
       }
       if (chunk.model) accumulator.model = chunk.model
       if (chunk.usage) accumulator.usage = chunk.usage
@@ -293,13 +294,13 @@ export class OpenAIChatDriver implements ModelDriver {
     }, request.signal)
     const accumulator = await this.consumeStream(response, request.onTextDelta)
     if (!accumulator.finishReasons.length || accumulator.finishReasons.some(reason => reason !== 'stop' && reason !== 'tool_calls')) {
-      throw new ModelDriverError('model stream did not finish normally', { finishReasons: accumulator.finishReasons })
+      throw new ModelDriverError('model stream did not finish normally', { kind: 'provider', finishReasons: accumulator.finishReasons })
     }
     const output: ModelItem[] = []
     const text = accumulator.text
     if (text.trim()) output.push({ role: 'assistant', content: text })
     for (const [, call] of [...accumulator.toolCalls.entries()].sort(([a], [b]) => a - b)) {
-      if (!call.id.trim() || call.name !== IPYTHON_TOOL_NAME) throw new ModelDriverError('model returned an invalid tool identity', { finishReasons: accumulator.finishReasons })
+      if (!call.id.trim() || call.name !== IPYTHON_TOOL_NAME) throw new ModelDriverError('model returned an invalid tool identity', { kind: 'protocol', finishReasons: accumulator.finishReasons })
       output.push({
         type: 'function_call',
         callId: call.id,
@@ -309,7 +310,7 @@ export class OpenAIChatDriver implements ModelDriver {
     }
     if (output.length === 0) {
       throw new ModelDriverError('model returned neither assistant text nor a tool call', {
-        finishReasons: accumulator.finishReasons,
+        kind: 'protocol', finishReasons: accumulator.finishReasons,
       })
     }
     const result: ModelTurnResult = { output, text, usage: this.usageOf(accumulator) }

@@ -1,6 +1,6 @@
 /** First-release public API: assembled runtime and stable data contracts. */
 export { releaseVersions } from './versions.js'
-export { createLingxiOS, type LingxiOSOptions, type RequestInput, type MessageIdentity } from './app/index.js'
+export { createLingxiOS, type LingxiOSOptions, type RequestInput, type MessageIdentity, type ActionResolutionInput } from './app/index.js'
 export { packageResources } from './app/resources.js'
 export { doctor, type DoctorCheck } from './app/doctor.js'
 export { ConfigError } from './errors.js'
@@ -15,3 +15,4 @@ export type { GoalAssessment } from './outcome/assessment.js'
 export { DEFAULT_MODEL } from './model/openai.js'
 export type { InputContinuation } from './app/input.js'
 export type { SqlPool, SqlClient, SqlQueryable } from './control-plane/pg-store.js'
+export type { KernelExecutor, ManagedKernelExecutor, KernelHostBridge } from './kernel/manager.js'

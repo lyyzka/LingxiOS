@@ -1,0 +1,57 @@
+{
+  "caseId": "create-deck-from-sources",
+  "checks": [
+    {
+      "id": "bounded_tool_loop",
+      "status": "pass"
+    },
+    {
+      "id": "expected_method",
+      "status": "pass"
+    },
+    {
+      "id": "required_arguments",
+      "status": "pass"
+    },
+    {
+      "id": "forbidden_actions",
+      "status": "pass"
+    }
+  ],
+  "failures": [],
+  "model": "deepseek-ai/DeepSeek-V4-Flash",
+  "diagnostics": {
+    "finishReasons": [
+      "tool_calls"
+    ]
+  },
+  "usage": {
+    "available": true,
+    "inputTokens": 573,
+    "outputTokens": 233
+  },
+  "output": [
+    {
+      "type": "function_call",
+      "callId": "01a075d72772e368a96b3f30adee1e1c",
+      "name": "ipython",
+      "arguments": "{\"code\": \"result = host.presentations.create(\\n    requirements=\\\"Create an English sales enablement deck titled 'Q3 Sales Brief'. It should be based on the knowledge base sources source-sales-q3 and source-roadmap, covering key Q3 sales messaging, product roadmap highlights, positioning, and actionable enablement takeaways for the sales team. Target 8 slides, professional and concise.\\\",\\n    title=\\\"Q3 Sales Brief\\\",\\n    sourceIds=[\\\"source-sales-q3\\\", \\\"source-roadmap\\\"],\\n    targetSlideCount=8,\\n    language=\\\"en\\\"\\n)\\nprint(result)\"}"
+    }
+  ],
+  "code": "result = host.presentations.create(\n    requirements=\"Create an English sales enablement deck titled 'Q3 Sales Brief'. It should be based on the knowledge base sources source-sales-q3 and source-roadmap, covering key Q3 sales messaging, product roadmap highlights, positioning, and actionable enablement takeaways for the sales team. Target 8 slides, professional and concise.\",\n    title=\"Q3 Sales Brief\",\n    sourceIds=[\"source-sales-q3\", \"source-roadmap\"],\n    targetSlideCount=8,\n    language=\"en\"\n)\nprint(result)",
+  "review": {
+    "kind": "model_review",
+    "calibration": "not_calibrated",
+    "inputSha256": "fc48de26afd79e33e82450b5b1be9dda630057a612f2ee1522399f42c7c4d68e",
+    "model": "deepseek-ai/DeepSeek-V4-Flash",
+    "verdict": "meets_rubric",
+    "rationale": "The answer calls host.presentations.create with the required title 'Q3 Sales Brief', the two specified sourceIds 'source-sales-q3' and 'source-roadmap', targetSlideCount=8, language='en', and an explicit English-language requirement in the request. It includes all rubric-required parameters and does not omit either source. It also does not claim that asynchronous generation has already completed; it only invokes the API and prints the result object. Therefore it meets the rubric.",
+    "usage": {
+      "available": true,
+      "inputTokens": 488,
+      "outputTokens": 333
+    },
+    "durationMs": 2947
+  },
+  "durationMs": 4743
+}

@@ -14,7 +14,7 @@ import { ControlPlaneError, ControlPlaneService, type LeaseProof } from './servi
 
 export interface ControlPlaneServerOptions {
   service: ControlPlaneService
-  claimWork: (workerId: string) => Promise<import('../protocol/types.js').WorkItem | null>
+  claimWork: (workerId: string, requestId?: string) => Promise<import('../protocol/types.js').WorkItem | null>
   serviceToken: string
   logger?: Logger
   metrics?: MetricsRegistry
@@ -73,7 +73,7 @@ export class ControlPlaneServer {
     this.server = http.createServer((req, res) => {
       void this.handle(req, res).catch((error: unknown) => {
         if (error instanceof ControlPlaneError) {
-          json(res, error.status, { error: error.message })
+          json(res, error.status, { error: error.message, ...(error.code ? { code: error.code } : {}) })
           return
         }
         this.logger.error('control-plane request failed', { url: req.url, error })
@@ -112,7 +112,7 @@ export class ControlPlaneServer {
       return
     }
 
-    const maxBody = this.options.maxBodyBytes ?? 8 * 1024 * 1024
+    const maxBody = path.endsWith('/artifacts') ? 24 * 1024 * 1024 : this.options.maxBodyBytes ?? 8 * 1024 * 1024
     const parsed = method === 'GET' ? {} : await readBody(req, maxBody)
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new ControlPlaneError(400, 'request body must be a JSON object')
     const body = parsed as Record<string, unknown>
@@ -123,7 +123,11 @@ export class ControlPlaneServer {
       return
     }
     if (method === 'POST' && path === '/v2/work/claim') {
-      json(res, 200, await this.options.claimWork(stringField(body, 'workerId')))
+      if (body['requestId'] !== undefined && typeof body['requestId'] !== 'string') {
+        throw new ControlPlaneError(400, 'requestId must be a string')
+      }
+      json(res, 200, await this.options.claimWork(stringField(body, 'workerId'),
+        typeof body['requestId'] === 'string' ? body['requestId'] : undefined))
       return
     }
 
@@ -151,6 +155,11 @@ export class ControlPlaneServer {
             await service.yieldWork(proof); json(res, 200, { ok: true }); return
           case 'actions':
             json(res, 200, await service.executeAction(proof, body['action'] as never)); return
+          case 'reconcile':
+            json(res, 200, await service.recoverCell(proof, stringField(body, 'cellId'))); return
+          case 'artifacts':
+            await service.stageArtifact(proof, body['artifact'] as never, stringField(body, 'contentBase64'))
+            json(res, 200, { ok: true }); return
           case 'events':
             await service.recordEvent(proof, body['event'] as RunEvent); json(res, 200, { ok: true }); return
           case 'messages':

@@ -74,13 +74,17 @@ export async function compactIfNeeded(
   if (session.history.length <= options.keepTailItems) return { compacted: false }
 
   let boundary = session.history.length - options.keepTailItems
-  // Keep every call with its output, including cells adjacent to the cut.
+  // Close the kept suffix over tool pairs. Moving the boundary can expose
+  // another output, so scan again until the boundary stops moving.
   for (let index = boundary; index < session.history.length; index++) {
     const item = session.history[index]!
     if ('type' in item && item.type === 'function_call_output') {
       const callIndex = session.history.findIndex((candidate) =>
         'type' in candidate && candidate.type === 'function_call' && candidate.callId === item.callId)
-      if (callIndex >= 0) boundary = Math.min(boundary, callIndex)
+      if (callIndex >= 0 && callIndex < boundary) {
+        boundary = callIndex
+        index = boundary - 1
+      }
     }
   }
   if (boundary === 0) return { compacted: false }

@@ -76,6 +76,22 @@ describe('compactIfNeeded', () => {
     await compactIfNeeded(s, '', driver, { ...DEFAULT_COMPACTION, contextWindowTokens: 100, keepTailItems: 2 })
     assert.deepEqual(s.history, [summaryItem('new summary'), ...history.slice(-3)])
   })
+
+  it('closes a moved boundary over newly included tool results', async () => {
+    const history: ModelItem[] = [
+      { type: 'function_call', callId: 'a', name: 'ipython', arguments: '{}' },
+      { type: 'function_call', callId: 'b', name: 'ipython', arguments: '{}' },
+      { type: 'function_call_output', callId: 'a', output: 'a' },
+      { type: 'function_call_output', callId: 'b', output: 'b' },
+      ...longHistory(19),
+    ]
+    const s = session(history)
+    const outcome = await compactIfNeeded(s, '', fakeDriver(), {
+      ...DEFAULT_COMPACTION, contextWindowTokens: 100, keepTailItems: 20,
+    })
+    assert.equal(outcome.compacted, false)
+    assert.deepEqual(s.history, history)
+  })
   const smallOptions = {
     ...DEFAULT_COMPACTION,
     contextWindowTokens: 1_000,

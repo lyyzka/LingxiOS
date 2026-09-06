@@ -7,12 +7,13 @@
  * the schema lives in `db/schema.sql`.
  */
 import { createHash, randomBytes, randomUUID } from 'node:crypto'
+import { isDeepStrictEqual } from 'node:util'
 import { sessionKeyOf } from '../protocol/types.js'
 import type {
   HostActionResult, SessionRecord, WorkCompletion, WorkItem,
 } from '../protocol/types.js'
 import type {
-  ActionIntent, ActionLedgerStore, EnqueueResult, EnqueueWorkInput, EventStore, HeartbeatRow,
+  ActionIntent, ActionLedgerStore, ActionResolution, EnqueueResult, EnqueueWorkInput, EventStore, HeartbeatRow,
   LeasedWork, SaveSessionResult, SessionStore, StoredRunEvent, WorkStore, WorkStoreOptions,
 } from './stores.js'
 
@@ -117,8 +118,29 @@ export class PgWorkStore implements WorkStore {
     return { id, deduplicated: rows.length === 0 }
   }
 
-  async claim(workerId: string): Promise<WorkItem | null> {
+  async claim(workerId: string, requestId?: string): Promise<WorkItem | null> {
     return withTransaction(this.pool, async (client) => {
+      if (requestId) {
+        // ponytail: seven-day dedupe window bounds storage; use partitioned retention if claim volume demands it.
+        await client.query(`DELETE FROM lingxios.agent_claim_requests
+          WHERE completed=TRUE AND created_at<NOW()-INTERVAL '7 days'`)
+        const inserted = await client.query(
+          `INSERT INTO lingxios.agent_claim_requests (request_id, worker_id)
+           VALUES ($1,$2) ON CONFLICT (request_id) DO NOTHING RETURNING request_id`, [requestId, workerId])
+        if (!inserted.rows[0]) {
+          const prior = await client.query(
+            `SELECT worker_id, completed, response FROM lingxios.agent_claim_requests
+              WHERE request_id=$1 FOR UPDATE`, [requestId])
+          if (prior.rows[0]?.['worker_id'] !== workerId) throw new Error('claim request identity reused by another worker')
+          if (prior.rows[0]?.['completed']) return prior.rows[0]['response'] as WorkItem | null
+        }
+      }
+      const finish = async (work: WorkItem | null) => {
+        if (requestId) await client.query(
+          `UPDATE lingxios.agent_claim_requests SET completed=TRUE, response=$2::jsonb
+            WHERE request_id=$1`, [requestId, JSON.stringify(work)])
+        return work
+      }
       await client.query(
         `INSERT INTO lingxios.agent_os_workers (worker_id, last_seen_at, updated_at) VALUES ($1, NOW(), NOW())
          ON CONFLICT (worker_id) DO UPDATE SET last_seen_at = NOW(), updated_at = NOW()`,
@@ -151,7 +173,7 @@ export class PgWorkStore implements WorkStore {
         [workerId, this.workerTimeoutSeconds],
       )
       const row = rows[0]
-      if (!row) return null
+      if (!row) return finish(null)
       const sessionKey = sessionKeyOf({ tenantId: String(row['tenant_id']), agentId: String(row['agent_id']), sessionId: String(row['session_id']), ...(row['thread_id'] === null ? {} : { threadId: String(row['thread_id']) }) })
       const { rows: routes } = await client.query(
         `INSERT INTO lingxios.agent_os_session_routes (session_key, worker_id, home_epoch, updated_at)
@@ -170,7 +192,7 @@ export class PgWorkStore implements WorkStore {
          RETURNING home_epoch`,
         [sessionKey, workerId, this.workerTimeoutSeconds],
       )
-      if (!routes[0]) return null
+      if (!routes[0]) return finish(null)
       const proposedFence = Number(row['fence']) + 1
       const { rows: sessionLease } = await client.query(
         `INSERT INTO lingxios.agent_os_session_leases (session_key, work_id, fence, expires_at)
@@ -178,7 +200,7 @@ export class PgWorkStore implements WorkStore {
          ON CONFLICT (session_key) DO NOTHING RETURNING session_key`,
         [sessionKey, row['id'], proposedFence, this.leaseTtlSeconds],
       )
-      if (!sessionLease[0]) return null
+      if (!sessionLease[0]) return finish(null)
       const token = randomBytes(32).toString('base64url')
       const { rows: claimed } = await client.query(
         `UPDATE lingxios.agent_work_items
@@ -189,7 +211,7 @@ export class PgWorkStore implements WorkStore {
           RETURNING *`,
         [row['id'], hashToken(token), workerId, this.leaseTtlSeconds],
       )
-      return workItemFromRow(claimed[0]!, token, Number(routes[0]['home_epoch']))
+      return finish(workItemFromRow(claimed[0]!, token, Number(routes[0]['home_epoch'])))
     })
   }
 
@@ -327,7 +349,7 @@ export class PgSessionStore implements SessionStore {
       agentId: String(row['agent_id']),
       sessionId: String(row['session_id']),
       ...(row['thread_id'] !== null ? { threadId: String(row['thread_id']) } : {}),
-      ...(row['summary'] ? { summary: String(row['summary']) } : {}),
+      ...(row['summary'] !== null ? { summary: String(row['summary']) } : {}),
       ...(row['request_snapshot'] ? { request: row['request_snapshot'] as NonNullable<SessionRecord['request']> } : {}),
       history: row['history'] as SessionRecord['history'],
       appliedWorkIds: (row['applied_work_ids'] ?? []) as string[],
@@ -337,18 +359,22 @@ export class PgSessionStore implements SessionStore {
     }
   }
 
-  async save(session: SessionRecord): Promise<SaveSessionResult> {
+  async save(session: SessionRecord, proof?: import('./stores.js').StoreLeaseProof): Promise<SaveSessionResult> {
     if (session.revision > 0) {
       const { rows } = await this.pool.query(
         `UPDATE lingxios.agent_os_sessions
             SET summary=$3, history=$4::jsonb, applied_work_ids=$5::jsonb,
                 compaction_epoch=$6, prompt_context=$7::jsonb, request_snapshot=$8::jsonb,
                 revision=revision+1, updated_at=NOW()
-          WHERE session_key=$1 AND revision=$2 RETURNING revision`,
+          WHERE session_key=$1 AND revision=$2
+            AND ($9::text IS NULL OR EXISTS (SELECT 1 FROM lingxios.agent_work_items
+              WHERE id=$9 AND fence=$10 AND lease_token_hash=$11 AND status='leased' AND lease_expires_at>NOW()))
+          RETURNING revision`,
         [session.key, session.revision, session.summary ?? null, JSON.stringify(session.history),
           JSON.stringify(session.appliedWorkIds), session.compactionEpoch,
           session.promptContext ? JSON.stringify(session.promptContext) : null,
-          session.request ? JSON.stringify(session.request) : null],
+          session.request ? JSON.stringify(session.request) : null,
+          proof?.workId ?? null, proof?.fence ?? null, proof?.leaseTokenHash ?? null],
       )
       return rows[0] ? { ok: true, revision: Number(rows[0]['revision']) } : { ok: false, conflict: true }
     }
@@ -357,14 +383,16 @@ export class PgSessionStore implements SessionStore {
          (session_key, tenant_id, agent_id, session_id, thread_id, summary, history,
           applied_work_ids, revision, compaction_epoch, prompt_context, request_snapshot, updated_at)
        SELECT $1,$2,$3,$4,$5,$6,$7::jsonb,$8::jsonb,1,$10,$11::jsonb,$12::jsonb,NOW()
-        WHERE $9 = 0
+        WHERE $9 = 0 AND ($13::text IS NULL OR EXISTS (SELECT 1 FROM lingxios.agent_work_items
+          WHERE id=$13 AND fence=$14 AND lease_token_hash=$15 AND status='leased' AND lease_expires_at>NOW()))
        ON CONFLICT (session_key) DO NOTHING
        RETURNING revision`,
       [session.key, session.tenantId, session.agentId, session.sessionId, session.threadId ?? null,
         session.summary ?? null, JSON.stringify(session.history), JSON.stringify(session.appliedWorkIds),
         session.revision, session.compactionEpoch,
         session.promptContext ? JSON.stringify(session.promptContext) : null,
-        session.request ? JSON.stringify(session.request) : null],
+        session.request ? JSON.stringify(session.request) : null,
+        proof?.workId ?? null, proof?.fence ?? null, proof?.leaseTokenHash ?? null],
     )
     if (!rows[0]) return { ok: false, conflict: true }
     return { ok: true, revision: Number(rows[0]['revision']) }
@@ -374,13 +402,16 @@ export class PgSessionStore implements SessionStore {
 export class PgEventStore implements EventStore {
   constructor(private readonly pool: SqlPool) {}
 
-  async append(event: StoredRunEvent): Promise<boolean> {
+  async append(event: StoredRunEvent, proof?: import('./stores.js').StoreLeaseProof): Promise<boolean> {
     const { rows } = await this.pool.query(
       `INSERT INTO lingxios.agent_run_events (run_id, seq, tenant_id, agent_id, kind, stage, visibility, data, recorded_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9)
+       SELECT $1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9
+        WHERE $10::text IS NULL OR EXISTS (SELECT 1 FROM lingxios.agent_work_items
+          WHERE id=$10 AND fence=$11 AND lease_token_hash=$12 AND status='leased' AND lease_expires_at>NOW())
        ON CONFLICT (run_id, seq) DO NOTHING RETURNING run_id`,
       [event.runId, event.seq, event.tenantId, event.agentId, event.kind, event.stage,
-        event.visibility, JSON.stringify(event.data), event.recordedAt],
+        event.visibility, JSON.stringify(event.data), event.recordedAt,
+        proof?.workId ?? null, proof?.fence ?? null, proof?.leaseTokenHash ?? null],
     )
     return rows.length > 0
   }
@@ -412,24 +443,31 @@ export class PgActionLedger implements ActionLedgerStore {
 
   async hasWait(workId: string, requestVersion: number, wait: { approvalId: string } | { question: string }): Promise<boolean> {
     const { rows } = await this.pool.query(`SELECT i.idempotency_key FROM lingxios.agent_action_intents i
-      JOIN lingxios.agent_action_ledger r USING(idempotency_key)
+      LEFT JOIN lingxios.agent_action_ledger r USING(idempotency_key)
+      LEFT JOIN LATERAL (SELECT resolution->'result' AS result FROM lingxios.agent_action_resolutions
+        WHERE idempotency_key=i.idempotency_key ORDER BY resolution_seq DESC LIMIT 1) rr ON TRUE
       WHERE i.intent->>'workId'=$1 AND i.intent->'requestVersion'=$2::jsonb
-        AND COALESCE(r.result->>'executionState','')<>'unknown'
-        AND CASE WHEN $3::text IS NOT NULL THEN r.result->'approval'->>'status'='PENDING' AND r.result->'approval'->>'id'=$3
-          ELSE i.intent->'action'->>'action'='task.ask' AND r.result->>'ok'='true'
-            AND r.result->'directive'->>'type'='defer' AND r.result->'directive'->>'reason'='user'
-            AND r.result->'directive'->'data'->>'question'=$4::text END LIMIT 1`,
+        AND COALESCE(rr.result,r.result) IS NOT NULL
+        AND COALESCE(COALESCE(rr.result,r.result)->>'executionState','')<>'unknown'
+        AND CASE WHEN $3::text IS NOT NULL THEN COALESCE(rr.result,r.result)->'approval'->>'status'='PENDING' AND COALESCE(rr.result,r.result)->'approval'->>'id'=$3
+          ELSE i.intent->'action'->>'action'='task.ask' AND COALESCE(rr.result,r.result)->>'ok'='true'
+            AND COALESCE(rr.result,r.result)->'directive'->>'type'='defer' AND COALESCE(rr.result,r.result)->'directive'->>'reason'='user'
+            AND COALESCE(rr.result,r.result)->'directive'->'data'->>'question'=$4::text END LIMIT 1`,
     [workId, JSON.stringify(requestVersion), 'approvalId' in wait ? wait.approvalId : null, 'question' in wait ? wait.question : null])
     return rows.length === 1
   }
 
   async unsettled(workId: string): Promise<Array<{ actionKey: string; action: string; state: 'unknown' | 'awaiting_approval' }>> {
-    const { rows } = await this.pool.query(`SELECT i.idempotency_key,i.intent->'action'->>'action' AS action,
-      CASE WHEN r.result->'approval'->>'status'='PENDING' THEN 'awaiting_approval' ELSE 'unknown' END AS state
+    const { rows } = await this.pool.query(`WITH actions AS (
+      SELECT i.idempotency_key,i.intent,COALESCE(rr.result,r.result) AS result
       FROM lingxios.agent_action_intents i LEFT JOIN lingxios.agent_action_ledger r USING(idempotency_key)
-      WHERE i.intent->>'workId'=$1 AND i.intent->'action'->>'action' NOT LIKE 'task.%'
-        AND (r.idempotency_key IS NULL OR r.result->>'executionState'='unknown' OR r.result->'approval'->>'status'='PENDING')
-      ORDER BY i.idempotency_key LIMIT 65`, [workId])
+      LEFT JOIN LATERAL (SELECT resolution->'result' AS result FROM lingxios.agent_action_resolutions
+        WHERE idempotency_key=i.idempotency_key ORDER BY resolution_seq DESC LIMIT 1) rr ON TRUE)
+      SELECT idempotency_key,intent->'action'->>'action' AS action,
+        CASE WHEN result->'approval'->>'status'='PENDING' THEN 'awaiting_approval' ELSE 'unknown' END AS state
+      FROM actions WHERE intent->>'workId'=$1 AND intent->'action'->>'action' NOT LIKE 'task.%'
+        AND (result IS NULL OR result->>'executionState'='unknown' OR result->'approval'->>'status'='PENDING')
+      ORDER BY idempotency_key LIMIT 65`, [workId])
     return rows.map(row => ({ actionKey: String(row['idempotency_key']), action: String(row['action']), state: row['state'] as 'unknown' | 'awaiting_approval' }))
   }
 
@@ -455,9 +493,28 @@ export class PgActionLedger implements ActionLedgerStore {
 
   async find(idempotencyKey: string): Promise<HostActionResult | null> {
     const { rows } = await this.pool.query(
-      `SELECT result FROM lingxios.agent_action_ledger WHERE idempotency_key = $1`, [idempotencyKey],
+      `SELECT COALESCE((SELECT resolution->'result' FROM lingxios.agent_action_resolutions
+          WHERE idempotency_key=$1 ORDER BY resolution_seq DESC LIMIT 1),
+        (SELECT result FROM lingxios.agent_action_ledger WHERE idempotency_key=$1)) AS result`, [idempotencyKey],
     )
     return rows[0] ? rows[0]['result'] as HostActionResult : null
+  }
+
+  async listCell(workId: string, cellId: string, requestVersion: number | null) {
+    const { rows } = await this.pool.query(
+      `SELECT i.intent, COALESCE(rr.result,r.result) AS result FROM lingxios.agent_action_intents i
+       LEFT JOIN lingxios.agent_action_ledger r USING(idempotency_key)
+       LEFT JOIN LATERAL (SELECT resolution->'result' AS result FROM lingxios.agent_action_resolutions
+         WHERE idempotency_key=i.idempotency_key ORDER BY resolution_seq DESC LIMIT 1) rr ON TRUE
+       WHERE i.intent->>'workId'=$1 AND i.intent->'action'->>'cellId'=$2
+         AND i.intent->'requestVersion' IS NOT DISTINCT FROM $3::jsonb
+       ORDER BY (i.intent->'action'->>'callIndex')::integer`,
+      [workId, cellId, requestVersion === null ? null : JSON.stringify(requestVersion)],
+    )
+    return rows.map(row => ({
+      intent: row['intent'] as ActionIntent,
+      result: row['result'] as HostActionResult | null ?? null,
+    }))
   }
 
   async record(idempotencyKey: string, result: HostActionResult): Promise<HostActionResult> {
@@ -469,5 +526,20 @@ export class PgActionLedger implements ActionLedgerStore {
     if (rows[0]) return result
     const existing = await this.find(idempotencyKey)
     return existing ?? result
+  }
+
+  async recordResolution(resolution: ActionResolution): Promise<'recorded' | 'existing'> {
+    const { rows } = await this.pool.query(
+      `INSERT INTO lingxios.agent_action_resolutions (resolution_id,idempotency_key,resolution)
+       VALUES ($1,$2,$3::jsonb) ON CONFLICT (resolution_id) DO NOTHING RETURNING resolution_id`,
+      [resolution.id, resolution.actionKey, JSON.stringify(resolution)],
+    )
+    if (rows[0]) return 'recorded'
+    const prior = await this.pool.query(
+      `SELECT resolution FROM lingxios.agent_action_resolutions WHERE resolution_id=$1`, [resolution.id])
+    if (!isDeepStrictEqual(prior.rows[0]?.['resolution'], resolution)) {
+      throw new Error('resolution identity reused with different evidence')
+    }
+    return 'existing'
   }
 }

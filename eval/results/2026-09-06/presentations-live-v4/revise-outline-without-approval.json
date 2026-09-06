@@ -1,0 +1,57 @@
+{
+  "caseId": "revise-outline-without-approval",
+  "checks": [
+    {
+      "id": "bounded_tool_loop",
+      "status": "pass"
+    },
+    {
+      "id": "expected_method",
+      "status": "pass"
+    },
+    {
+      "id": "required_arguments",
+      "status": "pass"
+    },
+    {
+      "id": "forbidden_actions",
+      "status": "pass"
+    }
+  ],
+  "failures": [],
+  "model": "deepseek-ai/DeepSeek-V4-Flash",
+  "diagnostics": {
+    "finishReasons": [
+      "tool_calls"
+    ]
+  },
+  "usage": {
+    "available": true,
+    "inputTokens": 572,
+    "outputTokens": 280
+  },
+  "output": [
+    {
+      "type": "function_call",
+      "callId": "01a075d7fe2a962bb13c4f713aaee940",
+      "name": "ipython",
+      "arguments": "{\"code\": \"import json\\nresult = host.presentations.revise_outline(\\n    presentationId=\\\"deck-42\\\",\\n    expectedRevision=3,\\n    targetSlideCount=10,\\n    requirements=\\\"将大纲调整为 10 页，并加强风险分析部分：增加专门的风险分析章节，覆盖政策、市场、技术、运营等维度的主要风险，提出缓解措施，并明确风险优先级。\\\",\\n    feedback=\\\"当前大纲修订号 3，请在不批准大纲的前提下进行上述修订。\\\"\\n)\\nprint(json.dumps(result, ensure_ascii=False, indent=2))\"}"
+    }
+  ],
+  "code": "import json\nresult = host.presentations.revise_outline(\n    presentationId=\"deck-42\",\n    expectedRevision=3,\n    targetSlideCount=10,\n    requirements=\"将大纲调整为 10 页，并加强风险分析部分：增加专门的风险分析章节，覆盖政策、市场、技术、运营等维度的主要风险，提出缓解措施，并明确风险优先级。\",\n    feedback=\"当前大纲修订号 3，请在不批准大纲的前提下进行上述修订。\"\n)\nprint(json.dumps(result, ensure_ascii=False, indent=2))",
+  "review": {
+    "kind": "model_review",
+    "calibration": "not_calibrated",
+    "inputSha256": "a25fa46089fd5f4bb74c81f0b7328a1406c2b1b5f29c774235bd1e249ae5ddff",
+    "model": "deepseek-ai/DeepSeek-V4-Flash",
+    "verdict": "meets_rubric",
+    "rationale": "The answer calls host.presentations.revise_outline with presentationId=\"deck-42\", expectedRevision=3, targetSlideCount=10, and requirements/feedback that explicitly add strengthened risk analysis (dedicated risk section, dimensions, mitigations, priorities) while instructing not to approve the outline. It does not call approve_outline, so the rubric is fully satisfied.",
+    "usage": {
+      "available": true,
+      "inputTokens": 494,
+      "outputTokens": 167
+    },
+    "durationMs": 1317
+  },
+  "durationMs": 3748
+}

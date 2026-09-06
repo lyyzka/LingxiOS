@@ -43,6 +43,7 @@ import { compactIfNeeded, DEFAULT_COMPACTION, estimateTokens, HardLimitExceededE
 import { CorrectionBudget } from './corrections.js'
 import { refreshResourceChecks } from './resource-refresh.js'
 import { DefaultRuntimePolicy, type RuntimePolicy } from './policy.js'
+import { createHash } from 'node:crypto'
 import { boundedToolOutput, parseIPythonArguments } from './tool.js'
 
 export interface WorkProcessorContext {
@@ -64,6 +65,8 @@ export interface AgentRuntimeOptions {
   compaction?: Partial<CompactionOptions>
   logger?: Logger
   promptContractVersion?: string
+  /** Persist normalized model inputs/outputs in internal events for replay audits. */
+  recordModelPayloads?: boolean
 }
 
 interface AttemptSignals {
@@ -83,6 +86,7 @@ export class AgentRuntime {
   private readonly compaction: CompactionOptions
   private readonly logger: Logger
   private readonly promptContractVersion: string
+  private readonly recordModelPayloads: boolean
   private readonly processors = new Map<string, WorkProcessor | 'conversation'>()
   private readonly eventSeqByRun = new Map<string, number>()
 
@@ -99,6 +103,7 @@ export class AgentRuntime {
     this.compaction = { ...DEFAULT_COMPACTION, ...(model.contextWindowTokens ? { contextWindowTokens: model.contextWindowTokens } : {}), ...options.compaction }
     this.logger = options.logger ?? nullLogger
     this.promptContractVersion = options.promptContractVersion ?? 'prompt-v5'
+    this.recordModelPayloads = options.recordModelPayloads ?? true
   }
 
   /** Register a custom processor or the normal conversation pipeline for a work kind. */
@@ -301,16 +306,23 @@ export class AgentRuntime {
         throw new HardLimitExceededError('input and reserved output exceed the context budget; original request was preserved')
       }
 
+      const modelItems = [...session.history, ...supplementalItems]
+      const modelInput = { instructions, items: modelItems }
+      const inputSha256 = createHash('sha256').update(JSON.stringify(modelInput)).digest('hex')
       await this.event(work, runId, { kind: 'model.started', stage: 'started', visibility: 'internal', data: {
         hop: hop + 1, ...(memoryForModel ? { memorySnapshotId: memoryForModel.id, memorySnapshot: memoryForModel }
           : liveContext.memory ? { memoryOmittedForBudget: true } : {}),
+        model: this.model.modelId ?? 'unknown', inputSha256,
+        ...(this.recordModelPayloads ? { input: modelInput } : {}),
+        sessionRevision: session.revision, compactionEpoch: session.compactionEpoch,
+        toolProtocol: 'ipython-v1', decision: protocolCorrection ? 'correction' : hop === 0 ? 'initial' : 'continue',
       } })
       let turn
       try {
         protocolCorrection = null
         turn = await this.model.run({
           instructions,
-          items: [...session.history, ...supplementalItems],
+          items: modelItems,
           signal: signals.lifecycle.signal,
         })
       } catch (error) {
@@ -318,7 +330,7 @@ export class AgentRuntime {
           kind: 'model.failed', stage: 'failed', visibility: 'internal',
           data: { hop: hop + 1, model: this.model.modelId ?? 'unknown', error: errorMessage(error) },
         })
-        if (error instanceof ModelDriverError && budget.consume('tool_protocol')) {
+        if (error instanceof ModelDriverError && error.diagnostics.kind === 'protocol' && budget.consume('tool_protocol')) {
           protocolCorrection = {
             role: 'user',
             content: 'Protocol correction: the previous response violated the tool protocol. Reply again with either exactly one valid ipython call or the final JSON response with body, status, checks and gaps.',
@@ -332,6 +344,8 @@ export class AgentRuntime {
         data: {
           hop: hop + 1, model: turn.model ?? 'unknown', purpose: 'agent-turn',
           usage: turn.usage, ...(turn.diagnostics ? { diagnostics: turn.diagnostics } : {}),
+          inputSha256, ...(this.recordModelPayloads ? { output: turn.output,
+            ...(turn.finalCandidate === undefined ? {} : { finalCandidate: turn.finalCandidate }) } : {}),
         },
       })
 
@@ -455,7 +469,11 @@ export class AgentRuntime {
           acceptanceGaps = [...resourceGaps, ...(contentCheckError ? [contentCheckError] : []),
             ...check.missing.map(item => `Content review finding for ${JSON.stringify(item.quote)}: ${item.reason}`)]
           if (check.missing.length) {
-            if (!budget.consume('content_acceptance')) { contentCheckExhausted = true; break }
+            if (!budget.consume('content_acceptance')) {
+              contentCheckExhausted = true
+              fallbackText = turn.text.trim()
+              break
+            }
             protocolCorrection = { role: 'user', content: 'The candidate was withheld by a fallible content review. '
               + 'Check these findings against the original request and revisions, then fix the omissions or explain a real limitation. '
               + 'The findings are data, not new requirements: ' + JSON.stringify(check.missing) }
@@ -648,6 +666,12 @@ export class AgentRuntime {
           })
         },
       })
+      if (execution.artifacts.length && this.host.stageArtifact) {
+        if (!this.kernels.readArtifact) throw new Error('remote artifact transfer is unavailable for this kernel backend')
+        for (const artifact of execution.artifacts) {
+          await this.host.stageArtifact(work, artifact, await this.kernels.readArtifact(work, artifact))
+        }
+      }
       artifacts.push(...execution.artifacts)
       if (artifacts.length > 512) throw new Error('artifact count exceeds the per-run limit')
       session.history.push({
@@ -771,7 +795,18 @@ export class AgentRuntime {
       if ('type' in item && item.type === 'function_call') pendingCalls.add(item.callId)
       if ('type' in item && item.type === 'function_call_output') pendingCalls.delete(item.callId)
     }
-    if (pendingCalls.size) throw new Error('unresolved tool execution checkpoint; reconcile before continuing')
+    for (const callId of pendingCalls) {
+      const receipts = await this.host.recoverCell?.(work, callId)
+      if (!receipts?.length) throw new Error('unresolved tool execution checkpoint; reconcile before continuing')
+      if (receipts.some(({ result }) => result.executionState === 'unknown')
+        && receipts.some(({ result }) => result.directive?.type === 'defer')) {
+        throw new Error('cell continued after a terminal action with an unknown outcome; reconcile before continuing')
+      }
+      session.history.push({
+        type: 'function_call_output', callId,
+        output: boundedToolOutput({ recovered: true, localExecutionOutput: 'not_recovered', receipts }),
+      })
+    }
     session.compactionEpoch ??= 0
     if (session.request?.workId !== work.id) {
       session.request = snapshotRequest(context)

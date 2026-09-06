@@ -9,7 +9,7 @@ import { setTimeout as delay } from 'node:timers/promises'
 import type { AddressInfo } from 'node:net'
 import { errorMessage } from '../errors.js'
 import type { HostPort } from '../host/port.js'
-import type { KernelManager } from '../kernel/manager.js'
+import type { ManagedKernelExecutor } from '../kernel/manager.js'
 import { nullLogger, type Logger } from '../logging.js'
 import type { MetricsRegistry } from '../metrics.js'
 import type { AgentRuntime } from '../runtime/runtime.js'
@@ -17,7 +17,7 @@ import type { AgentRuntime } from '../runtime/runtime.js'
 export interface AgentWorkerOptions {
   host: Pick<HostPort, 'claimWork'>
   runtime: Pick<AgentRuntime, 'runWork'>
-  kernels?: KernelManager
+  kernels?: ManagedKernelExecutor
   workerId: string
   maxConcurrentRuns: number
   shutdownGraceMs: number

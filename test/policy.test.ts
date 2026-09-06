@@ -102,16 +102,16 @@ describe('DefaultRuntimePolicy.validateAssistantText', () => {
     assert.equal(policy.validateAssistantText('Here is your answer.'), null)
   })
 
-  it('rejects hidden reasoning or tool-call markup', () => {
-    assert.match(policy.validateAssistantText('<thinking>secret</thinking>done') ?? '', /hidden reasoning/)
+  it('allows markup when it is visible answer data', () => {
+    assert.equal(policy.validateAssistantText('<thinking>example data</thinking>'), null)
   })
 
-  it('rejects text that references the host SDK module', () => {
-    assert.match(policy.validateAssistantText('call host.fs.read(path="x")') ?? '', /SDK or tool code/)
+  it('allows explanatory host SDK examples', () => {
+    assert.equal(policy.validateAssistantText('Example only: host.fs.read(path="x")'), null)
   })
 
-  it('rejects text that shows ipython code fences', () => {
+  it('allows ipython code fences in an answer', () => {
     const text = '```ipython\nprint(1)\n```'
-    assert.match(policy.validateAssistantText(text) ?? '', /SDK or tool code/)
+    assert.equal(policy.validateAssistantText(text), null)
   })
 })

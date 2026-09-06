@@ -75,7 +75,7 @@ export interface WorkStore {
    * session exclusivity and session→worker routing; returns null when
    * nothing is claimable.
    */
-  claim(workerId: string): Promise<WorkItem | null>
+  claim(workerId: string, requestId?: string): Promise<WorkItem | null>
 
   /** Renew the lease; null when the lease is no longer valid. */
   heartbeat(id: string, fence: number, leaseTokenHash: string): Promise<HeartbeatRow | null>
@@ -101,13 +101,19 @@ export interface WorkStore {
 
 export type SaveSessionResult = { ok: true; revision: number } | { ok: false; conflict: true }
 
+export interface StoreLeaseProof {
+  workId: string
+  fence: number
+  leaseTokenHash: string
+}
+
 export interface SessionStore {
   get(key: string): Promise<SessionRecord | null>
   /**
    * Optimistic save: succeeds only when the stored revision equals
    * `session.revision` (or the session does not exist and revision is 0).
    */
-  save(session: SessionRecord): Promise<SaveSessionResult>
+  save(session: SessionRecord, proof?: StoreLeaseProof): Promise<SaveSessionResult>
 }
 
 // ---------------------------------------------------------------------------
@@ -122,7 +128,7 @@ export interface StoredRunEvent extends RunEvent {
 
 export interface EventStore {
   /** Append with (runId, seq) dedupe. Returns false for a duplicate. */
-  append(event: StoredRunEvent): Promise<boolean>
+  append(event: StoredRunEvent, proof?: StoreLeaseProof): Promise<boolean>
   /** Events of one attempt range, ordered by seq. */
   listRange(runId: string, fromSeqExclusive: number, toSeqInclusive: number, kinds?: readonly string[]): Promise<StoredRunEvent[]>
 }
@@ -142,6 +148,14 @@ export interface ActionIntent {
   action: import('../protocol/types.js').HostAction
 }
 
+export interface ActionResolution {
+  id: string
+  actionKey: string
+  result: HostActionResult
+  evidence: Record<string, unknown>
+  resolvedBy: string
+}
+
 export interface ActionLedgerStore {
   hasWait(workId: string, requestVersion: number, wait: { approvalId: string } | { question: string }): Promise<boolean>
   /** At most 65 unresolved business actions; callers report truncation above 64. */
@@ -151,11 +165,18 @@ export interface ActionLedgerStore {
   findIntent(idempotencyKey: string): Promise<ActionIntent | null>
   /** The recorded result for this idempotency key, if the action already ran. */
   find(idempotencyKey: string): Promise<HostActionResult | null>
+  /** Ordered durable action facts for rebuilding one interrupted cell observation. */
+  listCell(workId: string, cellId: string, requestVersion: number | null): Promise<Array<{
+    intent: ActionIntent
+    result: HostActionResult | null
+  }>>
   /**
    * Record a result. Returns the winning result: on a concurrent duplicate,
    * the first recorded result is returned and the new one discarded.
    */
   record(idempotencyKey: string, result: HostActionResult): Promise<HostActionResult>
+  /** Append an authoritative settlement without rewriting intent or receipt history. */
+  recordResolution(resolution: ActionResolution): Promise<'recorded' | 'existing'>
 }
 
 // ---------------------------------------------------------------------------
@@ -200,6 +221,10 @@ export interface DeliveryPort {
   getMessage?(work: Omit<WorkItem, 'leaseToken'>): Promise<import('../protocol/types.js').AssistantMessage | null>
   onEvent(work: Omit<WorkItem, 'leaseToken'>, event: RunEvent): Promise<void>
   deliverMessage(work: Omit<WorkItem, 'leaseToken'>, message: import('../protocol/types.js').AssistantMessage): Promise<void>
+}
+
+export interface ArtifactStager {
+  stage(work: Omit<WorkItem, 'leaseToken'>, artifact: import('../protocol/types.js').KernelArtifact, bytes: Uint8Array): Promise<void>
 }
 
 // ---------------------------------------------------------------------------

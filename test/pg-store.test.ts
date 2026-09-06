@@ -27,7 +27,8 @@ it('runs namespaced stores on PostgreSQL without touching product tables', async
     assert.deepEqual(await workStore.enqueue(input), { id: 'w', deduplicated: true })
     await assert.rejects(workStore.enqueue({ ...input, tenantId: 'other' }), /different request/)
     await assert.rejects(workStore.enqueue({ ...input, meta: { text: 'different' } }), /different request/)
-    const work = (await workStore.claim('worker'))!
+    const work = (await workStore.claim('worker', 'claim-request-0001'))!
+    assert.deepEqual(await workStore.claim('worker', 'claim-request-0001'), work)
     assert.equal(work.id, 'w')
     assert.equal(work.fence, 1)
     const token = hashToken(work.leaseToken)
@@ -68,12 +69,23 @@ it('runs namespaced stores on PostgreSQL without touching product tables', async
     assert.deepEqual(await ledger.unsettled('w'), [])
     assert.equal(await ledger.reserve('[\"w\",\"c\",0]', 'intent', intent), 'existing')
     assert.deepEqual(await ledger.find('[\"w\",\"c\",0]'), { ok: true, value: 'receipt' })
+    const resolution = { id: 'resolution-1', actionKey: '[\"w\",\"c\",0]', result: { ok: true, value: 'reconciled' },
+      evidence: { source: 'readback' }, resolvedBy: 'operator:test' }
+    assert.equal(await ledger.recordResolution(resolution), 'recorded')
+    assert.equal(await ledger.recordResolution(resolution), 'existing')
+    assert.deepEqual(await ledger.find('[\"w\",\"c\",0]'), resolution.result)
 
     const events = new PgEventStore(pool)
     const event = { runId: 'w', seq: 1, tenantId: 't', agentId: 'a', recordedAt: '2026-09-05T00:00:00.000Z', kind: 'test', stage: 'completed' as const, visibility: 'internal' as const, data: {} }
     assert.equal(await events.append(event), true)
     assert.equal(await events.append(event), false)
     assert.deepEqual(await events.listRange('w', 0, 10), [event])
+    const fencedSession = { ...session, revision: 2, history: [{ role: 'user' as const, content: 'fenced' }] }
+    assert.deepEqual(await sessions.save(fencedSession, { workId: work.id, fence: work.fence, leaseTokenHash: token }), { ok: true, revision: 3 })
+    assert.deepEqual(await sessions.save({ ...fencedSession, revision: 3, history: [] },
+      { workId: work.id, fence: work.fence, leaseTokenHash: 'wrong' }), { ok: false, conflict: true })
+    assert.deepEqual((await sessions.get(session.key))?.history, fencedSession.history)
+    assert.equal(await events.append({ ...event, seq: 2 }, { workId: work.id, fence: work.fence, leaseTokenHash: 'wrong' }), false)
     assert.equal(await workStore.complete('w', 1, token, { status: 'completed', goalOutcome: { status: 'partial', verification: 'not_run', requestVersion: 1 } }), false)
     assert.ok(await workStore.getLeased('w', 1, token))
     assert.ok(await workStore.complete('w', 1, token, { status: 'completed', goalOutcome: { status: 'partial', verification: 'not_run', requestVersion: 2 } }))

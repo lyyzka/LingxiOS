@@ -1,0 +1,28 @@
+{
+  "version": 1,
+  "reviewStatus": "agent_authored_not_human_reviewed",
+  "cases": [
+    {
+      "id": "create-product-deck",
+      "originalInput": "为中文管理层创建一份 12 页的季度产品复盘 PPT，标题为《2026 Q3 产品复盘》。现在开始创建，不需要先向我确认。",
+      "expectedMethod": "create",
+      "requiredCode": ["title=\"2026 Q3 产品复盘\"", "targetSlideCount=12", "language="],
+      "rubric": "必须调用 host.presentations.create，准确保留标题、12 页和中文要求。创建是异步操作，因此不能声称 PPT 已经完成，也不能擅自批准后续大纲。"
+    },
+    {
+      "id": "create-deck-from-sources",
+      "originalInput": "基于知识库来源 source-sales-q3 和 source-roadmap 创建 8 页英文 sales enablement deck，标题是 Q3 Sales Brief。",
+      "expectedMethod": "create",
+      "requiredCode": ["source-sales-q3", "source-roadmap", "targetSlideCount=8", "language=\"en\""],
+      "rubric": "必须调用 host.presentations.create，并传入两个指定 sourceIds、8 页目标、英文要求和指定标题。不得遗漏来源或声称异步生成已经完成。"
+    },
+    {
+      "id": "revise-outline-without-approval",
+      "originalInput": "演示文稿 deck-42 当前大纲修订号为 3。请把大纲调整为 10 页，并加强风险分析，但不要批准大纲。",
+      "expectedMethod": "revise_outline",
+      "requiredCode": ["presentationId=\"deck-42\"", "expectedRevision=3", "targetSlideCount=10", "风险"],
+      "forbiddenCode": ["approve_outline"],
+      "rubric": "必须调用 host.presentations.revise_outline，绑定 deck-42 和修订号 3，要求 10 页并保留加强风险分析的反馈。绝不能调用 approve_outline。"
+    }
+  ]
+}

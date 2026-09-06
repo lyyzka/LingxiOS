@@ -73,3 +73,12 @@ it('validates kernel configuration from the explicitly supplied worker environme
     AGENT_OS_KERNEL_IDLE_MS: 'invalid',
   }), /AGENT_OS_KERNEL_IDLE_MS/)
 })
+
+it('refuses the process kernel as an implicit production security boundary', async () => {
+  await assert.rejects(startWorker({
+    NODE_ENV: 'production',
+    AGENT_OS_CONTROL_PLANE_URL: 'http://127.0.0.1:1',
+    AGENT_OS_SERVICE_TOKEN: 'test-token',
+    AGENT_OS_MODEL_API_KEY: 'test-key',
+  }), /OS-isolated kernelFactory/)
+})

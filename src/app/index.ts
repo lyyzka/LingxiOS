@@ -2,7 +2,7 @@ import { ControlPlaneServer } from '../control-plane/http-server.js'
 import { checkStorage } from './storage.js'
 import { captureMemoryEvidence, retryMemorySynthesis } from '../memory/evidence.js'
 import { memorySynthesisProcessor, memoryIndexProcessor } from '../memory/processor.js'
-import { readArtifact, persistArtifacts } from './artifacts.js'
+import { readArtifact, persistArtifacts, stageArtifact } from './artifacts.js'
 import { resolve } from 'node:path'
 import { snapshotAttachments, type RequestAttachment } from '../context/attachments.js'
 import { recoverWait } from './recover-wait.js'
@@ -12,7 +12,7 @@ import { ConfigError } from '../errors.js'
 import { ControlPlaneService } from '../control-plane/service.js'
 import { withTransaction, PgWorkStore, PgSessionStore, PgEventStore, PgActionLedger, type SqlPool } from '../control-plane/pg-store.js'
 import type { HostPort } from '../host/port.js'
-import { KernelManager, type KernelManagerOptions } from '../kernel/manager.js'
+import { KernelManager, type KernelHostBridge, type KernelManagerOptions, type ManagedKernelExecutor } from '../kernel/manager.js'
 import { DEFAULT_MODEL, OpenAIChatDriver } from '../model/openai.js'
 import { AgentRuntime } from '../runtime/runtime.js'
 import { AgentWorker } from '../worker/worker.js'
@@ -21,12 +21,17 @@ import { sessionKeyOf } from '../protocol/types.js'
 import { RUN_SEQUENCE_SPAN } from '../protocol/constants.js'
 import type { GoalOutcome } from '../protocol/outcome.js'
 import type { ControlPlaneDeps } from '../control-plane/service.js'
+import type { ActionResolution } from '../control-plane/stores.js'
 
 export interface LingxiOSOptions {
   database: SqlPool
   model?: { id?: string; apiKey: string; baseUrl?: string; reasoningEffort?: 'high' | 'max'; maxOutputTokens?: number; contextWindowTokens?: number }
   persona?: PromptContext['persona']
-  kernel?: Pick<KernelManagerOptions, 'pythonCommand' | 'homesRoot' | 'executionTimeoutMs' | 'allowNetwork'>
+  kernel?: Pick<KernelManagerOptions, 'pythonCommand' | 'homesRoot' | 'startupTimeoutMs' | 'executionTimeoutMs' | 'hostActionTimeoutMs' | 'maxOutputChars' | 'allowNetwork'>
+  /** Required in production for untrusted model-authored code. */
+  kernelFactory?: (bridge: KernelHostBridge) => ManagedKernelExecutor
+  /** Explicit opt-in for trusted model code using the local process backend in production. */
+  trustProcessKernel?: boolean
   worker?: { id?: string; concurrency?: number; shutdownGraceMs?: number; pollIdleMs?: number; healthPort?: number }
 }
 
@@ -49,6 +54,9 @@ export interface MessageIdentity {
   agentId: string
   sessionId: string
 }
+
+export type ActionResolutionInput = ActionResolution & Pick<RequestInput,
+  'tenantId' | 'agentId' | 'sessionId' | 'principalId' | 'threadId'>
 
 /** Trusted server entry point. Product ingress must authenticate the principal. */
 export async function createLingxiOS(options: LingxiOSOptions) {
@@ -100,6 +108,8 @@ export async function assembleApp(options: LingxiOSOptions, integration?: Pick<C
   const service = new ControlPlaneService({
     work: new PgWorkStore(options.database), sessions,
     events: new PgEventStore(options.database), actions: new PgActionLedger(options.database),
+    artifactStager: { stage: (work, artifact, bytes) => stageArtifact(
+      resolve(options.kernel?.homesRoot ?? process.env['AGENT_OS_HOMES_ROOT'] ?? '.agent-os/homes'), work, artifact, bytes) },
     contextProvider: integration?.contextProvider ?? { loadContext: async (work) => {
       const text = work.meta?.['text']
       if (typeof text !== 'string' || !work.principalId) throw new Error('request text and principal are missing')
@@ -148,11 +158,11 @@ export async function assembleApp(options: LingxiOSOptions, integration?: Pick<C
       },
     },
   })
-  async function claimWork(claimingWorkerId: string) {
+  async function claimWork(claimingWorkerId: string, requestId?: string) {
     await flushDeliveries()
     if (integration) await retryMemorySynthesis(options.database)
     await integration?.beforeClaim?.()
-    const work = await service.claim(claimingWorkerId)
+    const work = await service.claim(claimingWorkerId, requestId)
     if (!work) return null
     const { rows } = await options.database.query(
       'SELECT message FROM lingxios.agent_messages WHERE run_id=$1 AND tenant_id=$2 AND agent_id=$3 AND session_id=$4',
@@ -183,6 +193,7 @@ export async function assembleApp(options: LingxiOSOptions, integration?: Pick<C
   const host: HostPort = {
     claimWork: () => claimWork(workerId), heartbeat: (work) => service.heartbeat(work),
     loadContext: (work) => service.loadContext(work), executeAction: (work, action) => service.executeAction(work, action),
+    recoverCell: (work, cellId) => service.recoverCell(work, cellId),
     emitEvent: (work, event) => service.recordEvent(work, event), loadSession: (work, key) => service.getSession(work, key),
     saveSession: async (work, session) => { session.revision = (await service.saveSession(work, session)).revision },
     commitMessage: (work, message) => service.commitMessage(work, message), completeWork: (work, completion) => service.complete(work, completion),
@@ -197,7 +208,11 @@ export async function assembleApp(options: LingxiOSOptions, integration?: Pick<C
     if (local) return local
     if (!options.model) throw new ConfigError('model configuration is required for local execution')
     const model = new OpenAIChatDriver(options.model.id ?? DEFAULT_MODEL.id, options.model)
-    const kernels = new KernelManager({ execute: (work, action) => service.executeAction(work, action) }, { ...options.kernel, maxKernels: concurrency })
+    const bridge: KernelHostBridge = { execute: (work, action) => service.executeAction(work, action) }
+    if (!options.kernelFactory && process.env['NODE_ENV'] === 'production' && options.trustProcessKernel !== true) {
+      throw new ConfigError('production local execution requires an OS-isolated kernelFactory; trustProcessKernel is only for trusted model code')
+    }
+    const kernels = options.kernelFactory?.(bridge) ?? new KernelManager(bridge, { ...options.kernel, maxKernels: concurrency })
     const runtime = new AgentRuntime(host, model, kernels)
     runtime.registerProcessor('memory_synthesis', memorySynthesisProcessor)
     runtime.registerProcessor('memory_index', memoryIndexProcessor)
@@ -218,6 +233,10 @@ export async function assembleApp(options: LingxiOSOptions, integration?: Pick<C
     readArtifact: (identity: MessageIdentity & Pick<RequestInput, 'principalId' | 'threadId'>, path: string) =>
       readArtifact(options.database, resolve(options.kernel?.homesRoot ?? process.env['AGENT_OS_HOMES_ROOT'] ?? '.agent-os/homes'), identity, path),
     continueInput: (input: InputContinuation) => continueInput(options.database, input),
+    resolveAction: (input: ActionResolutionInput) => {
+      const { tenantId, agentId, sessionId, principalId, threadId, ...resolution } = input
+      return service.resolveAction(resolution, { tenantId, agentId, sessionId, principalId, ...(threadId ? { threadId } : {}) })
+    },
     /** Trusted server boundary: use the authenticated original principal. */
     async cancel(identity: MessageIdentity & Pick<RequestInput, 'principalId' | 'threadId'>): Promise<boolean> {
       if (!identity || !identity.principalId?.trim()) throw new Error('authenticated principalId is required')

@@ -9,7 +9,8 @@ CREATE TABLE IF NOT EXISTS lingxios.schema_version (
   singleton BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
   version INT NOT NULL
 );
-INSERT INTO lingxios.schema_version(singleton, version) VALUES(TRUE, 1) ON CONFLICT DO NOTHING;
+INSERT INTO lingxios.schema_version(singleton, version) VALUES(TRUE, 2)
+ON CONFLICT (singleton) DO UPDATE SET version=GREATEST(lingxios.schema_version.version, EXCLUDED.version);
 
 CREATE TABLE IF NOT EXISTS lingxios.agent_work_items (
   id                   TEXT PRIMARY KEY,
@@ -46,6 +47,18 @@ CREATE TABLE IF NOT EXISTS lingxios.agent_work_items (
 CREATE INDEX IF NOT EXISTS agent_work_items_claim_idx
   ON lingxios.agent_work_items (status, available_at)
   WHERE status IN ('queued','leased');
+
+-- A retried claim returns the original answer, including null, instead of
+-- leasing another work item after the first response was lost.
+CREATE TABLE IF NOT EXISTS lingxios.agent_claim_requests (
+  request_id TEXT PRIMARY KEY,
+  worker_id TEXT NOT NULL,
+  completed BOOLEAN NOT NULL DEFAULT FALSE,
+  response JSONB,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS agent_claim_requests_created_idx
+  ON lingxios.agent_claim_requests(created_at) WHERE completed=TRUE;
 
 -- Package-owned schedules; no dependency on the retired product agent runtime.
 CREATE TABLE IF NOT EXISTS lingxios.agent_routines (
@@ -171,6 +184,21 @@ CREATE TABLE IF NOT EXISTS lingxios.agent_delivery_outbox (
   claim_token TEXT,
   attempts INTEGER NOT NULL DEFAULT 0
 );
+
+-- Reconciliation is append-only: it settles an uncertain action without
+-- overwriting either the pre-execution intent or its original receipt.
+CREATE TABLE IF NOT EXISTS lingxios.agent_action_resolutions (
+  resolution_id TEXT PRIMARY KEY,
+  resolution_seq BIGSERIAL,
+  idempotency_key TEXT NOT NULL REFERENCES lingxios.agent_action_intents(idempotency_key),
+  resolution JSONB NOT NULL CHECK (jsonb_typeof(resolution) = 'object'),
+  recorded_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+ALTER TABLE lingxios.agent_action_resolutions ADD COLUMN IF NOT EXISTS resolution_seq BIGSERIAL;
+CREATE UNIQUE INDEX IF NOT EXISTS agent_action_resolutions_seq_idx
+  ON lingxios.agent_action_resolutions(resolution_seq);
+CREATE INDEX IF NOT EXISTS agent_action_resolutions_action_idx
+  ON lingxios.agent_action_resolutions(idempotency_key, resolution_seq DESC);
 
 CREATE TABLE IF NOT EXISTS lingxios.agent_calendar_outbox (
   id TEXT PRIMARY KEY REFERENCES lingxios.agent_action_intents(idempotency_key),

@@ -36,7 +36,7 @@ export async function doctor(options: { database?: SqlQueryable; pythonCommand?:
   if (options.database) {
     try {
       await checkStorage(options.database)
-      checks.push({ name: 'database', status: 'passed', detail: 'Initial schema version 1, required columns and memory triggers are readable; write permissions and all constraints are not verified' })
+      checks.push({ name: 'database', status: 'passed', detail: `Schema version ${releaseVersions.schema}, required columns and memory triggers are readable; write permissions and all constraints are not verified` })
     } catch {
       checks.push({ name: 'database', status: 'failed', detail: 'Database unavailable or explicit schema installation is required' })
     }

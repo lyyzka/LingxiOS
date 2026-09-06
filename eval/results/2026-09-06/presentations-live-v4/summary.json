@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "mode": "live_model_presentation_planning",
+  "model": "deepseek-ai/DeepSeek-V4-Flash",
+  "providerOrigin": "https://api.siliconflow.cn",
+  "datasetSha256": "ba64150026380c4b3ba5390fd01263d56bedba7e1c59d53cadbeec9410b375fd",
+  "datasetReview": "agent_authored_not_human_reviewed",
+  "sampleCount": 3,
+  "deterministicFailures": 0,
+  "executionOrReviewErrors": 0,
+  "semanticPasses": 3,
+  "reports": [
+    "create-product-deck.json",
+    "create-deck-from-sources.json",
+    "revise-outline-without-approval.json"
+  ]
+}

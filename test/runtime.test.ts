@@ -7,7 +7,7 @@ import type { ModelDriver } from '../src/model/driver.js'
 import type { KernelExecutor } from '../src/kernel/manager.js'
 import type { ModelItem, SessionRecord, TurnContext, WorkCompletion } from '../src/protocol/types.js'
 import { AgentRuntime } from '../src/runtime/runtime.js'
-import { ApprovalPendingError } from '../src/errors.js'
+import { ApprovalPendingError, ModelDriverError } from '../src/errors.js'
 
 for (const format of ['object', 'plain text'] as const) it(`preserves ${format} content and observed artifacts when assessment correction is exhausted`, async () => {
   const work: TurnContext['work'] = { id: 'w', tenantId: 't', agentId: 'a', sessionId: 's', kind: 'turn', lane: 'interactive', triggerRef: 'm', fence: 1, homeEpoch: 1, leaseToken: 'token' }
@@ -175,6 +175,7 @@ it('reviews complex candidates against original requirements, bounds corrections
       assert.match(JSON.stringify(completion?.goalOutcome?.gaps), /did not confirm the expected fields/)
     }
     if (mode === 'exhausted') {
+      assert.equal(body, 'Comparison with costs.')
       assert.match(completion?.goalOutcome?.gaps?.[0] ?? '', /Content acceptance correction budget exhausted/)
       assert.match(JSON.stringify(completion?.goalOutcome?.gaps), /did not confirm the expected fields/)
       assert.match(JSON.stringify(completion?.goalOutcome?.gaps), /include costs.*Costs are missing/)
@@ -239,6 +240,34 @@ it('preserves history across prompt upgrades and exposes assigned action receipt
   assert.equal(calls, 2)
   assert.equal(completion?.status, 'failed')
   assert.match(completion?.error ?? '', /unresolved tool execution checkpoint/)
+  host.recoverCell = async () => [{ action: 'files.save', idempotencyKey: '["w","interrupted",0]', result: {
+    ok: false, executionState: 'unknown', error: 'receipt missing',
+  } }]
+  await new AgentRuntime(host, model, kernels).runWork({ ...context.work, fence: 3 })
+  assert.equal(calls, 3)
+  assert.equal(completion?.status, 'completed')
+})
+
+it('does not spend model-correction budget on provider failures', async () => {
+  const work: TurnContext['work'] = { id: 'w', tenantId: 't', agentId: 'a', sessionId: 's', kind: 'turn', lane: 'interactive', triggerRef: 'm', fence: 1, homeEpoch: 1, leaseToken: 'token', meta: { text: 'answer' } }
+  let calls = 0
+  let completion: WorkCompletion | undefined
+  const host: HostPort = {
+    claimWork: async () => null, heartbeat: async () => ({ ok: true }),
+    loadContext: async () => ({ work, persona: { name: '', role: '', instructions: '' }, capabilities: [],
+      messages: [{ ref: 'm', authorId: 'u', authorName: 'U', authorKind: 'human', body: 'answer', createdAt: 'now' }] }),
+    executeAction: async () => ({ ok: true }), emitEvent: async () => {}, loadSession: async () => null,
+    saveSession: async () => {}, commitMessage: async () => {}, yieldWork: async () => {},
+    completeWork: async (_work, value) => { completion = value },
+  }
+  const unavailable = async () => { throw new Error('unexpected') }
+  const model: ModelDriver = {
+    run: async () => { calls++; throw new ModelDriverError('provider unavailable', { kind: 'provider', finishReasons: [] }) },
+    structured: unavailable, compact: unavailable,
+  }
+  await new AgentRuntime(host, model, { execute: unavailable }).runWork(work)
+  assert.equal(calls, 1)
+  assert.equal(completion?.status, 'failed')
 })
 
 it('records approval and input waiting without claiming goal completion or invented delegation', async () => {

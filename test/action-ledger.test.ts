@@ -43,6 +43,26 @@ it('does not overwrite intent or replay a receipt without an intent', async () =
   await assert.rejects(ledger.reserve('intent', 'changed', intent), /identity reused/)
   await assert.rejects(ledger.record('orphan', { ok: true }), /intent is required/)
   await assert.rejects(ledger.reserve('wrong', 'fingerprint', intent), /must match/)
+  await ledger.record('intent', { ok: false, executionState: 'unknown', error: 'lost' })
+  const resolution = { id: 'resolution-1', actionKey: 'intent', result: { ok: true, value: { saved: true } },
+    evidence: { source: 'authoritative-readback', version: 2 }, resolvedBy: 'operator:test' }
+  assert.equal(await ledger.recordResolution(resolution), 'recorded')
+  assert.equal(await ledger.recordResolution(resolution), 'existing')
+  assert.deepEqual(await ledger.find('intent'), resolution.result)
+  assert.deepEqual(await ledger.unsettled('w'), [])
+  await assert.rejects(ledger.recordResolution({ ...resolution, evidence: { source: 'changed' } }), /identity reused/)
+  const service = new ControlPlaneService({
+    work: new MemoryWorkStore(), sessions: new MemorySessionStore(), events: new MemoryEventStore(), actions: ledger,
+    contextProvider: { loadContext: async () => ({ persona: { name: '', role: '', instructions: '' }, capabilities: [], messages: [] }) },
+    capabilityResolver: { resolve: async () => [] }, actionExecutor: { execute: async () => ({ ok: true }) },
+    delivery: { onEvent: async () => {}, deliverMessage: async () => {} },
+  })
+  await assert.rejects(service.resolveAction({ ...resolution, id: 'resolution-2' }, {
+    tenantId: 'other', agentId: 'a', sessionId: 's', principalId: 'u',
+  }), /not found/)
+  assert.equal(await service.resolveAction({ ...resolution, id: 'resolution-2', result: { ok: false, error: 'not found' } }, {
+    tenantId: 't', agentId: 'a', sessionId: 's', principalId: 'u',
+  }), 'recorded')
 })
 
 it('does not treat a changed request or principal as a duplicate enqueue', async () => {

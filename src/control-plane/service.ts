@@ -32,7 +32,7 @@ import type {
 import { sessionKeyOf, actionKeyOf } from '../protocol/types.js'
 import { isGoalOutcome, type GoalOutcome } from '../protocol/outcome.js'
 import type {
-  ActionExecutor, ActionLedgerStore, CapabilityResolver, ContextProvider,
+  ActionExecutor, ActionLedgerStore, ActionResolution, ArtifactStager, CapabilityResolver, ContextProvider,
   DeliveryPort, EventStore, SessionStore, WorkStore,
 } from './stores.js'
 import { isModelItem } from './stores.js'
@@ -46,12 +46,13 @@ export interface ControlPlaneDeps {
   actionExecutor: ActionExecutor
   capabilityResolver: CapabilityResolver
   delivery: DeliveryPort
+  artifactStager?: ArtifactStager
   logger?: Logger
   metrics?: MetricsRegistry
 }
 
 export class ControlPlaneError extends Error {
-  constructor(readonly status: number, message: string) {
+  constructor(readonly status: number, message: string, readonly code?: string) {
     super(message)
     this.name = 'ControlPlaneError'
   }
@@ -92,6 +93,32 @@ export class ControlPlaneService {
     this.logger = deps.logger ?? nullLogger
   }
 
+  /** Internal/operator API: append authoritative evidence settling an uncertain action. */
+  async resolveAction(resolution: ActionResolution, scope: {
+    tenantId: string; agentId: string; sessionId: string; principalId: string; threadId?: string
+  }): Promise<'recorded' | 'existing'> {
+    if (!resolution || typeof resolution !== 'object'
+      || !/^[A-Za-z0-9._:-]{1,160}$/.test(resolution.id)
+      || typeof resolution.actionKey !== 'string' || !resolution.actionKey
+      || typeof resolution.resolvedBy !== 'string' || !resolution.resolvedBy.trim()
+      || !resolution.evidence || typeof resolution.evidence !== 'object' || Array.isArray(resolution.evidence)
+      || !resolution.result || typeof resolution.result.ok !== 'boolean'
+      || resolution.result.executionState === 'unknown'
+      || JSON.stringify(resolution.evidence).length > 65_536) {
+      throw new ControlPlaneError(400, 'invalid action reconciliation resolution')
+    }
+    const intent = await this.deps.actions.findIntent(resolution.actionKey)
+    if (!intent) {
+      throw new ControlPlaneError(404, 'action intent not found')
+    }
+    if (!scope?.principalId?.trim() || intent.tenantId !== scope.tenantId || intent.agentId !== scope.agentId
+      || intent.sessionId !== scope.sessionId || intent.principalId !== scope.principalId
+      || intent.threadId !== (scope.threadId ?? null)) {
+      throw new ControlPlaneError(404, 'action intent not found')
+    }
+    return this.deps.actions.recordResolution(structuredClone(resolution))
+  }
+
   // -------------------------------------------------------------------------
   // Work lifecycle
   // -------------------------------------------------------------------------
@@ -110,11 +137,14 @@ export class ControlPlaneService {
     return result
   }
 
-  async claim(workerId: string): Promise<WorkItem | null> {
+  async claim(workerId: string, requestId?: string): Promise<WorkItem | null> {
     if (typeof workerId !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(workerId)) {
       throw new ControlPlaneError(400, 'workerId must be 1-128 safe identifier characters')
     }
-    const work = await this.deps.work.claim(workerId)
+    if (requestId !== undefined && !/^[A-Za-z0-9_-]{16,128}$/.test(requestId)) {
+      throw new ControlPlaneError(400, 'requestId must be a 16-128 character identifier')
+    }
+    const work = await this.deps.work.claim(workerId, requestId)
     if (work) {
       this.deps.metrics?.counter('agentos_work_claimed_total', 'Work items claimed').inc({ lane: work.lane })
     }
@@ -126,7 +156,7 @@ export class ControlPlaneService {
       throw new ControlPlaneError(400, 'work lease proof required')
     }
     const leased = await this.deps.work.getLeased(proof.id, proof.fence, hashToken(proof.leaseToken))
-    if (!leased) throw new ControlPlaneError(409, 'work lease lost or expired')
+    if (!leased) throw new ControlPlaneError(409, 'work lease lost or expired', 'lease_lost')
     if (options.rejectCancelled && leased.cancelRequested) {
       throw new ControlPlaneError(409, 'work is cancelled; no further actions are permitted')
     }
@@ -146,7 +176,10 @@ export class ControlPlaneService {
 
   async yieldWork(proof: LeaseProof): Promise<void> {
     const ok = await this.deps.work.yieldWork(proof.id, proof.fence, hashToken(proof.leaseToken))
-    if (!ok) throw new ControlPlaneError(409, 'work is no longer yieldable')
+    if (!ok) {
+      await this.requireLease(proof)
+      throw new ControlPlaneError(409, 'work is no longer yieldable', 'work_state_conflict')
+    }
   }
 
   async complete(proof: LeaseProof, completion: WorkCompletion): Promise<void> {
@@ -175,7 +208,10 @@ export class ControlPlaneService {
       }
     }
     const ok = await this.deps.work.complete(proof.id, proof.fence, hashToken(proof.leaseToken), completion)
-    if (!ok) throw new ControlPlaneError(409, 'work lease lost before completion')
+    if (!ok) {
+      await this.requireLease(proof)
+      throw new ControlPlaneError(409, 'work cannot complete in its current state', 'work_state_conflict')
+    }
     this.deps.metrics?.counter('agentos_work_completed_total', 'Work attempts finished').inc({ status: completion.status })
   }
 
@@ -270,7 +306,11 @@ export class ControlPlaneService {
     if (typeof work.meta?.['text'] === 'string') {
       const request = (await this.getSession(proof, sessionKeyOf(work)))?.request
       const current = await this.heartbeat(proof)
-      if (!current.ok || current.cancelRequested) throw new ControlPlaneError(409, 'work lease lost or cancelled before action')
+      if (!current.ok) {
+        await this.requireLease(proof)
+        throw new ControlPlaneError(409, 'work lease lost before action', 'lease_lost')
+      }
+      if (current.cancelRequested) throw new ControlPlaneError(409, 'work is cancelled; no further actions are permitted', 'work_cancelled')
       if (!request || request.workId !== work.id || !isDeepStrictEqual(request.revisions, current.steer ?? [])) {
         return { ok: false, error: 'request snapshot is stale or missing; process the latest user revisions before acting' }
       }
@@ -359,6 +399,48 @@ export class ControlPlaneService {
     return recorded
   }
 
+  async recoverCell(proof: LeaseProof, cellId: string): Promise<Array<{
+    action: string; idempotencyKey: string; result: HostActionResult
+  }> | null> {
+    const work = await this.requireLease(proof, { rejectCancelled: true })
+    if (!cellId || cellId.length > 512) throw new ControlPlaneError(400, 'invalid cellId')
+    const request = typeof work.meta?.['text'] === 'string'
+      ? (await this.getSession(proof, sessionKeyOf(work)))?.request : undefined
+    const requestVersion = request?.workId === work.id ? request.revisions.length + 1 : null
+    const records = await this.deps.actions.listCell(work.id, cellId, requestVersion)
+    if (!records.length || records.length > 100) return null
+    return records.map(({ intent, result }, index) => {
+      if (intent.tenantId !== work.tenantId || intent.principalId !== (work.principalId ?? null)
+        || intent.agentId !== work.agentId || intent.sessionId !== work.sessionId
+        || intent.threadId !== (work.threadId ?? null) || intent.action.callIndex !== index) {
+        throw new ControlPlaneError(409, 'cell action history is inconsistent', 'reconciliation_conflict')
+      }
+      return {
+        action: intent.action.action,
+        idempotencyKey: intent.action.idempotencyKey,
+        result: result ?? { ok: false, executionState: 'unknown', error: 'action intent has no receipt; reconciliation required' },
+      }
+    })
+  }
+
+  async stageArtifact(proof: LeaseProof, artifact: KernelArtifact, contentBase64: string): Promise<void> {
+    const work = await this.requireLease(proof, { rejectCancelled: true })
+    if (!this.deps.artifactStager) throw new ControlPlaneError(501, 'artifact upload is unavailable')
+    let checked: KernelArtifact
+    try { checked = snapshotArtifacts([artifact])[0]! }
+    catch { throw new ControlPlaneError(400, 'invalid artifact metadata') }
+    if (typeof contentBase64 !== 'string' || contentBase64.length > 22_369_624) {
+      throw new ControlPlaneError(413, 'artifact upload exceeds 16 MiB')
+    }
+    const bytes = Buffer.from(contentBase64, 'base64')
+    if (bytes.length !== checked.size || bytes.length > 16 * 1024 * 1024
+      || bytes.toString('base64') !== contentBase64
+      || createHash('sha256').update(bytes).digest('hex') !== checked.sha256.toLowerCase()) {
+      throw new ControlPlaneError(409, 'artifact content does not match its metadata', 'artifact_mismatch')
+    }
+    await this.deps.artifactStager.stage(work, checked, bytes)
+  }
+
   // -------------------------------------------------------------------------
   // Run events
   // -------------------------------------------------------------------------
@@ -392,8 +474,11 @@ export class ControlPlaneService {
       tenantId: work.tenantId,
       agentId: work.agentId,
       recordedAt: new Date().toISOString(),
-    })
-    if (!inserted) return // duplicate delivery of an already-recorded event
+    }, { workId: work.id, fence: proof.fence, leaseTokenHash: hashToken(proof.leaseToken) })
+    if (!inserted) {
+      await this.requireLease(proof)
+      return // duplicate delivery of an already-recorded event
+    }
     this.deps.metrics?.counter('agentos_events_recorded_total', 'Run events recorded').inc({ kind: event.kind })
     try {
       await this.deps.delivery.onEvent(work, event)
@@ -488,7 +573,11 @@ export class ControlPlaneService {
       throw new ControlPlaneError(409, 'response envelope is inconsistent with its durable records')
     }
     const current = await this.heartbeat(proof)
-    if (!current.ok || current.cancelRequested) throw new ControlPlaneError(409, 'work lease lost or cancelled before delivery')
+    if (!current.ok) {
+      await this.requireLease(proof)
+      throw new ControlPlaneError(409, 'work lease lost before delivery', 'lease_lost')
+    }
+    if (current.cancelRequested) throw new ControlPlaneError(409, 'work is cancelled; response cannot be delivered', 'work_cancelled')
     if (message.envelope.requestVersion !== (current.steer?.length ?? 0) + 1) throw new ControlPlaneError(409, 'response request version is stale')
     await this.deps.delivery.deliverMessage(work, message)
     this.deps.metrics?.counter('agentos_messages_delivered_total', 'Final assistant messages delivered').inc()
@@ -627,8 +716,18 @@ export class ControlPlaneService {
       }
       if (!isDeepStrictEqual(expected, next)) throw new ControlPlaneError(409, 'evidence does not match recorded research reads')
     }
-    const saved = await this.deps.sessions.save(session)
-    if (!saved.ok) throw new ControlPlaneError(409, 'session revision conflict')
+    const saved = await this.deps.sessions.save(session, {
+      workId: work.id, fence: proof.fence, leaseTokenHash: hashToken(proof.leaseToken),
+    })
+    if (!saved.ok) {
+      await this.requireLease(proof)
+      const current = await this.deps.sessions.get(session.key)
+      if (current && current.revision === session.revision + 1
+        && isDeepStrictEqual(current, { ...session, revision: current.revision })) {
+        return { revision: current.revision }
+      }
+      throw new ControlPlaneError(409, 'session revision conflict', 'session_conflict')
+    }
     return { revision: saved.revision }
   }
 }
