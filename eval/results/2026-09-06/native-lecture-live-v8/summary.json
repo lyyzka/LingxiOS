@@ -5,7 +5,7 @@
   "providerOrigin": "https://api.siliconflow.cn",
   "status": "awaiting_human_visual_review",
   "artifact": "lecture.html",
-  "artifactSha256": "dc18b1d6321068e0b64cfa0d2c6f2d0b9b1a5e826bf49fe758bd6dc6a64f206c",
+  "artifactSha256": "58ec547a935955ff0d7160f641442f3d9c2cc717600156103405180100b35057",
   "pageCount": 6,
   "staticValidation": {
     "passed": true,

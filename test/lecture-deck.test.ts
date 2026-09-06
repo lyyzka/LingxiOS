@@ -37,7 +37,13 @@ test('native lecture pipeline publishes offline HTML and revises only selected p
   assert.match(new TextDecoder().decode(artifacts[0]), /application\/json/)
   assert.doesNotMatch(new TextDecoder().decode(artifacts[0]), /<script[^>]+src=/)
   const html = new TextDecoder().decode(artifacts[0])
-  for (const feature of [/id="pages"/, /async function goTo/, /\.animate\(/, /classList\.add\('is-focus'\)/]) assert.match(html, feature)
+  for (const feature of [/zoom-lecture\/v2/, /anthropic-academic/, /class="fit-layer"/, /class="interaction-layer"/, /class="spatial-layer"/, /class="geometry-probe-fit"/, /class="onboarding"/]) assert.match(html, feature)
+  const bundleTag = '<script id="zoomLectureBundle" type="application/json">'
+  const bundleStart = html.indexOf(bundleTag) + bundleTag.length
+  const bundle = JSON.parse(html.slice(bundleStart, html.indexOf('</script>', bundleStart)))
+  assert.deepEqual(bundle.lecture.slides.map((item: { role: string }) => item.role), ['opening', 'content', 'closing'])
+  assert.ok(bundle.lecture.slides.every((item: { anchors: { label: string; rect: unknown }[] }) => item.anchors.every(anchor => anchor.label && anchor.rect)))
+  assert.ok(bundle.lecture.slides.flatMap((item: { steps: { advance: string }[] }) => item.steps).every((item: { advance: string }) => item.advance === 'manual'))
 
   const originalBodies = created.manifest!.slides.map(item => item.bodyHtml)
   const revised = await service.revise(scope, created.id, { instruction: 'Turn this into a process', scope: 'page', pageIds: ['pg_page_2'], expectedRevision: 1 })
