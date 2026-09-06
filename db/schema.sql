@@ -55,7 +55,7 @@ CREATE TABLE IF NOT EXISTS lingxios.lecture_decks (
   tenant_id    TEXT NOT NULL,
   principal_id TEXT NOT NULL,
   revision     INT NOT NULL CHECK (revision > 0),
-  status       TEXT NOT NULL CHECK (status IN ('planning','generating','validating','ready','failed','cancelled')),
+  status       TEXT NOT NULL CHECK (status IN ('planning','generating','validating','publishing','ready','failed','cancelled')),
   record       JSONB NOT NULL CHECK (jsonb_typeof(record) = 'object'),
   created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),

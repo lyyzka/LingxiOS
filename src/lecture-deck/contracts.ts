@@ -76,6 +76,18 @@ const strings = (value: unknown, name: string, max = 500): string[] => {
   return [...new Set(value)]
 }
 
+const record = (value: unknown, name: string): Record<string, unknown> => {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error(`${name} is invalid`)
+  return value as Record<string, unknown>
+}
+const exact = (value: Record<string, unknown>, allowed: readonly string[], name: string) => {
+  if (Object.keys(value).some(key => !allowed.includes(key))) throw new Error(`${name} has unknown fields`)
+}
+const integer = (value: unknown, name: string, min = 0, max = Number.MAX_SAFE_INTEGER) => {
+  if (!Number.isSafeInteger(value) || Number(value) < min || Number(value) > max) throw new Error(`${name} is invalid`)
+  return Number(value)
+}
+
 export function validateCreateRequest(value: unknown): LectureDeckCreateRequest {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('lecture request is invalid')
   const input = value as Record<string, unknown>
@@ -134,12 +146,76 @@ function validateTheme(value: unknown): LectureTheme {
     if (typeof value !== 'string' || !/^#[0-9a-f]{6}$/i.test(value)) throw new Error(`theme.${name} is invalid`)
     return value
   }
+  const fontFamily = theme['fontFamily'] === undefined ? undefined : text(theme['fontFamily'], 'theme.fontFamily', 300)
+  if (fontFamily && !/^[\w\s,"'-]+$/u.test(fontFamily)) throw new Error('theme.fontFamily is invalid')
   return { id: text(theme['id'], 'theme.id', 100), background: color('background'), surface: color('surface'), text: color('text'), muted: color('muted'), accent: color('accent'),
-    ...(theme['fontFamily'] === undefined ? {} : { fontFamily: text(theme['fontFamily'], 'theme.fontFamily', 300) }) }
+    ...(fontFamily ? { fontFamily } : {}) }
 }
 
+export function parseCoursePlan(value: unknown, targetSlideCount: number): CoursePlan {
+  const plan = record(value, 'course plan')
+  exact(plan, ['title', 'audience', 'prerequisites', 'objectives', 'chapters', 'targetSlideCount', 'durationMinutes', 'terminology'], 'course plan')
+  if (!Array.isArray(plan['objectives']) || !plan['objectives'].length || plan['objectives'].length > 100) throw new Error('course objectives are invalid')
+  const objectives = plan['objectives'].map((item, index) => {
+    const objective = record(item, `objective ${index}`); exact(objective, ['id', 'description'], `objective ${index}`)
+    return { id: text(objective['id'], 'objective.id', 100), description: text(objective['description'], 'objective.description', 2_000) }
+  })
+  if (new Set(objectives.map(item => item.id)).size !== objectives.length) throw new Error('objective IDs must be unique')
+  if (!Array.isArray(plan['chapters']) || !plan['chapters'].length || plan['chapters'].length > 50) throw new Error('course chapters are invalid')
+  const chapters = plan['chapters'].map((item, index) => {
+    const chapter = record(item, `chapter ${index}`); exact(chapter, ['id', 'order', 'title', 'objectiveIds', 'slideIds'], `chapter ${index}`)
+    return { id: text(chapter['id'], 'chapter.id', 100), order: integer(chapter['order'], 'chapter.order', 0, 49), title: text(chapter['title'], 'chapter.title', 500),
+      objectiveIds: strings(chapter['objectiveIds'], 'chapter.objectiveIds', 100), slideIds: strings(chapter['slideIds'], 'chapter.slideIds', 100) }
+  })
+  const pageIds = chapters.flatMap(item => item.slideIds)
+  if (integer(plan['targetSlideCount'], 'targetSlideCount', 3, 100) !== targetSlideCount || pageIds.length !== targetSlideCount) throw new Error('course plan does not satisfy targetSlideCount')
+  if (new Set(chapters.map(item => item.id)).size !== chapters.length || new Set(chapters.map(item => item.order)).size !== chapters.length
+    || new Set(pageIds).size !== pageIds.length || pageIds.some(id => !/^pg_[\w-]{1,80}$/u.test(id))) throw new Error('course plan identities are invalid')
+  const objectiveIds = new Set(objectives.map(item => item.id))
+  if (chapters.some(item => item.objectiveIds.some(id => !objectiveIds.has(id)))) throw new Error('chapter references an unknown objective')
+  const terminology = record(plan['terminology'], 'terminology')
+  if (Object.entries(terminology).length > 200 || Object.entries(terminology).some(([key, value]) => !key.trim() || typeof value !== 'string' || !value.trim())) throw new Error('terminology is invalid')
+  return { title: text(plan['title'], 'course.title', 500), audience: text(plan['audience'], 'course.audience', 2_000), prerequisites: strings(plan['prerequisites'], 'course.prerequisites', 100),
+    objectives, chapters, targetSlideCount, durationMinutes: integer(plan['durationMinutes'], 'durationMinutes', 1, 1_000), terminology: terminology as Record<string, string> }
+}
+
+export function parseSlideSpec(value: unknown, expected: { id: string; order: number; chapterId: string; evidence: readonly EvidenceSnapshot[] }): SlideSpec {
+  const slide = record(value, 'slide'); exact(slide, ['id', 'order', 'chapterId', 'role', 'purpose', 'title', 'conclusion', 'visualKind', 'bodyHtml', 'anchors', 'steps', 'bindings'], 'slide')
+  if (!['cover', 'content', 'section', 'summary', 'ending'].includes(String(slide['role']))) throw new Error('slide.role is invalid')
+  if (!['explain', 'example', 'counterexample', 'practice', 'review', 'assessment'].includes(String(slide['purpose']))) throw new Error('slide.purpose is invalid')
+  if (!['diagram', 'process', 'chart', 'comparison', 'formula', 'exercise', 'source-image'].includes(String(slide['visualKind']))) throw new Error('slide.visualKind is invalid')
+  if (!Array.isArray(slide['anchors']) || slide['anchors'].length > 100) throw new Error('slide.anchors is invalid')
+  const anchors = slide['anchors'].map((item, index) => {
+    const anchor = record(item, `anchor ${index}`); exact(anchor, ['id', 'x', 'y', 'width', 'height'], `anchor ${index}`)
+    const number = (name: string) => { const result = Number(anchor[name]); if (!Number.isFinite(result)) throw new Error(`anchor.${name} is invalid`); return result }
+    return { id: text(anchor['id'], 'anchor.id', 100), x: number('x'), y: number('y'), width: number('width'), height: number('height') }
+  })
+  if (!Array.isArray(slide['bindings']) || slide['bindings'].length > 100) throw new Error('slide.bindings is invalid')
+  const snapshots = new Set(expected.evidence.map(item => item.id))
+  const bindings = slide['bindings'].map((item, index) => {
+    const binding = record(item, `binding ${index}`); exact(binding, ['claimId', 'snapshotId', 'evidenceMarkers', 'kind', 'statement'], `binding ${index}`)
+    if (!['source', 'derived', 'teaching-example'].includes(String(binding['kind']))) throw new Error('binding.kind is invalid')
+    const snapshotId = text(binding['snapshotId'], 'binding.snapshotId', 200)
+    if (binding['kind'] !== 'teaching-example' && !snapshots.has(snapshotId)) throw new Error('binding snapshot is unavailable to this slide')
+    return { claimId: text(binding['claimId'], 'binding.claimId', 100), snapshotId, evidenceMarkers: strings(binding['evidenceMarkers'], 'binding.evidenceMarkers', 50), kind: binding['kind'] as EvidenceBinding['kind'], statement: text(binding['statement'], 'binding.statement', 2_000) }
+  })
+  if (!Array.isArray(slide['steps']) || slide['steps'].length > 100) throw new Error('slide.steps is invalid')
+  const steps = slide['steps'].map((item, index) => {
+    const step = record(item, `step ${index}`); exact(step, ['id', 'title', 'explanation', 'anchorIds', 'claimIds'], `step ${index}`)
+    return { id: text(step['id'], 'step.id', 100), title: text(step['title'], 'step.title', 500), explanation: text(step['explanation'], 'step.explanation', 10_000), anchorIds: strings(step['anchorIds'], 'step.anchorIds', 100), claimIds: strings(step['claimIds'], 'step.claimIds', 100) }
+  })
+  return { id: expected.id, order: expected.order, chapterId: expected.chapterId, role: slide['role'] as SlideRole, purpose: slide['purpose'] as TeachingPurpose,
+    title: text(slide['title'], 'slide.title', 500), conclusion: text(slide['conclusion'], 'slide.conclusion', 2_000), visualKind: slide['visualKind'] as VisualKind,
+    bodyHtml: text(slide['bodyHtml'], 'slide.bodyHtml', 500_000), anchors, steps, bindings }
+}
+
+export const COURSE_PLAN_OUTPUT = `{"title":"string","audience":"string","prerequisites":["string"],"objectives":[{"id":"string","description":"string"}],"chapters":[{"id":"string","order":0,"title":"string","objectiveIds":["objective id"],"slideIds":["pg_stable_id"]}],"targetSlideCount":3,"durationMinutes":30,"terminology":{"term":"definition"}}`
+export const SLIDE_OUTPUT = `{"id":"pg_id","order":0,"chapterId":"chapter id","role":"cover|content|section|summary|ending","purpose":"explain|example|counterexample|practice|review|assessment","title":"string","conclusion":"string","visualKind":"diagram|process|chart|comparison|formula|exercise|source-image","bodyHtml":"inline HTML with accessible SVG and data-anchor-id attributes","anchors":[{"id":"string","x":0,"y":0,"width":1,"height":1}],"steps":[{"id":"string","title":"string","explanation":"string","anchorIds":["anchor id"],"claimIds":["claim id"]}],"bindings":[{"claimId":"string","snapshotId":"provided snapshot id","evidenceMarkers":["S1"],"kind":"source|derived|teaching-example","statement":"string"}]}`
+
 export function newPageId(): string { return `pg_${randomUUID().replaceAll('-', '')}` }
-export function contentHash(value: unknown): string { return createHash('sha256').update(JSON.stringify(value)).digest('hex') }
+const canonical = (value: unknown): unknown => Array.isArray(value) ? value.map(canonical) : value && typeof value === 'object'
+  ? Object.fromEntries(Object.entries(value as Record<string, unknown>).sort(([left], [right]) => left.localeCompare(right)).map(([key, item]) => [key, canonical(item)])) : value
+export function contentHash(value: unknown): string { return createHash('sha256').update(JSON.stringify(canonical(value))).digest('hex') }
 
 export function evidenceFor(snapshot: EvidenceSnapshot, markers: readonly string[]): EvidenceItem[] {
   const wanted = new Set(markers)

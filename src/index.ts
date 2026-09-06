@@ -1,6 +1,6 @@
 /** First-release public API: assembled runtime and stable data contracts. */
 export { releaseVersions } from './versions.js'
-export { createLingxiOS, type LingxiOSOptions, type RequestInput, type MessageIdentity, type ActionResolutionInput } from './app/index.js'
+export { createLingxiOS, type LingxiOSOptions, type RequestInput, type LectureRequestInput, type LectureOperationInput, type MessageIdentity, type ActionResolutionInput } from './app/index.js'
 export { packageResources } from './app/resources.js'
 export { doctor, type DoctorCheck } from './app/doctor.js'
 export { ConfigError } from './errors.js'
