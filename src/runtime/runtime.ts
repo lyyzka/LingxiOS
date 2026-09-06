@@ -67,6 +67,45 @@ export interface AgentRuntimeOptions {
   promptContractVersion?: string
   /** Persist normalized model inputs/outputs in internal events for replay audits. */
   recordModelPayloads?: boolean
+  modelTrace?: ModelTracePolicy
+  rootModelBudget?: RootModelBudgetOptions
+  /** Product-owned billing/limit ledger. Failure is fatal so usage cannot disappear silently. */
+  onModelCall?: ModelCallObserver
+}
+
+export interface ModelCallObservation {
+  callId: string
+  purpose: 'agent-turn' | 'structured' | 'compaction'
+  workId: string
+  tenantId: string
+  agentId: string
+  sessionId: string
+  threadId?: string
+  principalId?: string
+  model: string
+  usage?: { available: boolean; inputTokens: number; outputTokens: number }
+  latencyMs: number
+  status: 'succeeded' | 'failed'
+  error?: string
+}
+
+export type ModelCallObserver = (observation: ModelCallObservation) => Promise<void>
+
+export interface ModelTracePolicy {
+  recordPayloads?: boolean
+  /** Required for payload capture unless explicitly accepting full raw payloads. */
+  redact?: (payload: unknown) => unknown
+  sampleRate?: number
+  retentionDays?: number
+}
+
+export interface RootModelBudgetOptions {
+  maxModelCalls?: number
+  maxTokens?: number
+  maxCostMicros?: number
+  wallClockMs?: number
+  inputCostMicrosPerMillion?: number
+  outputCostMicrosPerMillion?: number
 }
 
 interface AttemptSignals {
@@ -87,6 +126,9 @@ export class AgentRuntime {
   private readonly logger: Logger
   private readonly promptContractVersion: string
   private readonly recordModelPayloads: boolean
+  private readonly modelTrace: Required<Pick<ModelTracePolicy, 'sampleRate' | 'retentionDays'>> & Pick<ModelTracePolicy, 'redact'>
+  private readonly rootModelBudget: Required<RootModelBudgetOptions>
+  private readonly onModelCall: ModelCallObserver | undefined
   private readonly processors = new Map<string, WorkProcessor | 'conversation'>()
   private readonly eventSeqByRun = new Map<string, number>()
 
@@ -102,13 +144,71 @@ export class AgentRuntime {
     this.heartbeatMs = options.heartbeatMs ?? 5_000
     this.compaction = { ...DEFAULT_COMPACTION, ...(model.contextWindowTokens ? { contextWindowTokens: model.contextWindowTokens } : {}), ...options.compaction }
     this.logger = options.logger ?? nullLogger
-    this.promptContractVersion = options.promptContractVersion ?? 'prompt-v5'
-    this.recordModelPayloads = options.recordModelPayloads ?? true
+    this.promptContractVersion = options.promptContractVersion ?? 'prompt-v6'
+    this.recordModelPayloads = options.recordModelPayloads ?? false
+    this.modelTrace = { sampleRate: options.modelTrace?.sampleRate ?? 1,
+      retentionDays: options.modelTrace?.retentionDays ?? 30, ...(options.modelTrace?.redact ? { redact: options.modelTrace.redact } : {}) }
+    if (this.modelTrace.sampleRate < 0 || this.modelTrace.sampleRate > 1
+      || !Number.isFinite(this.modelTrace.sampleRate)) throw new Error('model trace sampleRate must be between 0 and 1')
+    if (!Number.isSafeInteger(this.modelTrace.retentionDays) || this.modelTrace.retentionDays < 1) throw new Error('model trace retentionDays must be a positive integer')
+    if (options.modelTrace?.recordPayloads === true) this.recordModelPayloads = true
+    this.rootModelBudget = {
+      maxModelCalls: options.rootModelBudget?.maxModelCalls ?? this.maxHops,
+      maxTokens: options.rootModelBudget?.maxTokens ?? 1_000_000,
+      maxCostMicros: options.rootModelBudget?.maxCostMicros ?? 10_000_000,
+      wallClockMs: options.rootModelBudget?.wallClockMs ?? 30 * 60_000,
+      inputCostMicrosPerMillion: options.rootModelBudget?.inputCostMicrosPerMillion ?? 0,
+      outputCostMicrosPerMillion: options.rootModelBudget?.outputCostMicrosPerMillion ?? 0,
+    }
+    this.onModelCall = options.onModelCall
+    for (const [name, value] of Object.entries(this.rootModelBudget)) {
+      if (!Number.isSafeInteger(value) || value < (name.includes('CostMicrosPerMillion') ? 0 : 1)) throw new Error(`${name} must be a positive safe integer`)
+    }
   }
 
   /** Register a custom processor or the normal conversation pipeline for a work kind. */
   registerProcessor(kind: string, processor: WorkProcessor | 'conversation'): void {
     this.processors.set(kind, processor)
+  }
+
+  private observedModel(work: WorkItem): ModelDriver {
+    if (!this.onModelCall) return this.model
+    const observer = this.onModelCall
+    let sequence = 0
+    const call = async <T extends { model: string; usage: { available: boolean; inputTokens: number; outputTokens: number } }>(
+      purpose: ModelCallObservation['purpose'], operation: () => Promise<T>,
+    ): Promise<T> => {
+      const callId = `${work.id}:${work.fence}:model:${++sequence}`
+      const startedAt = Date.now()
+      let result: T
+      try {
+        result = await operation()
+      } catch (error) {
+        await observer({ callId, purpose, workId: work.id, tenantId: work.tenantId, agentId: work.agentId,
+          sessionId: work.sessionId, ...(work.threadId ? { threadId: work.threadId } : {}),
+          ...(work.principalId ? { principalId: work.principalId } : {}), model: this.model.modelId ?? 'unknown',
+          latencyMs: Date.now() - startedAt, status: 'failed', error: errorMessage(error) })
+        throw error
+      }
+      await observer({ callId, purpose, workId: work.id, tenantId: work.tenantId, agentId: work.agentId,
+        sessionId: work.sessionId, ...(work.threadId ? { threadId: work.threadId } : {}),
+        ...(work.principalId ? { principalId: work.principalId } : {}), model: result.model,
+        usage: result.usage, latencyMs: Date.now() - startedAt, status: 'succeeded' })
+      return result
+    }
+    return {
+      ...(this.model.modelId === undefined ? {} : { modelId: this.model.modelId }),
+      ...(this.model.configurationFingerprint === undefined ? {} : { configurationFingerprint: this.model.configurationFingerprint }),
+      ...(this.model.contextWindowTokens === undefined ? {} : { contextWindowTokens: this.model.contextWindowTokens }),
+      ...(this.model.maxOutputTokens === undefined ? {} : { maxOutputTokens: this.model.maxOutputTokens }),
+      ...(this.model.toolDefinitionTokens === undefined ? {} : { toolDefinitionTokens: this.model.toolDefinitionTokens }),
+      run: (request) => call('agent-turn', async () => {
+        const result = await this.model.run(request)
+        return { ...result, model: result.model ?? this.model.modelId ?? 'unknown' }
+      }),
+      structured: (request) => call('structured', () => this.model.structured(request)),
+      compact: (request) => call('compaction', () => this.model.compact(request)),
+    }
   }
 
   private async event(work: WorkItem, runId: string, event: Omit<RunEvent, 'runId' | 'seq'>): Promise<number> {
@@ -177,6 +277,7 @@ export class AgentRuntime {
     const signals = this.startSignals(work, signal)
     let activeSession: SessionRecord | null = null
     const log = this.logger.child({ runId, workId: work.id, agentId: work.agentId, fence: work.fence })
+    const model = this.observedModel(work)
 
     try {
       await this.event(work, runId, {
@@ -192,7 +293,7 @@ export class AgentRuntime {
       if (processor !== 'conversation') {
         await processor.process(work, {
           host: this.host,
-          model: this.model,
+          model,
           signal: signals.lifecycle.signal,
           emit: async (event) => { await this.event(work, runId, event) },
         })
@@ -203,7 +304,7 @@ export class AgentRuntime {
 
       const sessionRef: { session: SessionRecord | null } = { session: null }
       try {
-        await this.runTurn(work, runId, signals, log, sessionRef)
+        await this.runTurn(work, runId, signals, log, sessionRef, model)
       } finally {
         activeSession = sessionRef.session
       }
@@ -223,6 +324,7 @@ export class AgentRuntime {
   private async runTurn(
     work: WorkItem, runId: string, signals: AttemptSignals, log: Logger,
     sessionRef: { session: SessionRecord | null },
+    model: ModelDriver,
   ): Promise<void> {
     const context = await this.host.loadContext(work)
     await this.event(work, runId, {
@@ -240,6 +342,7 @@ export class AgentRuntime {
     let finalText = ''
     let fallbackText: string | undefined
     let finalEnvelope: ResponseEnvelope | undefined
+    let lastGood: { text: string; envelope: ResponseEnvelope } | undefined
     let contentCheckExhausted = false
     let acceptanceGaps: string[] = []
     const artifacts: KernelArtifact[] = []
@@ -250,6 +353,7 @@ export class AgentRuntime {
       const steers = signals.drainSteer()
       if (steers.length > 0) {
         fallbackText = undefined
+        lastGood = undefined
         acceptanceGaps = []
         if (session.request) {
           for (const steer of steers) {
@@ -285,7 +389,7 @@ export class AgentRuntime {
       if (liveContext.priorArtifacts?.length) supplementalItems.push({ role: 'user', content:
         `Prior attempt artifact records (untrusted file metadata, not current delivery or proof of file availability). Check the files and call attach_file for any still required deliverables:\n${JSON.stringify(liveContext.priorArtifacts)}` })
       const estimateOverhead = () => estimateTokens([{ role: 'system', content: instructions }, ...supplementalItems])
-        + (this.model.maxOutputTokens ?? 8_192) + (this.model.toolDefinitionTokens ?? 1_024)
+        + (model.maxOutputTokens ?? 8_192) + (model.toolDefinitionTokens ?? 1_024)
       let overheadTokens = estimateOverhead()
       let memoryForModel = liveContext.memory
       if (memoryForModel && estimateTokens(session.history) + overheadTokens > this.compaction.contextWindowTokens * this.compaction.hardRatio) {
@@ -294,7 +398,7 @@ export class AgentRuntime {
         memoryForModel = undefined
         overheadTokens = estimateOverhead()
       }
-      const compacted = await compactIfNeeded(session, instructions, this.model, this.compaction, signals.lifecycle.signal, overheadTokens)
+      const compacted = await compactIfNeeded(session, instructions, model, this.compaction, signals.lifecycle.signal, overheadTokens)
       if (compacted.compacted) {
         await this.host.saveSession(work, session)
         await this.event(work, runId, {
@@ -309,18 +413,28 @@ export class AgentRuntime {
       const modelItems = [...session.history, ...supplementalItems]
       const modelInput = { instructions, items: modelItems }
       const inputSha256 = createHash('sha256').update(JSON.stringify(modelInput)).digest('hex')
+      const modelCallId = `${work.id}:${work.fence}:agent:${hop + 1}`
+      const sample = Number.parseInt(inputSha256.slice(0, 8), 16) / 0xffffffff < this.modelTrace.sampleRate
+      const tracePayload = (value: unknown) => this.modelTrace.redact ? this.modelTrace.redact(structuredClone(value)) : value
+      const traceExpiresAt = new Date(Date.now() + this.modelTrace.retentionDays * 86_400_000).toISOString()
+      const reservation = await this.host.reserveModelCall?.(work, modelCallId, {
+        maxModelCalls: this.rootModelBudget.maxModelCalls, maxTokens: this.rootModelBudget.maxTokens,
+        maxCostMicros: this.rootModelBudget.maxCostMicros,
+        deadlineAt: new Date(Date.now() + this.rootModelBudget.wallClockMs).toISOString(),
+      })
+      if (reservation && !reservation.allowed) throw new HardLimitExceededError('root work model budget exhausted')
       await this.event(work, runId, { kind: 'model.started', stage: 'started', visibility: 'internal', data: {
-        hop: hop + 1, ...(memoryForModel ? { memorySnapshotId: memoryForModel.id, memorySnapshot: memoryForModel }
+        hop: hop + 1, callId: modelCallId, ...(memoryForModel ? { memorySnapshotId: memoryForModel.id, memorySnapshot: memoryForModel }
           : liveContext.memory ? { memoryOmittedForBudget: true } : {}),
-        model: this.model.modelId ?? 'unknown', inputSha256,
-        ...(this.recordModelPayloads ? { input: modelInput } : {}),
+        model: model.modelId ?? 'unknown', providerConfigSha256: model.configurationFingerprint ?? 'unknown', inputSha256,
+        ...(this.recordModelPayloads && sample ? { input: tracePayload(modelInput) } : {}), traceExpiresAt,
         sessionRevision: session.revision, compactionEpoch: session.compactionEpoch,
-        toolProtocol: 'ipython-v1', decision: protocolCorrection ? 'correction' : hop === 0 ? 'initial' : 'continue',
+        promptContractVersion: this.promptContractVersion, toolProtocol: 'ipython-v1', decision: protocolCorrection ? 'correction' : hop === 0 ? 'initial' : 'continue',
       } })
       let turn
       try {
         protocolCorrection = null
-        turn = await this.model.run({
+        turn = await model.run({
           instructions,
           items: modelItems,
           signal: signals.lifecycle.signal,
@@ -328,7 +442,7 @@ export class AgentRuntime {
       } catch (error) {
         await this.event(work, runId, {
           kind: 'model.failed', stage: 'failed', visibility: 'internal',
-          data: { hop: hop + 1, model: this.model.modelId ?? 'unknown', error: errorMessage(error) },
+          data: { hop: hop + 1, model: model.modelId ?? 'unknown', error: errorMessage(error) },
         })
         if (error instanceof ModelDriverError && error.diagnostics.kind === 'protocol' && budget.consume('tool_protocol')) {
           protocolCorrection = {
@@ -337,17 +451,31 @@ export class AgentRuntime {
           }
           continue
         }
+        if (lastGood) {
+          finalText = lastGood.text
+          finalEnvelope = { ...lastGood.envelope, goalOutcome: { ...lastGood.envelope.goalOutcome,
+            status: 'partial', verification: 'inconclusive', gaps: [...(lastGood.envelope.goalOutcome.gaps ?? []), `Later model call failed: ${errorMessage(error)}`] } }
+          break
+        }
         throw error
       }
       await this.event(work, runId, {
         kind: 'model.completed', stage: 'completed', visibility: 'internal',
         data: {
-          hop: hop + 1, model: turn.model ?? 'unknown', purpose: 'agent-turn',
+          hop: hop + 1, callId: modelCallId, model: turn.model ?? 'unknown', purpose: 'agent-turn',
           usage: turn.usage, ...(turn.diagnostics ? { diagnostics: turn.diagnostics } : {}),
-          inputSha256, ...(this.recordModelPayloads ? { output: turn.output,
-            ...(turn.finalCandidate === undefined ? {} : { finalCandidate: turn.finalCandidate }) } : {}),
+          inputSha256, providerConfigSha256: model.configurationFingerprint ?? 'unknown', traceExpiresAt,
+          ...(this.recordModelPayloads && sample ? { output: tracePayload(turn.output),
+            ...(turn.finalCandidate === undefined ? {} : { finalCandidate: tracePayload(turn.finalCandidate) }) } : {}),
         },
       })
+      if (this.host.recordModelUsage) {
+        const inputTokens = turn.usage.available ? turn.usage.inputTokens : 0
+        const outputTokens = turn.usage.available ? turn.usage.outputTokens : 0
+        const costMicros = Math.ceil((inputTokens * this.rootModelBudget.inputCostMicrosPerMillion
+          + outputTokens * this.rootModelBudget.outputCostMicrosPerMillion) / 1_000_000)
+        await this.host.recordModelUsage(work, modelCallId, { inputTokens, outputTokens, costMicros })
+      }
 
       await signals.refresh()
       if (signals.leaseLost()) throw signals.leaseLost()!
@@ -412,6 +540,14 @@ export class AgentRuntime {
       }
 
       if (assessment?.status === 'partial' && hop + 1 < this.maxHops && budget.consume('content_acceptance')) {
+        if (session.request && !this.policy.validateAssistantText(turn.text, liveContext)) {
+          try {
+            lastGood = { text: turn.text.trim(), envelope: createResponseEnvelope(turn.text.trim(), {
+              status: 'partial', verification: 'not_run', requestVersion: session.request.revisions.length + 1,
+              gaps: assessment.gaps,
+            }, evidence(), artifacts, session.request.contract, session.request.resourceChecks, assessment) }
+          } catch { /* Invalid citations or envelope fields are not a deliverable candidate. */ }
+        }
         session.history.push(...turn.output)
         await this.host.saveSession(work, session)
         await this.event(work, runId, { kind: 'response.withheld', stage: 'failed', visibility: 'internal',
@@ -425,6 +561,7 @@ export class AgentRuntime {
 
       if (calls.length === 0) {
         let violation = this.policy.validateAssistantText(turn.text, liveContext)
+        if (!violation && assessment) violation = this.policy.validateCompletion?.(turn.text, assessment, liveContext) ?? null
         let contentCheckError: string | undefined
         let resourceGaps: string[] = []
         let needsContentCheck = Boolean(session.request?.contract || session.request?.resourceChecks?.some(record =>
@@ -525,7 +662,16 @@ export class AgentRuntime {
       const call = calls[0]!
       session.history.push(...turn.output)
       await this.host.saveSession(work, session)
-      const outcome = await this.executeCall(work, runId, session, call, signals, budget, nextStreamPartIndex, capabilities, artifacts)
+      let outcome
+      try {
+        outcome = await this.executeCall(work, runId, session, call, signals, budget, nextStreamPartIndex, capabilities, artifacts)
+      } catch (error) {
+        if (!lastGood) throw error
+        finalText = lastGood.text
+        finalEnvelope = { ...lastGood.envelope, goalOutcome: { ...lastGood.envelope.goalOutcome,
+          status: 'partial', verification: 'inconclusive', gaps: [...(lastGood.envelope.goalOutcome.gaps ?? []), `Later tool execution failed: ${errorMessage(error)}`] } }
+        break
+      }
       nextStreamPartIndex = outcome.nextStreamPartIndex
       if (outcome.correction) {
         protocolCorrection = outcome.correction
@@ -535,6 +681,13 @@ export class AgentRuntime {
 
     }
 
+    if (finalText && !streamedText) {
+      session.history.push({ role: 'assistant', content: finalText })
+      await this.host.saveSession(work, session)
+      await this.event(work, runId, { kind: 'model.delta', stage: 'delta', visibility: 'user',
+        data: { delta: finalText, partType: 'text', partIndex: nextStreamPartIndex++, partStart: true } })
+      streamedText = finalText
+    }
     if (!finalText) {
       await signals.refresh()
       if (signals.leaseLost()) throw signals.leaseLost()!
@@ -674,19 +827,19 @@ export class AgentRuntime {
       }
       artifacts.push(...execution.artifacts)
       if (artifacts.length > 512) throw new Error('artifact count exceeds the per-run limit')
-      session.history.push({
-        type: 'function_call_output', callId: call.callId,
-        output: boundedToolOutput({
+      const output = boundedToolOutput({
           stdout: execution.stdout, stderr: execution.stderr, result: execution.result,
           truncated: execution.truncated, artifacts: execution.artifacts, receipts,
-        }),
-      })
+        })
+      session.history.push({ type: 'function_call_output', callId: call.callId, output })
       await this.event(work, runId, {
         kind: 'ipython.completed', stage: 'completed', visibility: 'internal',
         data: {
           callId: call.callId, durationMs: execution.durationMs,
           truncated: execution.truncated, artifactCount: execution.artifacts.length,
           artifacts: execution.artifacts,
+          requestVersion: (session.request?.revisions.length ?? 0) + 1,
+          output,
         },
       })
       for (const receipt of receipts) {
@@ -796,6 +949,25 @@ export class AgentRuntime {
       if ('type' in item && item.type === 'function_call_output') pendingCalls.delete(item.callId)
     }
     for (const callId of pendingCalls) {
+      const step = await this.host.recoverStep?.(work, callId)
+      if (step) {
+        session.history.push({ type: 'function_call_output', callId, output: step.output })
+        const journal = JSON.parse(step.output) as { receipts?: Array<{ action: string; idempotencyKey: string; result: HostActionResult }> }
+        for (const receipt of journal.receipts ?? []) {
+          if (receipt.action === 'research.read' && session.request?.evidence) {
+            session.request.evidence = appendResearchEvidence(session.request.evidence, receipt.idempotencyKey, receipt.result)
+          } else if (receipt.action === 'task.check_resource' && session.request) {
+            session.request.resourceChecks = appendResourceCheck(session.request.resourceChecks ?? [], receipt.idempotencyKey,
+              receipt.result, session.request.revisions.length + 1)
+          } else if (receipt.action === 'task.contract' && receipt.result.ok && receipt.result.directive?.type === 'task_contract' && session.request) {
+            const draft = receipt.result.directive.data
+            session.request.contract = createTaskContract(session.request.originalText, session.request.revisions.length + 1, {
+              deliverables: draft?.['deliverables'], constraints: draft?.['constraints'], actions: draft?.['actions'], acceptance: draft?.['acceptance'],
+            })
+          }
+        }
+        continue
+      }
       const receipts = await this.host.recoverCell?.(work, callId)
       if (!receipts?.length) throw new Error('unresolved tool execution checkpoint; reconcile before continuing')
       if (receipts.some(({ result }) => result.executionState === 'unknown')

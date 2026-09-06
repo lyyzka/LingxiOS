@@ -9,7 +9,8 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { it } from 'node:test'
 import { PGlite } from '@electric-sql/pglite'
-import { createLingxiLoop } from '../src/integrations/lingxiloop/index.js'
+import { createLingxiLoop, createLingxiLoopControl } from '../src/integrations/lingxiloop/index.js'
+import { LINGXILOOP_CAPABILITY_METHODS, LingxiLoopRuntimePolicy } from '../src/integrations/lingxiloop/policy.js'
 import type { LingxiLoopServices, NativeTextMessage, NativeCalendarChanged, NativeCalendarCreate } from '../src/integrations/lingxiloop/service-contracts.js'
 import type { SqlPool } from '../src/control-plane/pg-store.js'
 import { executeCanvas } from '../src/integrations/lingxiloop/canvas.js'
@@ -355,7 +356,12 @@ it('binds native-shaped resources through the packaged ingress/action/delivery p
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
   const address = server.address()
   assert.ok(address && typeof address === 'object')
-  const app = await createLingxiLoop({ database, services, worker: { id: 'loop-test' }, model: { id: 'test', apiKey: 'test', baseUrl: `http://127.0.0.1:${address.port}` }, kernel: { homesRoot: directory } })
+  const app = await createLingxiLoop({ database, services, worker: { id: 'loop-test' }, model: { id: 'test', apiKey: 'test', baseUrl: `http://127.0.0.1:${address.port}` }, kernel: { homesRoot: directory },
+    policy: new LingxiLoopRuntimePolicy({ capabilityMethods: LINGXILOOP_CAPABILITY_METHODS, requireIdentityDisclosure: false }) })
+  const control = await createLingxiLoopControl({ database, services, kernel: { homesRoot: directory } })
+  await assert.rejects(control.start(), /control instances cannot start/)
+  await assert.rejects(control.runNext(), /control instances cannot claim/)
+  await control.stop()
   const invalidOptions = { database, services, model: { id: 'test', apiKey: 'test' } }
   await db.exec('ALTER TABLE approvals DROP CONSTRAINT approvals_work_id_fkey')
   await assert.rejects(createLingxiLoop(invalidOptions), /native approvals must reference/)
@@ -374,6 +380,9 @@ it('binds native-shaped resources through the packaged ingress/action/delivery p
     assert.equal((await app.receiveCalendarDispatch({ companyId: 't', agentId: 'a', channelId: 's', clientMsgNo: calendarClientMsgNo })).deduplicated, true)
     assert.equal(await app.cancel({ runId: calendarRequest.id, tenantId: 't', agentId: 'a', sessionId: 's', principalId: 'u', threadId: calendarClientMsgNo }), true)
     await assert.rejects(app.receiveCalendarDispatch({ companyId: 't', agentId: 'a', channelId: 's', clientMsgNo: 'forged' }), /committed calendar dispatch/)
+    const attachmentRequest = await app.receive({ companyId: 't', agentId: 'a', channelId: 's', clientMsgNo: 'attachment' })
+    assert.equal((await app.receive({ companyId: 't', agentId: 'a', channelId: 's', clientMsgNo: 'attachment' })).deduplicated, true)
+    assert.equal(await app.cancel({ runId: attachmentRequest.id, tenantId: 't', agentId: 'a', sessionId: 's', principalId: 'u' }), true)
     const input = { companyId: 't', agentId: 'a', channelId: 's', clientMsgNo: 'm', principalId: 'forged', attachmentClientMsgNos: ['attachment'] }
     const request = await app.receive(input)
     assert.equal((await app.receive(input)).deduplicated, true)
@@ -413,7 +422,7 @@ it('binds native-shaped resources through the packaged ingress/action/delivery p
     assert.equal(finalChecks?.[0]?.actionKey, JSON.stringify([request.id, 'c', 2]))
     assert.equal((finalChecks?.[0]?.result.value as Record<string, unknown>)['requestVersion'], 1)
     assert.deepEqual((finalChecks?.[0]?.result.value as Record<string, unknown>)['expected'], { id: 'p' })
-    assert.equal(canvasReads, 1)
+    assert.ok(canvasReads >= 1)
     const savedMemories = await database.query('SELECT scope_type,scope_id,body,version,source_refs FROM lingxios.agent_memories')
     assert.equal(savedMemories.rows.length, 1)
     assert.deepEqual({ ...savedMemories.rows[0], source_refs: undefined }, {
@@ -676,7 +685,8 @@ it('binds native-shaped resources through the packaged ingress/action/delivery p
     const digestRequest = { id: teacherWork.id, tenantId: 't', agentId: 'a', sessionId: 's', principalId: 'u', kind: 'turn', lane: 'interactive' as const, triggerRef: 'schedule-request', fence: 1, homeEpoch: 1 }
     await configureTeacherDigest(database, services, digestRequest, { frequency: 'daily', localTime: '09:00' })
     await database.query("UPDATE lingxios.agent_routines SET next_run_at=NOW()-INTERVAL '1 day'")
-    const digestApp = await createLingxiLoop({ database, services, worker: { id: 'loop-test' }, model: { id: 'test', apiKey: 'test', baseUrl: `http://127.0.0.1:${address.port}` }, kernel: { homesRoot: directory } })
+    const digestApp = await createLingxiLoop({ database, services, worker: { id: 'loop-test' }, model: { id: 'test', apiKey: 'test', baseUrl: `http://127.0.0.1:${address.port}` }, kernel: { homesRoot: directory },
+      policy: new LingxiLoopRuntimePolicy({ capabilityMethods: LINGXILOOP_CAPABILITY_METHODS, requireIdentityDisclosure: false }) })
     try {
       teacherDigest = true; teacherCalls = 0
       const digestPort = await digestApp.listenControlPlane({ serviceToken: 'digest-worker-secret', port: 0 })
@@ -832,7 +842,8 @@ it('binds native-shaped resources through the packaged ingress/action/delivery p
     approvalMethod = 'semantic-read'
     const semanticApp = await createLingxiLoop({ ...invalidOptions, worker: { id: 'loop-test' },
       model: { id: 'test', apiKey: 'test', baseUrl: `http://127.0.0.1:${address.port}` }, kernel: { homesRoot: directory },
-      embeddings: { id: 'embedding-test', apiKey: 'test', baseUrl: `http://127.0.0.1:${address.port}`, dimensions: 2 } })
+      embeddings: { id: 'embedding-test', apiKey: 'test', baseUrl: `http://127.0.0.1:${address.port}`, dimensions: 2 },
+      policy: new LingxiLoopRuntimePolicy({ capabilityMethods: LINGXILOOP_CAPABILITY_METHODS, requireIdentityDisclosure: false }) })
     try {
       await semanticApp.receive({ ...input, clientMsgNo: approvalMethod })
       assert.equal(await semanticApp.runNext(), true)

@@ -10,7 +10,7 @@ import { continueInput, type InputContinuation } from './input.js'
 import { randomUUID } from 'node:crypto'
 import { ConfigError } from '../errors.js'
 import { ControlPlaneService } from '../control-plane/service.js'
-import { withTransaction, PgWorkStore, PgSessionStore, PgEventStore, PgActionLedger, type SqlPool } from '../control-plane/pg-store.js'
+import { withTransaction, PgWorkStore, PgSessionStore, PgEventStore, PgActionLedger, PgModelBudgetStore, type SqlPool } from '../control-plane/pg-store.js'
 import type { HostPort } from '../host/port.js'
 import { KernelManager, type KernelHostBridge, type KernelManagerOptions, type ManagedKernelExecutor } from '../kernel/manager.js'
 import { DEFAULT_MODEL, OpenAIChatDriver } from '../model/openai.js'
@@ -21,7 +21,9 @@ import { sessionKeyOf } from '../protocol/types.js'
 import { RUN_SEQUENCE_SPAN } from '../protocol/constants.js'
 import type { GoalOutcome } from '../protocol/outcome.js'
 import type { ControlPlaneDeps } from '../control-plane/service.js'
-import type { ActionResolution } from '../control-plane/stores.js'
+import type { ActionResolution, ContextProvider } from '../control-plane/stores.js'
+import type { RuntimePolicy } from '../runtime/policy.js'
+import type { ModelCallObserver } from '../runtime/runtime.js'
 import { lectureDeckProcessor, type LectureDeckService } from '../lecture-deck/service.js'
 import { contentHash } from '../lecture-deck/contracts.js'
 
@@ -29,9 +31,20 @@ export interface LingxiOSOptions {
   database: SqlPool
   model?: { id?: string; apiKey: string; baseUrl?: string; reasoningEffort?: 'high' | 'max'; maxOutputTokens?: number; contextWindowTokens?: number }
   persona?: PromptContext['persona']
+  /** Trusted product context loaded for each execution attempt. */
+  contextProvider?: ContextProvider
+  /** Product policy used by local runtime execution. */
+  policy?: RuntimePolicy
+  /** Opt in to storing full normalized model payloads in internal events. */
+  recordModelPayloads?: boolean
+  modelTrace?: import('../runtime/runtime.js').ModelTracePolicy
+  /** Root-work limits shared by retries and delegated children. */
+  modelBudget?: import('../runtime/runtime.js').RootModelBudgetOptions
+  /** Required for products that own billing, quota and model-call observability. */
+  onModelCall?: ModelCallObserver
   /** Optional native professional HTML lecture-deck processor. */
   lectureDeck?: LectureDeckService
-  kernel?: Pick<KernelManagerOptions, 'pythonCommand' | 'homesRoot' | 'startupTimeoutMs' | 'executionTimeoutMs' | 'hostActionTimeoutMs' | 'maxOutputChars' | 'allowNetwork'>
+  kernel?: Pick<KernelManagerOptions, 'pythonCommand' | 'homesRoot' | 'startupTimeoutMs' | 'executionTimeoutMs' | 'hostActionTimeoutMs' | 'maxOutputChars' | 'allowNetwork' | 'isolation'>
   /** Required in production for untrusted model-authored code. */
   kernelFactory?: (bridge: KernelHostBridge) => ManagedKernelExecutor
   /** Explicit opt-in for trusted model code using the local process backend in production. */
@@ -50,6 +63,13 @@ export interface RequestInput {
   authorName?: string
   threadId?: string
   attachments?: RequestAttachment[]
+}
+
+export interface DelegatedRequestInput extends RequestInput {
+  delegation: {
+    parentWorkId: string; rootWorkId: string; parentRequestVersion: number
+    instructionAuthorId: string; parentRequest: import('../context/request.js').RequestSnapshot
+  }
 }
 
 export interface MessageIdentity {
@@ -117,9 +137,10 @@ export async function assembleApp(options: LingxiOSOptions, integration?: Pick<C
   const service = new ControlPlaneService({
     work: new PgWorkStore(options.database), sessions,
     events: new PgEventStore(options.database), actions: new PgActionLedger(options.database),
+    modelBudgets: new PgModelBudgetStore(options.database),
     artifactStager: { stage: (work, artifact, bytes) => stageArtifact(
       resolve(options.kernel?.homesRoot ?? process.env['AGENT_OS_HOMES_ROOT'] ?? '.agent-os/homes'), work, artifact, bytes) },
-    contextProvider: integration?.contextProvider ?? { loadContext: async (work) => {
+    contextProvider: integration?.contextProvider ?? options.contextProvider ?? { loadContext: async (work) => {
       const text = work.meta?.['text']
       if (typeof text !== 'string' || !work.principalId) throw new Error('request text and principal are missing')
       return {
@@ -202,7 +223,12 @@ export async function assembleApp(options: LingxiOSOptions, integration?: Pick<C
   const host: HostPort = {
     claimWork: () => claimWork(workerId), heartbeat: (work) => service.heartbeat(work),
     loadContext: (work) => service.loadContext(work), executeAction: (work, action) => service.executeAction(work, action),
+    reserveModelCall: (work, callId, limits) => service.reserveModelCall(work, callId, limits),
+    recordModelUsage: (work, callId, usage) => service.recordModelUsage(work, callId, usage),
     recoverCell: (work, cellId) => service.recoverCell(work, cellId),
+    recoverStep: (work, cellId) => service.recoverStep(work, cellId),
+    stageArtifact: (work, artifact, bytes) => stageArtifact(
+      resolve(options.kernel?.homesRoot ?? process.env['AGENT_OS_HOMES_ROOT'] ?? '.agent-os/homes'), work, artifact, bytes),
     emitEvent: (work, event) => service.recordEvent(work, event), loadSession: (work, key) => service.getSession(work, key),
     saveSession: async (work, session) => { session.revision = (await service.saveSession(work, session)).revision },
     commitMessage: (work, message) => service.commitMessage(work, message), completeWork: (work, completion) => service.complete(work, completion),
@@ -218,11 +244,16 @@ export async function assembleApp(options: LingxiOSOptions, integration?: Pick<C
     if (!options.model) throw new ConfigError('model configuration is required for local execution')
     const model = new OpenAIChatDriver(options.model.id ?? DEFAULT_MODEL.id, options.model)
     const bridge: KernelHostBridge = { execute: (work, action) => service.executeAction(work, action) }
-    if (!options.kernelFactory && process.env['NODE_ENV'] === 'production' && options.trustProcessKernel !== true) {
+    if (!options.kernelFactory && options.kernel?.isolation !== 'bubblewrap' && process.env['NODE_ENV'] === 'production' && options.trustProcessKernel !== true) {
       throw new ConfigError('production local execution requires an OS-isolated kernelFactory; trustProcessKernel is only for trusted model code')
     }
     const kernels = options.kernelFactory?.(bridge) ?? new KernelManager(bridge, { ...options.kernel, maxKernels: concurrency })
-    const runtime = new AgentRuntime(host, model, kernels)
+    const runtime = new AgentRuntime(host, model, kernels, {
+      ...(options.policy ? { policy: options.policy } : {}), recordModelPayloads: options.recordModelPayloads ?? false,
+      ...(options.modelTrace ? { modelTrace: options.modelTrace } : {}),
+      ...(options.modelBudget ? { rootModelBudget: options.modelBudget } : {}),
+      ...(options.onModelCall ? { onModelCall: options.onModelCall } : {}),
+    })
     runtime.registerProcessor('memory_synthesis', memorySynthesisProcessor)
     runtime.registerProcessor('memory_index', memoryIndexProcessor)
     runtime.registerProcessor('teacher_digest', 'conversation')
@@ -243,9 +274,32 @@ export async function assembleApp(options: LingxiOSOptions, integration?: Pick<C
     readArtifact: (identity: MessageIdentity & Pick<RequestInput, 'principalId' | 'threadId'>, path: string) =>
       readArtifact(options.database, resolve(options.kernel?.homesRoot ?? process.env['AGENT_OS_HOMES_ROOT'] ?? '.agent-os/homes'), identity, path),
     continueInput: (input: InputContinuation) => continueInput(options.database, input),
-    resolveAction: (input: ActionResolutionInput) => {
+    resolveAction: async (input: ActionResolutionInput) => {
       const { tenantId, agentId, sessionId, principalId, threadId, ...resolution } = input
-      return service.resolveAction(resolution, { tenantId, agentId, sessionId, principalId, ...(threadId ? { threadId } : {}) })
+      const recorded = await service.resolveAction(resolution, { tenantId, agentId, sessionId, principalId, ...(threadId ? { threadId } : {}) })
+      await options.database.query(`WITH target AS (
+        SELECT intent->>'workId' AS work_id,(intent->>'requestVersion')::integer AS request_version
+        FROM lingxios.agent_action_intents WHERE idempotency_key=$1), unsettled AS (
+        SELECT intent.intent->>'workId' AS work_id FROM lingxios.agent_action_intents intent
+        LEFT JOIN lingxios.agent_action_ledger receipt USING(idempotency_key)
+        LEFT JOIN LATERAL (SELECT resolution->'result' AS result FROM lingxios.agent_action_resolutions
+          WHERE idempotency_key=intent.idempotency_key ORDER BY resolution_seq DESC LIMIT 1) resolved ON TRUE
+        WHERE intent.intent->>'workId'=(SELECT work_id FROM target)
+          AND (COALESCE(resolved.result,receipt.result) IS NULL
+            OR COALESCE(resolved.result,receipt.result)->>'executionState'='unknown'
+            OR COALESCE(resolved.result,receipt.result)->'approval'->>'status'='PENDING') LIMIT 1)
+      UPDATE lingxios.agent_work_items work SET status='queued',available_at=NOW(),finished_at=NULL,
+        goal_outcome=NULL,error=NULL,updated_at=NOW() FROM target
+      WHERE work.id=target.work_id AND work.tenant_id=$2 AND work.agent_id=$3 AND work.session_id=$4
+        AND work.principal_id=$5 AND work.thread_id IS NOT DISTINCT FROM $6 AND work.status='failed'
+        AND (work.goal_outcome->>'requestVersion')::integer=target.request_version
+        AND NOT EXISTS(SELECT 1 FROM unsettled)
+        AND NOT EXISTS(SELECT 1 FROM lingxios.agent_os_session_leases lease
+          WHERE lease.session_key=('[' || to_json(work.tenant_id)::text || ',' || to_json(work.agent_id)::text || ','
+            || to_json(work.session_id)::text || ',' || COALESCE(to_json(work.thread_id)::text, 'null') || ']')
+            AND lease.expires_at>NOW())`,
+      [resolution.actionKey, tenantId, agentId, sessionId, principalId, threadId ?? null])
+      return recorded
     },
     /** Trusted server boundary: use the authenticated original principal. */
     async cancel(identity: MessageIdentity & Pick<RequestInput, 'principalId' | 'threadId'>): Promise<boolean> {
@@ -267,6 +321,16 @@ export async function assembleApp(options: LingxiOSOptions, integration?: Pick<C
       }
       return service.enqueue({ ...input, kind: 'turn', lane: 'interactive', triggerRef: input.sourceRef ?? input.id ?? randomUUID(),
         meta: { text: input.text, authorName: input.authorName ?? 'User', attachments: snapshotAttachments(input.attachments ?? []) },
+      })
+    },
+    async enqueueDelegated(input: DelegatedRequestInput) {
+      const { delegation, ...request } = input
+      if (!delegation || delegation.parentRequest.workId !== delegation.parentWorkId
+        || delegation.parentRequest.revisions.length + 1 !== delegation.parentRequestVersion) throw new Error('invalid delegated request')
+      return service.enqueue({ ...request, kind: 'turn', lane: 'collaboration', triggerRef: request.sourceRef ?? request.id ?? randomUUID(),
+        meta: { text: request.text, authorName: request.authorName ?? 'Agent', attachments: snapshotAttachments(request.attachments ?? []),
+          parentWorkId: delegation.parentWorkId, rootWorkId: delegation.rootWorkId,
+          parentRequestVersion: delegation.parentRequestVersion, delegation: { ...delegation, assignment: request.text } },
       })
     },
     async enqueueLecture(input: LectureRequestInput) {

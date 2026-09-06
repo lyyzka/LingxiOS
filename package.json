@@ -1,6 +1,6 @@
 {
   "name": "lingxios",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "LingxiOS — a purpose-built, production-grade Agent OS: durable work orchestration, sandboxed code-act kernels, and a policy-extensible agent runtime.",
   "type": "module",
   "license": "MIT",
@@ -58,8 +58,6 @@
     "test": "npm run build && node --test --test-concurrency=1 \"dist/test/**/*.test.js\"",
     "test:only": "node --test --test-concurrency=1 \"dist/test/**/*.test.js\"",
     "eval:live": "npm run build && node scripts/eval-live.mjs",
-    "eval:presentations": "npm run build && node scripts/eval-presentations-live.mjs",
-    "eval:presentation-artifact": "..\\LingxiLoop\\node_modules\\.bin\\tsx scripts/eval-presentation-artifact.mts",
     "test:contracts": "node scripts/check-lingxiloop-contracts.mjs",
     "test:postgres-stores": "npm run build && node scripts/test-postgres-stores.mjs",
     "test:native-missions": "npm run build && node scripts/test-native-missions.mjs",

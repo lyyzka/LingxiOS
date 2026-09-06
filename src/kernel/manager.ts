@@ -64,6 +64,8 @@ export interface KernelManagerOptions {
   hostActionTimeoutMs?: number
   maxOutputChars?: number
   allowNetwork?: boolean
+  /** Run each Python kernel inside a separate Linux user/PID/mount/network namespace. */
+  isolation?: 'process' | 'bubblewrap'
   logger?: Logger
 }
 
@@ -115,7 +117,14 @@ class PersistentKernel {
       this.readyResolve = resolveReady
       this.readyReject = rejectReady
     })
-    const child = spawn(this.options.pythonCommand, ['-I', this.options.runnerPath], {
+    const isolated = this.options.isolation === 'bubblewrap'
+    const child = spawn(isolated ? 'bwrap' : this.options.pythonCommand, isolated ? [
+      '--die-with-parent', '--unshare-all', '--new-session',
+      ...(this.options.allowNetwork ? ['--share-net'] : []),
+      '--ro-bind', '/', '/', '--bind', this.home, this.home,
+      '--proc', '/proc', '--dev', '/dev', '--tmpfs', '/tmp', '--chdir', this.home,
+      '--', this.options.pythonCommand, '-I', this.options.runnerPath,
+    ] : ['-I', this.options.runnerPath], {
       cwd: this.home,
       stdio: ['pipe', 'pipe', 'pipe'],
       env: {
@@ -387,7 +396,9 @@ export class KernelManager implements ManagedKernelExecutor {
       hostActionTimeoutMs: options.hostActionTimeoutMs ?? 30_000,
       maxOutputChars: options.maxOutputChars ?? 8_000,
       allowNetwork: options.allowNetwork ?? false,
+      isolation: options.isolation ?? 'process',
     }
+    if (this.options.isolation === 'bubblewrap' && process.platform !== 'linux') throw new Error('bubblewrap kernel isolation requires Linux')
     this.sweepTimer = setInterval(() => this.sweepIdle(), Math.min(60_000, this.options.idleMs))
     this.sweepTimer.unref?.()
   }

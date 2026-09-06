@@ -8,6 +8,33 @@ import type { KernelExecutor } from '../src/kernel/manager.js'
 import type { ModelItem, SessionRecord, TurnContext, WorkCompletion } from '../src/protocol/types.js'
 import { AgentRuntime } from '../src/runtime/runtime.js'
 import { ApprovalPendingError, ModelDriverError } from '../src/errors.js'
+import type { ModelCallObservation } from '../src/runtime/runtime.js'
+
+it('reports every processor model call to the product ledger with durable work scope', async () => {
+  const work: TurnContext['work'] = { id: 'ledger-work', tenantId: 'tenant', agentId: 'agent', sessionId: 'room',
+    threadId: 'thread', principalId: 'human', kind: 'memory_synthesis', lane: 'background', triggerRef: 'source',
+    fence: 3, homeEpoch: 1, leaseToken: 'secret' }
+  const observations: ModelCallObservation[] = []
+  let completed: WorkCompletion | undefined
+  const host: HostPort = { claimWork: async () => null, heartbeat: async () => ({ ok: true }),
+    loadContext: async () => { throw new Error('unexpected context') }, executeAction: async () => ({ ok: true }),
+    loadSession: async () => null, saveSession: async () => {}, emitEvent: async () => {}, commitMessage: async () => {},
+    completeWork: async (_work, value) => { completed = value }, yieldWork: async () => {} }
+  const unexpected = async () => { throw new Error('unexpected model call') }
+  const model: ModelDriver = { modelId: 'model-v1', run: unexpected, compact: unexpected,
+    structured: async () => ({ value: { ok: true }, model: 'model-v1',
+      usage: { available: true, inputTokens: 11, outputTokens: 7 } }) }
+  const runtime = new AgentRuntime(host, model, { execute: unexpected }, { onModelCall: async value => { observations.push(value) } })
+  runtime.registerProcessor('memory_synthesis', { process: async (_work, context) => { await context.model.structured({ instructions: 'i', input: {} }) } })
+  await runtime.runWork(work)
+  assert.equal(completed?.status, 'completed')
+  assert.deepEqual(observations.map(({ latencyMs: _latencyMs, ...value }) => value), [{
+    callId: 'ledger-work:3:model:1', purpose: 'structured', workId: 'ledger-work', tenantId: 'tenant',
+    agentId: 'agent', sessionId: 'room', threadId: 'thread', principalId: 'human', model: 'model-v1',
+    usage: { available: true, inputTokens: 11, outputTokens: 7 }, status: 'succeeded',
+  }])
+  assert.ok(observations[0]!.latencyMs >= 0)
+})
 
 for (const format of ['object', 'plain text'] as const) it(`preserves ${format} content and observed artifacts when assessment correction is exhausted`, async () => {
   const work: TurnContext['work'] = { id: 'w', tenantId: 't', agentId: 'a', sessionId: 's', kind: 'turn', lane: 'interactive', triggerRef: 'm', fence: 1, homeEpoch: 1, leaseToken: 'token' }
@@ -195,9 +222,11 @@ it('preserves history across prompt upgrades and exposes assigned action receipt
     work: { id: 'w', tenantId: 't', agentId: 'a', sessionId: 's', kind: 'turn', lane: 'interactive', triggerRef: 'm', fence: 1, homeEpoch: 1, leaseToken: 'token' },
     persona: { name: 'Assistant', role: 'assistant', instructions: '' }, capabilities: ['files'], messages: [{ ref: 'm', authorId: 'u', authorName: 'User', authorKind: 'human', body: 'Save the requested file.', createdAt: 'now' }],
   }
+  context.promptContextCandidate = { version: 2, epoch: 0, assembledAt: '', systemInstructions: '',
+    persona: context.persona, capabilities: context.capabilities, sourceVersions: {} }
   const session: SessionRecord = {
     key: '[\"t\",\"a\",\"s\",null]', tenantId: 't', agentId: 'a', sessionId: 's', history: [{ role: 'user', content: 'Preserve this requirement' }], appliedWorkIds: ['w'], revision: 1, compactionEpoch: 0,
-    promptContext: { version: 2, epoch: 0, assembledAt: '', systemInstructions: '', persona: context.persona, capabilities: [], sourceVersions: { promptContract: 'old' } },
+    promptContext: { version: 2, epoch: 0, assembledAt: '', systemInstructions: 'Stale prompt v5', persona: context.persona, capabilities: [], sourceVersions: { promptContract: 'prompt-v5' } },
   }
   let completion: WorkCompletion | undefined
   let checkpoint: SessionRecord | undefined
@@ -211,6 +240,8 @@ it('preserves history across prompt upgrades and exposes assigned action receipt
   const model: ModelDriver = {
     run: async (request) => {
       assert.deepEqual(request.items[0], { role: 'user', content: 'Preserve this requirement' })
+      assert.match(request.instructions, /## Instruction and data boundaries/)
+      assert.doesNotMatch(request.instructions, /Stale prompt v5/)
       calls++
       const output: ModelItem[] = calls === 1
         ? [{ role: 'assistant', content: 'Saving.' }, { type: 'function_call', callId: 'c', name: 'ipython', arguments: '{"code":"result = host.files.save()"}' }]

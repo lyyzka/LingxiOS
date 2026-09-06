@@ -151,7 +151,7 @@ const documentBoundary: {
       assert.ok(!(type.flags & ts.TypeFlags.Any) && type.getCallSignatures().length)
     }
   }
-  console.log('Native canvas, knowledge, learning, polls, presentations, storage, permissionService and wukongClient signatures accept direct resource binding.')
+  console.log('All configured LingxiLoop native service signatures accept direct resource binding.')
   console.log('This checks real source signatures only; domain execution and production integration remain separate gates.')
 } finally {
   assert.equal(dirname(directory), resolve(tmpdir()))
