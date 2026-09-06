@@ -5,7 +5,7 @@ import assert from 'node:assert/strict'
 import { it } from 'node:test'
 import { readFile } from 'node:fs/promises'
 import { PGlite } from '@electric-sql/pglite'
-import { approveTeacher, inspectApproval, requestTeacherApproval } from '../src/integrations/lingxiloop/approvals.js'
+import { approveTeacher, inspectApproval, requestTeacherApproval, resumeApproved } from '../src/integrations/lingxiloop/approvals.js'
 import type { SqlPool, SqlQueryable } from '../src/control-plane/pg-store.js'
 import type { HostAction } from '../src/protocol/types.js'
 
@@ -124,6 +124,10 @@ it('persists scoped teacher approval previews only for a live matching action in
     assert.deepEqual((await db.query('SELECT status FROM learning_knowledge_units')).rows, [{ status: 'PUBLISHED' }])
     assert.deepEqual((await db.query('SELECT status,resolved_by,result FROM approvals')).rows, [{ status: 'EXECUTED', resolved_by: 'reviewer', result: { ok: true } }])
     assert.deepEqual((await db.query('SELECT status FROM lingxios.agent_work_items')).rows, [{ status: 'completed' }])
+    const executed = await inspectApproval(database, services, decision)
+    await db.query("UPDATE lingxios.agent_action_intents SET intent=jsonb_set(intent,'{agentId}','\"other-agent\"'::jsonb)")
+    await assert.rejects(resumeApproved(database, decision, executed), /matching durable recovery records/)
+    await db.query("UPDATE lingxios.agent_action_intents SET intent=jsonb_set(intent,'{agentId}','\"a\"'::jsonb)")
     execution = 'forbidden'
     assert.deepEqual(await approveTeacher(database, services, decision), { status: 'resumed', workId: 'w' })
     assert.deepEqual(await approveTeacher(database, services, decision), { status: 'already_resumed', workId: 'w' })

@@ -1,6 +1,6 @@
 # LingxiLoop contract inventory
 
-Scope decision (2026-09-06, superseding the earlier core-only cut): continue to full current LingxiLoop product-capability coverage. This inventory remains a gap ledger until every retained native boundary has executable coverage.
+Target scope decision (2026-09-06): continue working toward full current LingxiLoop product-capability coverage after the core-package preview. This inventory is a gap ledger, not a claim of current release coverage or complete replacement, until every retained native boundary has executable coverage.
 
 Current document-boundary recheck: `edf7772af1be56cd71982fbae048593bfa29ba65`. The old `server/src/agents/cli.ts` is absent from this checkout. Its structured dispatcher was inspected from plan baseline `3e0a4aa8844f6ea809e7da6064ad499d9c0ad9b1`; it must not be treated as an available binding. Current replacements are `modules/documents/public.ts`, `modules/calendar/index.ts:calendarApplication`, and the agent-specific exports of `modules/email/index.ts`. Files/workspace operations still require a current-resource inventory.
 

@@ -148,7 +148,7 @@ describe('compactIfNeeded', () => {
     const outcome = await compactIfNeeded(s, 'instructions', driver, { ...smallOptions, maxSummaryChars: 10 })
     assert.equal(calls, 2)
     assert.equal(outcome.compacted, true)
-    assert.equal(s.summary, 'recompacted summary')
+    assert.equal(s.summary, 'recompacte')
     assert.equal(outcome.usage?.inputTokens, 13)
     assert.equal(outcome.usage?.outputTokens, 7)
   })

@@ -56,6 +56,8 @@ export interface CompactionResult {
 
 export interface ModelDriver {
   readonly modelId?: string
+  /** Hash of non-secret provider parameters needed to identify a replay configuration. */
+  readonly configurationFingerprint?: string
   readonly contextWindowTokens?: number
   readonly maxOutputTokens?: number
   readonly toolDefinitionTokens?: number

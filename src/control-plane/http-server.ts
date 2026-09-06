@@ -131,7 +131,7 @@ export class ControlPlaneServer {
       return
     }
 
-    const workMatch = /^\/v2\/work\/([^/]+)\/([a-z]+)$/.exec(path)
+    const workMatch = /^\/v2\/work\/([^/]+)\/([a-z-]+)$/.exec(path)
     if (workMatch) {
       const id = decodeURIComponent(workMatch[1]!)
       const operation = workMatch[2]!
@@ -149,6 +149,11 @@ export class ControlPlaneServer {
         switch (operation) {
           case 'heartbeat':
             json(res, 200, await service.heartbeat(proof)); return
+          case 'model-budget':
+            json(res, 200, await service.reserveModelCall(proof, stringField(body, 'callId'), body['limits'] as never)); return
+          case 'model-usage':
+            await service.recordModelUsage(proof, stringField(body, 'callId'), body['usage'] as never)
+            json(res, 200, { ok: true }); return
           case 'session':
             json(res, 200, { session: await service.getSession(proof, stringField(body, 'key')) }); return
           case 'yield':
@@ -157,6 +162,8 @@ export class ControlPlaneServer {
             json(res, 200, await service.executeAction(proof, body['action'] as never)); return
           case 'reconcile':
             json(res, 200, await service.recoverCell(proof, stringField(body, 'cellId'))); return
+          case 'step':
+            json(res, 200, await service.recoverStep(proof, stringField(body, 'cellId'))); return
           case 'artifacts':
             await service.stageArtifact(proof, body['artifact'] as never, stringField(body, 'contentBase64'))
             json(res, 200, { ok: true }); return

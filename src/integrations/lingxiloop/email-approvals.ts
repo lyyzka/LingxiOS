@@ -1,10 +1,9 @@
 import { isDeepStrictEqual } from 'node:util'
 import { withTransaction, type SqlPool } from '../../control-plane/pg-store.js'
-import type { ActionIntent } from '../../control-plane/stores.js'
 import type { HostAction, WorkItem } from '../../protocol/types.js'
 import type { LingxiLoopServices, NativeEmailAttachment, NativeMessage } from './service-contracts.js'
 import { EMAIL_APPROVAL_METHODS } from './email.js'
-import { inspectApproval, persistApproval, resumeApproved } from './approvals.js'
+import { claimApprovalExecution, inspectApproval, persistApproval, resumeApproved } from './approvals.js'
 
 type Services = Pick<LingxiLoopServices, 'email' | 'permissionService' | 'wukongClient'>
 
@@ -61,32 +60,48 @@ export async function approveEmail(database: SqlPool, services: Services, input:
   const reviewed = await inspectApproval(database, services, input)
   if (!['email.send', 'email.reply'].includes(reviewed.action.action)) throw new Error('unsupported email approval')
   if (reviewed.status === 'EXECUTED') return resumeApproved(database, input, reviewed)
-  if (reviewed.status !== 'PENDING') throw new Error('email approval is no longer pending')
-  const pending = await database.query(`SELECT intent.intent, binding.profile FROM approvals approval
-    JOIN lingxios.agent_work_items work ON work.id=approval.work_id AND work.tenant_id=approval.company_id
-    JOIN lingxios.agent_action_intents intent ON intent.idempotency_key=approval.idempotency_key
-    JOIN im_channel_bindings binding ON binding.company_id=work.tenant_id AND binding.channel_id=work.session_id
-    WHERE approval.id=$1 AND approval.company_id=$2 AND approval.status='PENDING' AND approval.expires_at>NOW()
-      AND approval.idempotency_key=$3 AND approval.args=$4::jsonb AND approval.preview=$5::jsonb
-      AND work.status='completed' AND work.cancel_requested_at IS NULL
-      AND work.goal_outcome->>'status'='awaiting_approval' AND work.goal_outcome->>'approvalId'=$1
-      AND (work.goal_outcome->>'requestVersion')::integer=$6 AND jsonb_array_length(work.steer_inputs)+1=$6`,
-  [input.approvalId, input.companyId, reviewed.action.idempotencyKey, JSON.stringify(reviewed.action.args), JSON.stringify(reviewed.preview), reviewed.requestVersion])
-  const intent = pending.rows[0]?.['intent'] as ActionIntent | undefined
-  const profile = pending.rows[0]?.['profile'] as Record<string, unknown> | undefined, channelType = Number(profile?.['channelType'])
-  if (!intent || channelType !== 1 && channelType !== 2) throw new Error('email approval expired or changed before execution')
+  const { intent, recovering } = await claimApprovalExecution(database, input, reviewed)
+  const binding = await database.query(`SELECT profile FROM im_channel_bindings
+    WHERE company_id=$1 AND channel_id=$2`, [intent.tenantId, intent.sessionId])
+  const profile = binding.rows[0]?.['profile'] as Record<string, unknown> | undefined, channelType = Number(profile?.['channelType'])
+  if (channelType !== 1 && channelType !== 2) throw new Error('email approval channel is unavailable')
   const work = { id: intent.workId, fence: 0, homeEpoch: 0, tenantId: intent.tenantId, agentId: intent.agentId, sessionId: intent.sessionId,
     triggerRef: '', kind: 'resume' as const, lane: 'approval' as const, ...(intent.principalId ? { principalId: intent.principalId } : {}) }
-  const prepared = await prepareEmailApproval(services, work, reviewed.action, channelType, input.userId)
-  if (!isDeepStrictEqual(prepared.preview, reviewed.preview)) throw new Error('email approval preview is stale')
-  const value = await prepared.execute()
+  let value: unknown
+  if (!recovering) {
+    const prepared = await prepareEmailApproval(services, work, reviewed.action, channelType, input.userId)
+    if (!isDeepStrictEqual(prepared.preview, reviewed.preview)) throw new Error('email approval preview is stale')
+    value = await prepared.execute()
+  } else value = await replayEmail(services, work, reviewed.action, reviewed.preview, input.userId)
   await withTransaction(database, async db => {
     const updated = await db.query(`UPDATE approvals SET status='EXECUTED',resolved_at=NOW(),resolved_by=$2,executed_at=NOW(),result=$3::jsonb,error=NULL
-      WHERE id=$1 AND company_id=$4 AND status='PENDING' RETURNING id`, [input.approvalId, input.userId, JSON.stringify(value), input.companyId])
+      WHERE id=$1 AND company_id=$4 AND status='EXECUTING' RETURNING id`, [input.approvalId, input.userId, JSON.stringify(value), input.companyId])
     if (updated.rows.length !== 1) throw new Error('email approval changed while executing')
     const receipt = await db.query(`UPDATE lingxios.agent_action_ledger SET result=$2::jsonb WHERE idempotency_key=$1 AND result->'approval'->>'id'=$3 RETURNING idempotency_key`,
       [reviewed.action.idempotencyKey, JSON.stringify({ ok: true, value }), input.approvalId])
     if (receipt.rows.length !== 1) throw new Error('email approval receipt is missing')
   })
   return resumeApproved(database, input, reviewed)
+}
+
+async function replayEmail(services: Services, work: Omit<WorkItem, 'leaseToken'>, action: HostAction,
+  preview: unknown, approverId: string) {
+  const api = services.email, saved = preview as Record<string, unknown>
+  if (!api || !saved || typeof saved !== 'object') throw new Error('email recovery data is unavailable')
+  const method = action.action.slice('email.'.length)
+  const conversationId = method === 'reply' ? saved['conversationId'] : work.sessionId
+  if (typeof conversationId !== 'string') throw new Error('email recovery conversation is invalid')
+  await services.permissionService.assertCan({ actorUserId: approverId, companyId: work.tenantId,
+    action: 'email:write', resource: { type: 'conversation', id: conversationId } })
+  const attachments = saved['attachments'] as NativeEmailAttachment[]
+  if (!Array.isArray(attachments) || typeof saved['body'] !== 'string') throw new Error('email recovery payload is invalid')
+  if (method === 'send') {
+    if (!Array.isArray(saved['to']) || !Array.isArray(saved['cc']) || typeof saved['subject'] !== 'string') throw new Error('email recovery payload is invalid')
+    return api.sendAgentEmail({ companyId: work.tenantId, userId: work.agentId },
+      { to: saved['to'] as string[], cc: saved['cc'] as string[], subject: saved['subject'], body: saved['body'], attachments },
+      { idempotencyKey: action.idempotencyKey })
+  }
+  if (method !== 'reply' || typeof saved['messageId'] !== 'string' || !Array.isArray(saved['cc'])) throw new Error('email recovery payload is invalid')
+  return api.replyToAgentEmail({ companyId: work.tenantId, userId: work.agentId }, saved['messageId'],
+    { cc: saved['cc'] as string[], body: saved['body'], attachments }, { idempotencyKey: action.idempotencyKey })
 }

@@ -5,7 +5,8 @@ import { sessionKeyOf, type AssistantMessage, type WorkItem } from '../protocol/
 
 /** Called inside the message commit transaction, never for drafts or progress text. */
 export async function captureMemoryEvidence(database: SqlQueryable, work: Omit<WorkItem, 'leaseToken'>, message: AssistantMessage) {
-  const { rows } = await database.query('SELECT request_snapshot FROM lingxios.agent_os_sessions WHERE session_key=$1', [sessionKeyOf(work)])
+  const { rows } = await database.query(`SELECT request_snapshot FROM lingxios.agent_request_snapshots
+    WHERE session_key=$1 AND work_id=$2`, [sessionKeyOf(work), work.id])
   const request = rows[0]?.['request_snapshot'] as RequestSnapshot | undefined
   if (!request || request.workId !== work.id || request.authorId !== work.principalId
     || request.revisions.length + 1 !== message.envelope.requestVersion) throw new Error('memory evidence requires the committed request version')

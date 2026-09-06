@@ -98,7 +98,8 @@ export async function approveCalendar(database: SqlPool, services: Services, inp
         AND approval.action=$7 AND work.status='completed' AND work.cancel_requested_at IS NULL
         AND work.goal_outcome->>'status'='awaiting_approval' AND work.goal_outcome->>'approvalId'=$1
         AND (work.goal_outcome->>'requestVersion')::integer=$6 AND jsonb_array_length(work.steer_inputs)+1=$6
-        AND session.request_snapshot->>'workId'=work.id AND session.request_snapshot->'revisions'=work.steer_inputs
+        AND EXISTS (SELECT 1 FROM lingxios.agent_request_snapshots snapshot WHERE snapshot.work_id=work.id
+          AND snapshot.session_key=session.session_key AND snapshot.request_snapshot->'revisions'=work.steer_inputs)
       FOR UPDATE OF approval,work,session`, [input.approvalId, input.companyId, reviewed.action.idempotencyKey,
       JSON.stringify(reviewed.action.args), JSON.stringify(reviewed.preview), reviewed.requestVersion, reviewed.action.action])
     const intent = pending.rows[0]?.['intent'] as ActionIntent | undefined

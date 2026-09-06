@@ -15,6 +15,7 @@ import type {
 import type {
   ActionIntent, ActionLedgerStore, ActionResolution, EnqueueResult, EnqueueWorkInput, EventStore, HeartbeatRow,
   LeasedWork, SaveSessionResult, SessionStore, StoredRunEvent, WorkStore, WorkStoreOptions,
+  ModelBudgetLimits, ModelBudgetReservation, ModelBudgetStore,
 } from './stores.js'
 
 /** The subset of `pg.Pool` this module needs. */
@@ -75,6 +76,14 @@ function workItemFromRow(row: Record<string, unknown>, leaseToken: string, homeE
 }
 
 export class PgWorkStore implements WorkStore {
+  async ownsBudgetRoot(work: Omit<WorkItem, 'leaseToken'>, rootWorkId: string): Promise<boolean> {
+    if (rootWorkId === work.id) return true
+    if (work.meta?.['rootWorkId'] !== rootWorkId || typeof work.meta?.['parentWorkId'] !== 'string') return false
+    const { rows } = await this.pool.query(`SELECT id FROM lingxios.agent_work_items
+      WHERE id=$1 AND tenant_id=$2 AND principal_id IS NOT DISTINCT FROM $3`,
+    [rootWorkId, work.tenantId, work.principalId ?? null])
+    return rows.length === 1
+  }
   async hasPendingChild(parent: Omit<WorkItem, 'leaseToken'>, childId: string, requestVersion: number): Promise<boolean> {
     const { rows } = await this.pool.query(`SELECT id FROM lingxios.agent_work_items WHERE id=$1
       AND tenant_id=$2 AND session_id=$3 AND principal_id IS NOT DISTINCT FROM $4
@@ -337,9 +346,12 @@ export class PgWorkStore implements WorkStore {
 export class PgSessionStore implements SessionStore {
   constructor(private readonly pool: SqlPool) {}
 
-  async get(key: string): Promise<SessionRecord | null> {
+  async get(key: string, workId?: string): Promise<SessionRecord | null> {
     const { rows } = await this.pool.query(
-      `SELECT * FROM lingxios.agent_os_sessions WHERE session_key = $1`, [key],
+      `SELECT session.*,COALESCE(request.request_snapshot,session.request_snapshot) AS effective_request_snapshot
+       FROM lingxios.agent_os_sessions session
+       LEFT JOIN lingxios.agent_request_snapshots request ON request.work_id=$2
+       WHERE session.session_key=$1`, [key, workId ?? null],
     )
     const row = rows[0]
     if (!row) return null
@@ -350,7 +362,7 @@ export class PgSessionStore implements SessionStore {
       sessionId: String(row['session_id']),
       ...(row['thread_id'] !== null ? { threadId: String(row['thread_id']) } : {}),
       ...(row['summary'] !== null ? { summary: String(row['summary']) } : {}),
-      ...(row['request_snapshot'] ? { request: row['request_snapshot'] as NonNullable<SessionRecord['request']> } : {}),
+      ...(row['effective_request_snapshot'] ? { request: row['effective_request_snapshot'] as NonNullable<SessionRecord['request']> } : {}),
       history: row['history'] as SessionRecord['history'],
       appliedWorkIds: (row['applied_work_ids'] ?? []) as string[],
       revision: Number(row['revision']),
@@ -360,42 +372,49 @@ export class PgSessionStore implements SessionStore {
   }
 
   async save(session: SessionRecord, proof?: import('./stores.js').StoreLeaseProof): Promise<SaveSessionResult> {
-    if (session.revision > 0) {
-      const { rows } = await this.pool.query(
+    return withTransaction(this.pool, async client => {
+      if (proof) {
+        if (session.revision > 0) await client.query(
+          'SELECT session_key FROM lingxios.agent_os_sessions WHERE session_key=$1 FOR UPDATE', [session.key])
+        const lease = await client.query(`SELECT id FROM lingxios.agent_work_items
+          WHERE id=$1 AND fence=$2 AND lease_token_hash=$3 AND status='leased' AND lease_expires_at>NOW() FOR UPDATE`,
+        [proof.workId, proof.fence, proof.leaseTokenHash])
+        if (!lease.rows[0]) return { ok: false, conflict: true }
+      }
+      let rows: Record<string, unknown>[]
+      if (session.revision > 0) {
+        ({ rows } = await client.query(
         `UPDATE lingxios.agent_os_sessions
             SET summary=$3, history=$4::jsonb, applied_work_ids=$5::jsonb,
                 compaction_epoch=$6, prompt_context=$7::jsonb, request_snapshot=$8::jsonb,
                 revision=revision+1, updated_at=NOW()
           WHERE session_key=$1 AND revision=$2
-            AND ($9::text IS NULL OR EXISTS (SELECT 1 FROM lingxios.agent_work_items
-              WHERE id=$9 AND fence=$10 AND lease_token_hash=$11 AND status='leased' AND lease_expires_at>NOW()))
           RETURNING revision`,
         [session.key, session.revision, session.summary ?? null, JSON.stringify(session.history),
           JSON.stringify(session.appliedWorkIds), session.compactionEpoch,
           session.promptContext ? JSON.stringify(session.promptContext) : null,
-          session.request ? JSON.stringify(session.request) : null,
-          proof?.workId ?? null, proof?.fence ?? null, proof?.leaseTokenHash ?? null],
-      )
-      return rows[0] ? { ok: true, revision: Number(rows[0]['revision']) } : { ok: false, conflict: true }
-    }
-    const { rows } = await this.pool.query(
+          session.request ? JSON.stringify(session.request) : null]))
+      } else ({ rows } = await client.query(
       `INSERT INTO lingxios.agent_os_sessions
          (session_key, tenant_id, agent_id, session_id, thread_id, summary, history,
           applied_work_ids, revision, compaction_epoch, prompt_context, request_snapshot, updated_at)
        SELECT $1,$2,$3,$4,$5,$6,$7::jsonb,$8::jsonb,1,$10,$11::jsonb,$12::jsonb,NOW()
-        WHERE $9 = 0 AND ($13::text IS NULL OR EXISTS (SELECT 1 FROM lingxios.agent_work_items
-          WHERE id=$13 AND fence=$14 AND lease_token_hash=$15 AND status='leased' AND lease_expires_at>NOW()))
+        WHERE $9 = 0
        ON CONFLICT (session_key) DO NOTHING
        RETURNING revision`,
       [session.key, session.tenantId, session.agentId, session.sessionId, session.threadId ?? null,
         session.summary ?? null, JSON.stringify(session.history), JSON.stringify(session.appliedWorkIds),
         session.revision, session.compactionEpoch,
         session.promptContext ? JSON.stringify(session.promptContext) : null,
-        session.request ? JSON.stringify(session.request) : null,
-        proof?.workId ?? null, proof?.fence ?? null, proof?.leaseTokenHash ?? null],
-    )
-    if (!rows[0]) return { ok: false, conflict: true }
-    return { ok: true, revision: Number(rows[0]['revision']) }
+        session.request ? JSON.stringify(session.request) : null]))
+      if (!rows[0]) return { ok: false, conflict: true }
+      if (session.request) await client.query(`INSERT INTO lingxios.agent_request_snapshots(work_id,session_key,request_snapshot)
+        VALUES($1,$2,$3::jsonb) ON CONFLICT(work_id) DO UPDATE
+        SET request_snapshot=EXCLUDED.request_snapshot,updated_at=NOW()
+        WHERE lingxios.agent_request_snapshots.session_key=EXCLUDED.session_key`,
+      [session.request.workId, session.key, JSON.stringify(session.request)])
+      return { ok: true, revision: Number(rows[0]['revision']) }
+    })
   }
 }
 
@@ -404,14 +423,15 @@ export class PgEventStore implements EventStore {
 
   async append(event: StoredRunEvent, proof?: import('./stores.js').StoreLeaseProof): Promise<boolean> {
     const { rows } = await this.pool.query(
-      `INSERT INTO lingxios.agent_run_events (run_id, seq, tenant_id, agent_id, kind, stage, visibility, data, recorded_at)
-       SELECT $1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9
+      `INSERT INTO lingxios.agent_run_events (run_id, seq, tenant_id, agent_id, kind, stage, visibility, data, recorded_at, expires_at)
+       SELECT $1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9,CASE WHEN $13::text IS NULL THEN NULL ELSE $13::timestamptz END
         WHERE $10::text IS NULL OR EXISTS (SELECT 1 FROM lingxios.agent_work_items
           WHERE id=$10 AND fence=$11 AND lease_token_hash=$12 AND status='leased' AND lease_expires_at>NOW())
        ON CONFLICT (run_id, seq) DO NOTHING RETURNING run_id`,
       [event.runId, event.seq, event.tenantId, event.agentId, event.kind, event.stage,
         event.visibility, JSON.stringify(event.data), event.recordedAt,
-        proof?.workId ?? null, proof?.fence ?? null, proof?.leaseTokenHash ?? null],
+        proof?.workId ?? null, proof?.fence ?? null, proof?.leaseTokenHash ?? null,
+        typeof event.data['traceExpiresAt'] === 'string' ? event.data['traceExpiresAt'] : null],
     )
     return rows.length > 0
   }
@@ -419,7 +439,7 @@ export class PgEventStore implements EventStore {
   async listRange(runId: string, fromSeqExclusive: number, toSeqInclusive: number, kinds?: readonly string[]): Promise<StoredRunEvent[]> {
     const { rows } = await this.pool.query(
       `SELECT * FROM lingxios.agent_run_events
-        WHERE run_id = $1 AND seq > $2 AND seq <= $3
+        WHERE run_id = $1 AND seq > $2 AND seq <= $3 AND (expires_at IS NULL OR expires_at>NOW())
           AND ($4::text[] IS NULL OR kind = ANY($4::text[]))
         ORDER BY seq`,
       [runId, fromSeqExclusive, toSeqInclusive, kinds ? [...kinds] : null],
@@ -541,5 +561,47 @@ export class PgActionLedger implements ActionLedgerStore {
       throw new Error('resolution identity reused with different evidence')
     }
     return 'existing'
+  }
+}
+
+export class PgModelBudgetStore implements ModelBudgetStore {
+  constructor(private readonly pool: SqlPool) {}
+
+  async reserve(rootWorkId: string, callId: string, limits: ModelBudgetLimits): Promise<ModelBudgetReservation> {
+    return withTransaction(this.pool, async client => {
+      await client.query(`INSERT INTO lingxios.agent_model_budgets
+        (root_work_id,max_model_calls,max_tokens,max_cost_micros,deadline_at)
+        VALUES($1,$2,$3,$4,$5) ON CONFLICT(root_work_id) DO NOTHING`,
+      [rootWorkId, limits.maxModelCalls, limits.maxTokens, limits.maxCostMicros, limits.deadlineAt])
+      await client.query('SELECT root_work_id FROM lingxios.agent_model_budgets WHERE root_work_id=$1 FOR UPDATE', [rootWorkId])
+      const prior = await client.query(`SELECT 1 FROM lingxios.agent_model_budget_calls
+        WHERE root_work_id=$1 AND call_id=$2`, [rootWorkId, callId])
+      if (!prior.rows.length) {
+        const inserted = await client.query(`INSERT INTO lingxios.agent_model_budget_calls(root_work_id,call_id)
+          SELECT root_work_id,$2 FROM lingxios.agent_model_budgets WHERE root_work_id=$1
+            AND NOW()<deadline_at AND model_calls<max_model_calls AND tokens<max_tokens AND cost_micros<max_cost_micros
+          ON CONFLICT DO NOTHING RETURNING call_id`, [rootWorkId, callId])
+        if (inserted.rows.length) await client.query(`UPDATE lingxios.agent_model_budgets
+          SET model_calls=model_calls+1,updated_at=NOW() WHERE root_work_id=$1`, [rootWorkId])
+      }
+      const { rows } = await client.query(`SELECT b.*,EXISTS(SELECT 1 FROM lingxios.agent_model_budget_calls c
+        WHERE c.root_work_id=b.root_work_id AND c.call_id=$2) AS allowed
+        FROM lingxios.agent_model_budgets b WHERE root_work_id=$1 FOR UPDATE`, [rootWorkId, callId])
+      const row = rows[0]!
+      return { allowed: Boolean(row['allowed']), remainingCalls: Math.max(0, Number(row['max_model_calls']) - Number(row['model_calls'])),
+        remainingTokens: Math.max(0, Number(row['max_tokens']) - Number(row['tokens'])),
+        remainingCostMicros: Math.max(0, Number(row['max_cost_micros']) - Number(row['cost_micros'])),
+        deadlineAt: new Date(row['deadline_at'] as string | Date).toISOString() }
+    })
+  }
+
+  async record(rootWorkId: string, callId: string, inputTokens: number, outputTokens: number, costMicros: number): Promise<void> {
+    await withTransaction(this.pool, async client => {
+      const { rows } = await client.query(`UPDATE lingxios.agent_model_budget_calls SET input_tokens=$3,output_tokens=$4,cost_micros=$5
+        WHERE root_work_id=$1 AND call_id=$2 AND input_tokens IS NULL RETURNING call_id`,
+      [rootWorkId, callId, inputTokens, outputTokens, costMicros])
+      if (rows.length) await client.query(`UPDATE lingxios.agent_model_budgets SET tokens=tokens+$2+$3,
+        cost_micros=cost_micros+$4,updated_at=NOW() WHERE root_work_id=$1`, [rootWorkId, inputTokens, outputTokens, costMicros])
+    })
   }
 }

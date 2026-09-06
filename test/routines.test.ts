@@ -11,6 +11,7 @@ import type { LingxiLoopServices } from '../src/integrations/lingxiloop/service-
 import { approveRoutine, requestRoutineApproval } from '../src/integrations/lingxiloop/approvals.js'
 import { assertRoutineWork, executeRoutine, nextRoutineRun, scheduleRoutines } from '../src/integrations/lingxiloop/routines.js'
 import { createLingxiLoop } from '../src/integrations/lingxiloop/index.js'
+import { LINGXILOOP_CAPABILITY_METHODS, LingxiLoopRuntimePolicy } from '../src/integrations/lingxiloop/policy.js'
 import { startWorker } from '../src/worker/index.js'
 import { setTimeout as delay } from 'node:timers/promises'
 
@@ -167,7 +168,8 @@ it('approves routines separately from activation, fences stale previews, and sco
         deliveries++
         return { messageId: message.clientMsgNo, messageSeq: deliveries }
       } }),
-    }, worker: { id: 'routine-test' }, model: { id: 'test', apiKey: 'test', baseUrl: `http://127.0.0.1:${address.port}` }, kernel: { homesRoot: directory } })
+    }, worker: { id: 'routine-test' }, model: { id: 'test', apiKey: 'test', baseUrl: `http://127.0.0.1:${address.port}` }, kernel: { homesRoot: directory },
+    policy: new LingxiLoopRuntimePolicy({ capabilityMethods: LINGXILOOP_CAPABILITY_METHODS, requireIdentityDisclosure: false }) })
     try {
       assert.equal(await app.runNext(), true)
       assert.equal(calls, 2, JSON.stringify(await jobs()))

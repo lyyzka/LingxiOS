@@ -12,6 +12,7 @@ import { sessionKeyOf, type HostActionResult, type SessionRecord, type WorkCompl
 import type {
   ActionIntent, ActionLedgerStore, EnqueueResult, EnqueueWorkInput, EventStore, HeartbeatRow,
   LeasedWork, SaveSessionResult, SessionStore, StoredRunEvent, WorkStore, WorkStoreOptions,
+  ModelBudgetLimits, ModelBudgetReservation, ModelBudgetStore,
 } from './stores.js'
 
 export function hashToken(token: string): string {
@@ -59,6 +60,12 @@ interface SessionLease {
 }
 
 export class MemoryWorkStore implements WorkStore {
+  async ownsBudgetRoot(work: Omit<WorkItem, 'leaseToken'>, rootWorkId: string): Promise<boolean> {
+    if (rootWorkId === work.id) return true
+    const root = this.rows.get(rootWorkId)
+    return Boolean(root && work.meta?.['rootWorkId'] === rootWorkId && typeof work.meta?.['parentWorkId'] === 'string'
+      && root.tenantId === work.tenantId && root.principalId === work.principalId)
+  }
   async hasPendingChild(parent: Omit<WorkItem, 'leaseToken'>, childId: string, requestVersion: number): Promise<boolean> {
     const child = this.rows.get(childId)
     return Boolean(child && ['queued', 'leased'].includes(child.status) && !child.cancelRequestedAt
@@ -337,10 +344,14 @@ export class MemoryWorkStore implements WorkStore {
 
 export class MemorySessionStore implements SessionStore {
   private readonly sessions = new Map<string, SessionRecord>()
+  private readonly requests = new Map<string, NonNullable<SessionRecord['request']>>()
 
-  async get(key: string): Promise<SessionRecord | null> {
+  async get(key: string, workId?: string): Promise<SessionRecord | null> {
     const stored = this.sessions.get(key)
-    return stored ? structuredClone(stored) : null
+    if (!stored) return null
+    const request = workId ? this.requests.get(workId) : stored.request
+    const { request: _activeRequest, ...base } = stored
+    return structuredClone({ ...base, ...(request ? { request } : {}) })
   }
 
   async save(session: SessionRecord): Promise<SaveSessionResult> {
@@ -352,6 +363,7 @@ export class MemorySessionStore implements SessionStore {
     const next = structuredClone(session)
     next.revision = currentRevision + 1
     this.sessions.set(session.key, next)
+    if (session.request) this.requests.set(session.request.workId, structuredClone(session.request))
     return { ok: true, revision: next.revision }
   }
 }
@@ -462,5 +474,33 @@ export class MemoryActionLedger implements ActionLedgerStore {
     this.resolutionIds.set(saved.id, saved)
     this.resolutions.set(saved.actionKey, [...(this.resolutions.get(saved.actionKey) ?? []), saved])
     return 'recorded'
+  }
+}
+
+export class MemoryModelBudgetStore implements ModelBudgetStore {
+  private readonly budgets = new Map<string, ModelBudgetLimits & { calls: Set<string>; recorded: Set<string>; tokens: number; costMicros: number }>()
+
+  async reserve(rootWorkId: string, callId: string, limits: ModelBudgetLimits): Promise<ModelBudgetReservation> {
+    let budget = this.budgets.get(rootWorkId)
+    if (!budget) {
+      budget = { ...limits, calls: new Set(), recorded: new Set(), tokens: 0, costMicros: 0 }
+      this.budgets.set(rootWorkId, budget)
+    }
+    const existing = budget.calls.has(callId)
+    const allowed = existing || (Date.now() < Date.parse(budget.deadlineAt)
+      && budget.calls.size < budget.maxModelCalls && budget.tokens < budget.maxTokens && budget.costMicros < budget.maxCostMicros)
+    if (allowed && !existing) budget.calls.add(callId)
+    return { allowed, remainingCalls: Math.max(0, budget.maxModelCalls - budget.calls.size),
+      remainingTokens: Math.max(0, budget.maxTokens - budget.tokens),
+      remainingCostMicros: Math.max(0, budget.maxCostMicros - budget.costMicros), deadlineAt: budget.deadlineAt }
+  }
+
+  async record(rootWorkId: string, callId: string, inputTokens: number, outputTokens: number, costMicros: number): Promise<void> {
+    const budget = this.budgets.get(rootWorkId)
+    if (!budget || !budget.calls.has(callId)) throw new Error('model call budget reservation is missing')
+    if (budget.recorded.has(callId)) return
+    budget.recorded.add(callId)
+    budget.tokens += inputTokens + outputTokens
+    budget.costMicros += costMicros
   }
 }

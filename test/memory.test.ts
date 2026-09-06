@@ -123,6 +123,8 @@ it('persists scoped memory provenance, filters expiry and rejects stale or unaut
     await db.exec('ROLLBACK')
     // Ordinary completion and a later request's session snapshot do not revoke a valid source.
     await db.exec("UPDATE lingxios.agent_work_items SET status='completed' WHERE id='w'")
+    await db.exec(`INSERT INTO lingxios.agent_work_items(id,tenant_id,agent_id,principal_id,session_id,kind,lane,trigger_ref)
+      VALUES('later-work','t','a','u','s','turn','interactive','later')`)
     await db.exec(`UPDATE lingxios.agent_os_sessions SET request_snapshot=jsonb_set(request_snapshot,'{workId}','"later-work"')`)
     assert.equal(await evidenceStatus(), 'pending')
     await db.exec("UPDATE lingxios.agent_work_items SET status='leased' WHERE id='w'")

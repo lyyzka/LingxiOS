@@ -61,7 +61,7 @@ it('asks through real Python, exposes the question and continues after a human r
       UPDATE lingxios.agent_os_sessions SET history=history-(jsonb_array_length(history)-1);
       INSERT INTO lingxios.agent_action_intents(idempotency_key,fingerprint,intent)
         SELECT 'lost-after-ask','lost',jsonb_set(intent,'{action,callIndex}','1'::jsonb) FROM lingxios.agent_action_intents LIMIT 1`)
-    assert.equal(await app.runNext(), true)
+    assert.equal(await app.runNext(), false)
     assert.equal(requests, 1)
     assert.equal((await app.readOutcome(identity))?.status, 'blocked')
     await db.exec(`DELETE FROM lingxios.agent_action_intents WHERE idempotency_key='lost-after-ask';

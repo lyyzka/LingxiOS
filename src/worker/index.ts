@@ -13,9 +13,12 @@ import { AgentRuntime } from '../runtime/runtime.js'
 import { AgentWorker } from './worker.js'
 import { memorySynthesisProcessor, memoryIndexProcessor } from '../memory/processor.js'
 import { ConfigError } from '../errors.js'
+import type { RuntimePolicy } from '../runtime/policy.js'
+import { createLingxiLoopRuntimePolicy } from '../integrations/lingxiloop/policy.js'
 
 export async function startWorker(env: NodeJS.ProcessEnv = process.env, options: {
   kernelFactory?: (bridge: KernelHostBridge) => ManagedKernelExecutor
+  policy?: RuntimePolicy
 } = {}): Promise<AgentWorker> {
   const config = loadWorkerConfig(env)
   const logger = createLogger().child({ service: 'agent-os-worker' })
@@ -29,7 +32,7 @@ export async function startWorker(env: NodeJS.ProcessEnv = process.env, options:
   const model = new OpenAIChatDriver(config.model.id, {
     apiKey: config.model.apiKey,
     baseUrl: config.model.baseUrl,
-    reasoningEffort: config.model.reasoningEffort,
+    ...(config.model.reasoningEffort ? { reasoningEffort: config.model.reasoningEffort } : {}),
   })
   const bridge: KernelHostBridge = { execute: (work, action) => host.executeAction(work, action) }
   if (!options.kernelFactory && env['NODE_ENV'] === 'production'
@@ -39,7 +42,11 @@ export async function startWorker(env: NodeJS.ProcessEnv = process.env, options:
   const kernels = options.kernelFactory?.(bridge) ?? new KernelManager(
     bridge, { logger, maxKernels: config.maxConcurrentRuns }, env,
   )
-  const runtime = new AgentRuntime(host, model, kernels, { logger })
+  const policyName = env['AGENT_OS_RUNTIME_POLICY']?.trim()
+  if (policyName && policyName !== 'lingxiloop') throw new ConfigError('AGENT_OS_RUNTIME_POLICY must be lingxiloop when set')
+  const policy = options.policy ?? (policyName === 'lingxiloop' ? createLingxiLoopRuntimePolicy() : undefined)
+  const runtime = new AgentRuntime(host, model, kernels, { logger, ...(policy ? { policy } : {}),
+    recordModelPayloads: boolEnv('AGENT_OS_RECORD_MODEL_PAYLOADS', false, env) })
   runtime.registerProcessor('memory_synthesis', memorySynthesisProcessor)
   runtime.registerProcessor('memory_index', memoryIndexProcessor)
   runtime.registerProcessor('teacher_digest', 'conversation')

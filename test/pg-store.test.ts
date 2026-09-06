@@ -4,7 +4,7 @@ import assert from 'node:assert/strict'
 import { readFile } from 'node:fs/promises'
 import { it } from 'node:test'
 import { PGlite } from '@electric-sql/pglite'
-import { PgActionLedger, PgEventStore, PgSessionStore, PgWorkStore, type SqlPool } from '../src/control-plane/pg-store.js'
+import { PgActionLedger, PgEventStore, PgModelBudgetStore, PgSessionStore, PgWorkStore, type SqlPool } from '../src/control-plane/pg-store.js'
 import { hashToken } from '../src/control-plane/memory-store.js'
 import type { SessionRecord } from '../src/protocol/types.js'
 
@@ -31,6 +31,14 @@ it('runs namespaced stores on PostgreSQL without touching product tables', async
     assert.deepEqual(await workStore.claim('worker', 'claim-request-0001'), work)
     assert.equal(work.id, 'w')
     assert.equal(work.fence, 1)
+    const budgets = new PgModelBudgetStore(pool)
+    const limits = { maxModelCalls: 2, maxTokens: 100, maxCostMicros: 100, deadlineAt: '2099-01-01T00:00:00.000Z' }
+    assert.equal((await budgets.reserve('w', 'call-1', limits)).remainingCalls, 1)
+    assert.equal((await budgets.reserve('w', 'call-1', limits)).remainingCalls, 1)
+    await budgets.record('w', 'call-1', 20, 10, 5)
+    await budgets.record('w', 'call-1', 20, 10, 5)
+    assert.equal((await budgets.reserve('w', 'call-2', limits)).remainingTokens, 70)
+    assert.equal((await budgets.reserve('w', 'call-3', limits)).allowed, false)
     const token = hashToken(work.leaseToken)
     assert.equal(await workStore.complete('w', 1, token, { status: 'completed' }), false)
     assert.equal((await workStore.getLeased('w', 1, token))?.work.id, 'w')
@@ -104,7 +112,7 @@ it('runs namespaced stores on PostgreSQL without touching product tables', async
     assert.deepEqual((await db.query('SELECT status FROM lingxios.agent_work_items WHERE id=$1', [expired.id])).rows, [{ status: 'leased' }])
     assert.deepEqual((await db.query('SELECT * FROM public.agent_work_items')).rows, [{ company_id: 'keep' }])
     await checkStorage(pool)
-    await db.exec('ALTER TABLE lingxios.agent_os_sessions DROP COLUMN request_snapshot')
+    await db.exec('ALTER TABLE lingxios.agent_request_snapshots DROP COLUMN request_snapshot')
     await assert.rejects(checkStorage(pool), /request_snapshot/)
   } finally {
     await db.close()

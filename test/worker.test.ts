@@ -82,3 +82,10 @@ it('refuses the process kernel as an implicit production security boundary', asy
     AGENT_OS_MODEL_API_KEY: 'test-key',
   }), /OS-isolated kernelFactory/)
 })
+
+it('rejects an unknown runtime policy deployment', async () => {
+  await assert.rejects(startWorker({
+    AGENT_OS_CONTROL_PLANE_URL: 'http://127.0.0.1:1', AGENT_OS_SERVICE_TOKEN: 'test-token',
+    AGENT_OS_MODEL_API_KEY: 'test-key', AGENT_OS_RUNTIME_POLICY: 'unknown',
+  }), /AGENT_OS_RUNTIME_POLICY/)
+})

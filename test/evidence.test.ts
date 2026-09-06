@@ -41,7 +41,8 @@ it('restores prior artifact records without silently adding them to current deli
   const artifact = { path: 'report.txt', size: 4, mime: 'text/plain', sha256: 'a'.repeat(64) }
   await assert.rejects(service.recordEvent(first, { runId: first.id, seq: 1, kind: 'ipython.completed', stage: 'completed', visibility: 'internal',
     data: { artifacts: [{ ...artifact, path: '../outside' }] } }), /invalid kernel artifact event/)
-  await service.recordEvent(first, { runId: first.id, seq: 1, kind: 'ipython.completed', stage: 'completed', visibility: 'internal', data: { artifacts: [artifact] } })
+  await service.recordEvent(first, { runId: first.id, seq: 1, kind: 'ipython.completed', stage: 'completed', visibility: 'internal',
+    data: { callId: 'prior-cell', requestVersion: 1, output: 'prior output', artifacts: [artifact] } })
   assert.deepEqual((await service.loadContext(first)).priorArtifacts, [])
   await workStore.requestPreempt(first.id)
   await service.yieldWork(first)

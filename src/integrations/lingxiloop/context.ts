@@ -55,9 +55,11 @@ export async function enrichLingxiLoopContext(
   [approvalId, work.agentId, work.sessionId])).rows[0] : undefined
   const pendingApproval = approval ? { approvalId: String(approval['id']), approved: approval['status'] === 'EXECUTED',
     ...(approval['result'] === undefined ? {} : { result: approval['result'] }), ...(approval['error'] ? { error: String(approval['error']) } : {}) } : undefined
-  const canvas = services.canvas ? await services.canvas.getConversationCanvas(work.tenantId, work.sessionId, work.agentId) : undefined
+  const canvas = services.canvas ? await services.canvas.getConversationCanvas(work.tenantId, work.sessionId, work.principalId!) : undefined
   const canvasRoster = services.canvas ? await services.canvas.listCanvasAvailableAgents(work.tenantId) : []
-  return { ...base, messages: messages.length ? messages : base.messages, ...(evidence.length ? { evidence } : {}),
+  const contextMessages = messages.some(message => message.ref === work.triggerRef) ? messages
+    : [...messages, ...base.messages.filter(message => message.ref === work.triggerRef)]
+  return { ...base, messages: contextMessages.length ? contextMessages : base.messages, ...(evidence.length ? { evidence } : {}),
     ...(pendingApproval ? { pendingApproval } : {}), dynamic: { ...base.dynamic, product: {
       knowledgeContext: retrieval, ...(learner ? { learnerId: learner.authorId } : {}),
       ...(learningContext ? { learningContext } : {}), ...(canvas ? { canvas } : {}), canvasRoster,

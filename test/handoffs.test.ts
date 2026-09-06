@@ -8,6 +8,9 @@ const work = { id: 'work', fence: 1, homeEpoch: 1, tenantId: 'company', agentId:
   principalId: 'human', triggerRef: 'message', kind: 'turn', lane: 'interactive' } as Omit<WorkItem, 'leaseToken'>
 const action = (name: string, args: Record<string, unknown>): HostAction => ({ runId: 'work', cellId: 'cell', callIndex: 0,
   action: name, args, idempotencyKey: 'handoff-key' })
+const parentRequest = { version: 1 as const, workId: 'work', tenantId: 'company', sessionId: 'room', authorId: 'human',
+  sourceRef: 'message', originalText: 'Only inspect; do not modify.', revisions: [], attachments: [],
+  evidence: { version: 1 as const, id: 'work:evidence:1', items: [], capturedAt: 'now' } }
 
 test('handoffs preserve native records while validating human scope and context messages', async () => {
   const calls: unknown[] = []
@@ -38,12 +41,14 @@ test('handoff ingress restores its human principal only through the native recor
   }) } as Pick<LingxiLoopServices, 'wukongClient' | 'permissionService'>
   const database = { query: async (_sql: string, params?: readonly unknown[]) => {
     assert.deepEqual(params, ['h1', 'company', 'room', 'target', 'created'])
-    return { rows: [{ from_agent_id: 'source', to_agent_id: 'target', title: 'Verify result', note: 'Check carefully',
+    return { rows: [{ parent_work_id: 'work', request_version: 1, request_snapshot: parentRequest,
+      from_agent_id: 'source', to_agent_id: 'target', title: 'Verify result', note: 'Check carefully',
       context_message_ids: ['m1'], principal_id: 'human', name: 'Human' }], rowCount: 1 }
   } }
   assert.deepEqual(await resolveHandoffIngress(database, services, { companyId: 'company', agentId: 'target', channelId: 'room',
     clientMsgNo: 'handoff:h1:created' }, 2), { handoffId: 'h1', principalId: 'human', authorName: 'Human',
-    text: 'Handoff: Verify result\nNote: Check carefully\nContext message IDs: m1' })
+    text: 'Handoff: Verify result\nNote: Check carefully\nContext message IDs: m1', parentWorkId: 'work', rootWorkId: 'work',
+    parentRequestVersion: 1, instructionAuthorId: 'source', parentRequest })
   assert.deepEqual(permissions, [{ actorUserId: 'human', companyId: 'company', action: 'conversation:read',
     resource: { type: 'conversation', id: 'room' } }])
   await assert.rejects(resolveHandoffIngress(database, services, { companyId: 'company', agentId: 'other', channelId: 'room',
@@ -59,7 +64,8 @@ test('terminal handoff ingress wakes the source with the persisted result', asyn
   }) } as Pick<LingxiLoopServices, 'wukongClient' | 'permissionService'>
   const database = { query: async (_sql: string, params?: readonly unknown[]) => {
     assert.deepEqual(params, ['h1', 'company', 'room', 'source', 'completed'])
-    return { rows: [{ from_agent_id: 'source', to_agent_id: 'target', title: 'Verify result', note: 'Looks good', status: 'completed',
+    return { rows: [{ parent_work_id: 'work', request_version: 1, request_snapshot: parentRequest,
+      from_agent_id: 'source', to_agent_id: 'target', title: 'Verify result', note: 'Looks good', status: 'completed',
       context_message_ids: ['m1'], principal_id: 'human', name: 'Human' }], rowCount: 1 }
   } }
   assert.equal((await resolveHandoffIngress(database, services, { companyId: 'company', agentId: 'source', channelId: 'room',

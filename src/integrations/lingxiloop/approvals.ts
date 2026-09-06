@@ -79,7 +79,7 @@ export async function inspectApproval(database: SqlQueryable, services: Pick<Lin
   await services.permissionService.assertCan({ actorUserId: input.userId, companyId: input.companyId,
     action: 'agent_approval:resolve', resource: { type: 'approval', id: input.approvalId } })
   const { rows } = await database.query(`SELECT to_jsonb(approval) AS approval, intent.intent,
-      session.request_snapshot AS request, work.steer_inputs AS revisions, work.thread_id AS thread_id
+      snapshot.request_snapshot AS request, work.steer_inputs AS revisions, work.thread_id AS thread_id
     FROM approvals approval
     JOIN lingxios.agent_action_intents intent ON intent.idempotency_key=approval.idempotency_key
     JOIN lingxios.agent_work_items work ON work.id=approval.work_id
@@ -87,6 +87,7 @@ export async function inspectApproval(database: SqlQueryable, services: Pick<Lin
       AND work.principal_id=approval.authorization_user_id
     JOIN lingxios.agent_os_sessions session ON session.tenant_id=work.tenant_id AND session.agent_id=work.agent_id
       AND session.session_id=work.session_id AND session.thread_id IS NOT DISTINCT FROM work.thread_id
+    JOIN lingxios.agent_request_snapshots snapshot ON snapshot.work_id=work.id AND snapshot.session_key=session.session_key
     WHERE approval.id=$1 AND approval.company_id=$2 AND approval.source='AGENT_OS'`, [input.approvalId, input.companyId])
   if (rows.length !== 1) throw new Error('approval has no unique namespaced recovery record')
   const row = rows[0]!
@@ -108,6 +109,42 @@ export async function inspectApproval(database: SqlQueryable, services: Pick<Lin
   return { approvalId: input.approvalId, status: approval['status'], requestVersion: intent.requestVersion,
     originalInput: request.originalText, revisions: structuredClone(request.revisions), action: structuredClone(intent.action),
     summary: approval['summary'] ?? null, preview: approval['preview'], result: approval['result'] ?? null, expiresAt: approval['expires_at'] }
+}
+
+/** Linearization point shared by approvals whose native effect runs outside PostgreSQL. */
+export async function claimApprovalExecution(database: SqlQueryable,
+  input: { companyId: string; userId: string; approvalId: string },
+  reviewed: Awaited<ReturnType<typeof inspectApproval>>) {
+  const params = [input.approvalId, input.userId, input.companyId, reviewed.action.idempotencyKey,
+    JSON.stringify(reviewed.action.args), JSON.stringify(reviewed.preview), reviewed.requestVersion]
+  if (reviewed.status === 'PENDING') {
+    const claimed = await database.query(`UPDATE approvals approval
+      SET status='EXECUTING',resolved_at=COALESCE(resolved_at,NOW()),resolved_by=COALESCE(resolved_by,$2)
+      FROM lingxios.agent_work_items work,lingxios.agent_action_intents intent
+      WHERE work.id=approval.work_id AND work.tenant_id=approval.company_id
+        AND intent.idempotency_key=approval.idempotency_key
+        AND approval.id=$1 AND approval.company_id=$3 AND approval.status='PENDING' AND approval.expires_at>NOW()
+        AND approval.idempotency_key=$4 AND approval.args=$5::jsonb AND approval.preview=$6::jsonb
+        AND work.status='completed' AND work.cancel_requested_at IS NULL
+        AND work.goal_outcome->>'status'='awaiting_approval' AND work.goal_outcome->>'approvalId'=$1
+        AND (work.goal_outcome->>'requestVersion')::integer=$7 AND jsonb_array_length(work.steer_inputs)+1=$7
+      RETURNING intent.intent`, params)
+    const intent = claimed.rows[0]?.['intent'] as ActionIntent | undefined
+    if (!intent) throw new Error('approval expired or changed before execution')
+    return { intent, recovering: false }
+  }
+  if (reviewed.status !== 'EXECUTING') throw new Error('approval is no longer pending or executing')
+  const existing = await database.query(`SELECT intent.intent FROM approvals approval
+    JOIN lingxios.agent_work_items work ON work.id=approval.work_id AND work.tenant_id=approval.company_id
+    JOIN lingxios.agent_action_intents intent ON intent.idempotency_key=approval.idempotency_key
+    WHERE approval.id=$1 AND approval.company_id=$3 AND approval.status='EXECUTING'
+      AND approval.idempotency_key=$4 AND approval.args=$5::jsonb AND approval.preview=$6::jsonb
+      AND work.status='completed' AND work.cancel_requested_at IS NULL
+      AND work.goal_outcome->>'status'='awaiting_approval' AND work.goal_outcome->>'approvalId'=$1
+      AND (work.goal_outcome->>'requestVersion')::integer=$7 AND jsonb_array_length(work.steer_inputs)+1=$7`, params)
+  const intent = existing.rows[0]?.['intent'] as ActionIntent | undefined
+  if (!intent) throw new Error('executing approval no longer matches its durable intent')
+  return { intent, recovering: true }
 }
 
 /** Creates a domain approval; the business mutation remains unexecuted. */
@@ -200,9 +237,9 @@ export async function rejectApproval(database: SqlPool, services: Pick<LingxiLoo
         AND session.session_id=work.session_id AND session.thread_id IS NOT DISTINCT FROM work.thread_id
       WHERE approval.id=$1 AND approval.company_id=$2 AND work.tenant_id=$2
         AND approval.idempotency_key=$3 AND approval.args=$4::jsonb AND approval.action=$5
-        AND session.request_snapshot->>'workId'=work.id
+        AND EXISTS (SELECT 1 FROM lingxios.agent_request_snapshots snapshot WHERE snapshot.work_id=work.id
+          AND snapshot.session_key=session.session_key AND snapshot.request_snapshot->'revisions'=work.steer_inputs)
         AND jsonb_array_length(work.steer_inputs)+1=$6
-        AND session.request_snapshot->'revisions'=work.steer_inputs
       FOR UPDATE OF approval,work,session`,
       [input.approvalId, input.companyId, reviewed.action.idempotencyKey, JSON.stringify(reviewed.action.args), reviewed.action.action, reviewed.requestVersion])
     const row = rows[0]
@@ -398,15 +435,25 @@ export async function resumeApproved(database: SqlPool, input: { companyId: stri
     await client.query('LOCK TABLE lingxios.agent_os_session_leases IN SHARE ROW EXCLUSIVE MODE')
     const { rows } = await client.query(`SELECT approval.resumed_at,approval.result,work.id,session.session_key
       FROM approvals approval JOIN lingxios.agent_work_items work ON work.id=approval.work_id
+      JOIN lingxios.agent_action_intents intent ON intent.idempotency_key=approval.idempotency_key
       JOIN lingxios.agent_action_ledger ledger ON ledger.idempotency_key=approval.idempotency_key
       JOIN lingxios.agent_os_sessions session ON session.tenant_id=work.tenant_id AND session.agent_id=work.agent_id
         AND session.session_id=work.session_id AND session.thread_id IS NOT DISTINCT FROM work.thread_id
-      WHERE approval.id=$1 AND approval.company_id=$2 AND work.tenant_id=$2 AND approval.status='EXECUTED'
+      WHERE approval.id=$1 AND approval.company_id=$2 AND approval.source='AGENT_OS' AND work.tenant_id=$2 AND approval.status='EXECUTED'
         AND approval.idempotency_key=$3 AND approval.args=$4::jsonb AND approval.action=$5
+        AND intent.intent->>'workId'=work.id AND intent.intent->>'tenantId'=work.tenant_id
+        AND intent.intent->>'agentId'=work.agent_id AND intent.intent->>'sessionId'=work.session_id
+        AND intent.intent->>'principalId'=work.principal_id
+        AND intent.intent->'action'->>'idempotencyKey'=approval.idempotency_key
+        AND intent.intent->'action'->>'action'=approval.action AND intent.intent->'action'->'args'=approval.args
+        AND (intent.intent->>'requestVersion')::integer=$6
         AND ledger.result=jsonb_build_object('ok',true,'value',approval.result)
-        AND session.request_snapshot->>'workId'=work.id
-        AND jsonb_array_length(work.steer_inputs)+1=$6 AND session.request_snapshot->'revisions'=work.steer_inputs
-      FOR UPDATE OF approval,work,session,ledger`,
+        AND EXISTS (SELECT 1 FROM lingxios.agent_request_snapshots snapshot WHERE snapshot.work_id=work.id
+          AND snapshot.session_key=session.session_key AND snapshot.request_snapshot->'revisions'=work.steer_inputs
+          AND snapshot.request_snapshot->>'tenantId'=work.tenant_id AND snapshot.request_snapshot->>'sessionId'=work.session_id
+          AND snapshot.request_snapshot->>'authorId'=work.principal_id)
+        AND jsonb_array_length(work.steer_inputs)+1=$6
+      FOR UPDATE OF approval,work,session,intent,ledger`,
       [input.approvalId, input.companyId, reviewed.action.idempotencyKey, JSON.stringify(reviewed.action.args), reviewed.action.action, reviewed.requestVersion])
     const row = rows[0]
     if (rows.length !== 1 || !row) throw new Error('approved execution lacks matching durable recovery records')

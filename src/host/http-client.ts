@@ -14,6 +14,7 @@ import type {
   RunEvent, SessionRecord, TurnContext, WorkCompletion, WorkItem,
 } from '../protocol/types.js'
 import type { HostPort } from './port.js'
+import type { ModelBudgetLimits, ModelBudgetReservation } from '../control-plane/stores.js'
 
 export interface HttpHostClientOptions {
   baseUrl: string
@@ -22,6 +23,7 @@ export interface HttpHostClientOptions {
   requestTimeoutMs?: number
   maxAttempts?: number
   retryBaseMs?: number
+  maxResponseBytes?: number
   fetchImpl?: typeof fetch
   sleep?: (ms: number) => Promise<void>
 }
@@ -37,6 +39,7 @@ export class HttpHostClient implements HostPort {
   private readonly timeoutMs: number
   private readonly maxAttempts: number
   private readonly retryBaseMs: number
+  private readonly maxResponseBytes: number
   private readonly fetchImpl: typeof fetch
   private readonly sleep: (ms: number) => Promise<void>
 
@@ -45,6 +48,7 @@ export class HttpHostClient implements HostPort {
     this.timeoutMs = options.requestTimeoutMs ?? 30_000
     this.maxAttempts = options.maxAttempts ?? 3
     this.retryBaseMs = options.retryBaseMs ?? 250
+    this.maxResponseBytes = options.maxResponseBytes ?? 10 * 1024 * 1024
     this.fetchImpl = options.fetchImpl ?? fetch
     this.sleep = options.sleep ?? ((ms) => new Promise((resolveSleep) => setTimeout(resolveSleep, ms)))
   }
@@ -55,9 +59,8 @@ export class HttpHostClient implements HostPort {
       signal?.throwIfAborted()
       const timeout = AbortSignal.timeout(this.timeoutMs)
       const combined = signal ? AbortSignal.any([signal, timeout]) : timeout
-      let response: Response
       try {
-        response = await this.fetchImpl(`${this.baseUrl}${path}`, {
+        const response = await this.fetchImpl(`${this.baseUrl}${path}`, {
           method,
           headers: {
             authorization: `Bearer ${this.options.serviceToken}`,
@@ -66,7 +69,20 @@ export class HttpHostClient implements HostPort {
           ...(body === undefined ? {} : { body: JSON.stringify(body) }),
           signal: combined,
         })
+        const detail = await readBody(response, this.maxResponseBytes)
+        if (response.ok) return JSON.parse(detail) as T
+        let message = detail
+        let responseCode: string | undefined
+        try {
+          const parsed = JSON.parse(detail) as { error?: unknown; code?: unknown }
+          if (typeof parsed.error === 'string') message = parsed.error
+          if (typeof parsed.code === 'string') responseCode = parsed.code
+        } catch { /* plain-text error body */ }
+        if (responseCode === 'lease_lost') throw new LeaseLostError(message || 'lease rejected by control plane')
+        if (response.status < 500) throw new HostRequestError(response.status, message || `control plane returned ${response.status}`, responseCode)
+        lastError = new HostRequestError(response.status, message)
       } catch (error) {
+        if (error instanceof LeaseLostError || (error instanceof HostRequestError && error.status > 0 && error.status < 500)) throw error
         signal?.throwIfAborted()
         lastError = error
         if (attempt < this.maxAttempts) {
@@ -75,22 +91,10 @@ export class HttpHostClient implements HostPort {
         }
         break
       }
-      if (response.ok) return await response.json() as T
-      const detail = await response.text().catch(() => '')
-      let message = detail
-      let responseCode: string | undefined
-      try {
-        const parsed = JSON.parse(detail) as { error?: unknown; code?: unknown }
-        if (typeof parsed.error === 'string') message = parsed.error
-        if (typeof parsed.code === 'string') responseCode = parsed.code
-      } catch { /* plain-text error body */ }
-      if (responseCode === 'lease_lost') throw new LeaseLostError(message || 'lease rejected by control plane')
-      if (response.status >= 500 && attempt < this.maxAttempts) {
-        lastError = new HostRequestError(response.status, message)
+      if (attempt < this.maxAttempts) {
         await this.sleep(this.retryBaseMs * 2 ** (attempt - 1))
         continue
       }
-      throw new HostRequestError(response.status, message || `control plane returned ${response.status}`, responseCode)
     }
     throw new HostRequestError(0, `control plane unreachable after ${this.maxAttempts} attempts: ${errorMessage(lastError)}`)
   }
@@ -123,9 +127,22 @@ export class HttpHostClient implements HostPort {
     })
   }
 
+  async reserveModelCall(work: WorkItem, callId: string, limits: ModelBudgetLimits): Promise<ModelBudgetReservation> {
+    return this.request('POST', `/v2/work/${encodeURIComponent(work.id)}/model-budget`, { ...this.proof(work), callId, limits })
+  }
+
+  async recordModelUsage(work: WorkItem, callId: string, usage: { inputTokens: number; outputTokens: number; costMicros: number }): Promise<void> {
+    await this.request('POST', `/v2/work/${encodeURIComponent(work.id)}/model-usage`, { ...this.proof(work), callId, usage })
+  }
+
   async recoverCell(work: WorkItem, cellId: string) {
     return this.request<Array<{ action: string; idempotencyKey: string; result: HostActionResult }> | null>(
       'POST', `/v2/work/${encodeURIComponent(work.id)}/reconcile`, { ...this.proof(work), cellId })
+  }
+
+  async recoverStep(work: WorkItem, cellId: string) {
+    return this.request<{ output: string; artifacts: import('../protocol/types.js').KernelArtifact[] } | null>(
+      'POST', `/v2/work/${encodeURIComponent(work.id)}/step`, { ...this.proof(work), cellId })
   }
 
   async stageArtifact(work: WorkItem, artifact: import('../protocol/types.js').KernelArtifact, bytes: Uint8Array): Promise<void> {
@@ -161,4 +178,27 @@ export class HttpHostClient implements HostPort {
   async yieldWork(work: WorkItem): Promise<void> {
     await this.request('POST', `/v2/work/${encodeURIComponent(work.id)}/yield`, this.proof(work))
   }
+}
+
+async function readBody(response: Response, maxBytes: number): Promise<string> {
+  const declared = Number(response.headers.get('content-length'))
+  if (Number.isFinite(declared) && declared > maxBytes) throw new Error(`control plane response exceeds ${maxBytes} bytes`)
+  if (!response.body) return ''
+  const reader = response.body.getReader()
+  const chunks: Uint8Array[] = []
+  let size = 0
+  for (;;) {
+    const { done, value } = await reader.read()
+    if (done) break
+    size += value.byteLength
+    if (size > maxBytes) {
+      await reader.cancel()
+      throw new Error(`control plane response exceeds ${maxBytes} bytes`)
+    }
+    chunks.push(value)
+  }
+  const bytes = new Uint8Array(size)
+  let offset = 0
+  for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength }
+  return new TextDecoder().decode(bytes)
 }

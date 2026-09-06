@@ -31,13 +31,14 @@ export async function continueInput(database: SqlPool, input: InputContinuation)
     // ponytail: serialize rare human continuations with lease acquisition; shard if contention matters.
     await client.query('LOCK TABLE lingxios.agent_os_session_leases IN SHARE ROW EXCLUSIVE MODE')
     const { rows } = await client.query(`SELECT work.status,work.cancel_requested_at,work.goal_outcome,work.steer_inputs,
-      session.request_snapshot FROM lingxios.agent_work_items work
+      request.request_snapshot FROM lingxios.agent_work_items work
       JOIN lingxios.agent_os_sessions session ON session.session_key=$7
         AND session.tenant_id=work.tenant_id AND session.agent_id=work.agent_id
         AND session.session_id=work.session_id AND session.thread_id IS NOT DISTINCT FROM work.thread_id
+      JOIN lingxios.agent_request_snapshots request ON request.work_id=work.id AND request.session_key=session.session_key
       WHERE work.id=$1 AND work.tenant_id=$2 AND work.agent_id=$3 AND work.session_id=$4
         AND work.principal_id=$5 AND work.thread_id IS NOT DISTINCT FROM $6
-        AND session.request_snapshot->>'workId'=work.id FOR UPDATE OF work,session`,
+      FOR UPDATE OF work,session,request`,
     [input.runId, input.tenantId, input.agentId, input.sessionId, input.principalId, input.threadId ?? null, sessionKeyOf(input)])
     const row = rows[0]
     if (!row) throw new Error('input continuation does not match the original request identity')
@@ -57,10 +58,15 @@ export async function continueInput(database: SqlPool, input: InputContinuation)
     const request = row['request_snapshot'] as RequestSnapshot
     if (request.attachments.length + revisions.reduce((count, revision) => count + (revision.attachments?.length ?? 0), 0) + attachments.length > 20) throw new Error('request attachment limit reached')
     const revision = { id: revisionId, text: input.text, createdAt: new Date().toISOString(), ...(attachments.length ? { attachments } : {}) }
-    const updated = await client.query(`UPDATE lingxios.agent_os_sessions SET request_snapshot=jsonb_set(request_snapshot-'contract','{revisions}',$2::jsonb),
-      revision=revision+1,updated_at=NOW() WHERE session_key=$1 AND request_snapshot->'revisions'=$3::jsonb RETURNING session_key`,
-    [sessionKeyOf(input), JSON.stringify([...revisions, revision]), JSON.stringify(revisions)])
+    const updated = await client.query(`UPDATE lingxios.agent_request_snapshots
+      SET request_snapshot=jsonb_set(request_snapshot-'contract','{revisions}',$2::jsonb),updated_at=NOW()
+      WHERE session_key=$1 AND work_id=$4 AND request_snapshot->'revisions'=$3::jsonb RETURNING session_key`,
+    [sessionKeyOf(input), JSON.stringify([...revisions, revision]), JSON.stringify(revisions), input.runId])
     if (updated.rows.length !== 1) throw new Error('request revisions changed before continuation')
+    await client.query(`UPDATE lingxios.agent_os_sessions
+      SET request_snapshot=(SELECT request_snapshot FROM lingxios.agent_request_snapshots WHERE work_id=$2),
+        revision=revision+1,updated_at=NOW()
+      WHERE session_key=$1 AND request_snapshot->>'workId'=$2`, [sessionKeyOf(input), input.runId])
     await client.query(`UPDATE lingxios.agent_work_items SET steer_inputs=$2::jsonb,status='queued',available_at=NOW(),
       goal_outcome=NULL,finished_at=NULL,result_text=NULL,error=NULL,updated_at=NOW() WHERE id=$1`, [input.runId, JSON.stringify([...revisions, revision])])
     return { status: 'resumed' as const, workId: input.runId }

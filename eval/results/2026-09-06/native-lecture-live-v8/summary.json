@@ -1,0 +1,24 @@
+{
+  "version": 1,
+  "mode": "lingxios_native_lecture_live_model",
+  "model": "deepseek-ai/DeepSeek-V4-Flash",
+  "providerOrigin": "https://api.siliconflow.cn",
+  "status": "awaiting_human_visual_review",
+  "artifact": "lecture.html",
+  "artifactSha256": "58ec547a935955ff0d7160f641442f3d9c2cc717600156103405180100b35057",
+  "pageCount": 6,
+  "staticValidation": {
+    "passed": true,
+    "issues": []
+  },
+  "semanticReview": {
+    "passed": true,
+    "issues": []
+  },
+  "modelCalls": 15,
+  "usage": {
+    "inputTokens": 37616,
+    "outputTokens": 16722
+  },
+  "error": null
+}

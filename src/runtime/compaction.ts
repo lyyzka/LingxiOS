@@ -113,6 +113,7 @@ export async function compactIfNeeded(
         outputTokens: usage.outputTokens + recompacted.usage.outputTokens,
       }
     }
+    combined = combined.slice(0, options.maxSummaryChars)
     session.summary = combined
     session.history = [summaryItem(combined), ...keep]
     session.compactionEpoch += 1

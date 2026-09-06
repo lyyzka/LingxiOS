@@ -1,6 +1,7 @@
 import type { HostAction, WorkItem } from '../../protocol/types.js'
 import type { SqlQueryable } from '../../control-plane/pg-store.js'
 import type { LingxiLoopServices } from './service-contracts.js'
+import type { RequestSnapshot } from '../../context/request.js'
 
 export const HANDOFF_METHODS = { list: [], create: ['toAgentId', 'title', 'contextMessageIds', 'note'],
   update: ['handoffId', 'status', 'note'] } as const
@@ -53,23 +54,31 @@ export async function resolveHandoffIngress(database: SqlQueryable,
     throw new Error('committed handoff message not found')
   }
   const { rows } = await database.query(`SELECT handoff.from_agent_id,handoff.to_agent_id,handoff.title,handoff.note,handoff.context_message_ids,
-      handoff.status,work.principal_id,human.name
+      handoff.status,work.id AS parent_work_id,work.principal_id,human.name,intent.intent->>'requestVersion' AS request_version,
+      work.meta->>'rootWorkId' AS root_work_id,snapshot.request_snapshot
     FROM agent_handoffs handoff
     JOIN lingxios.agent_action_intents intent ON intent.idempotency_key=handoff.idempotency_key
       AND intent.intent->'action'->>'action'='handoffs.create'
     JOIN lingxios.agent_work_items work ON work.id=intent.intent->>'workId' AND work.tenant_id=handoff.company_id
       AND work.agent_id=handoff.from_agent_id AND work.session_id=handoff.conversation_id
+    JOIN lingxios.agent_request_snapshots snapshot ON snapshot.work_id=work.id
     JOIN participants human ON human.company_id=work.tenant_id AND human.id=work.principal_id
       AND human.kind='human' AND human.departed_at IS NULL
     WHERE handoff.id=$1 AND handoff.company_id=$2 AND handoff.conversation_id=$3
       AND (($5='created' AND handoff.to_agent_id=$4) OR ($5 IN ('completed','blocked') AND handoff.from_agent_id=$4 AND handoff.status=$5))`,
   [handoffId, input.companyId, input.channelId, input.agentId, identity[2]])
   const row = rows[0], principalId = row?.['principal_id']
-  if (!row || typeof principalId !== 'string' || message.fromUid !== row[created ? 'from_agent_id' : 'to_agent_id']) throw new Error('handoff has no valid source work')
+  const parentRequest = row?.['request_snapshot'] as RequestSnapshot | undefined
+  const parentRequestVersion = Number(row?.['request_version'])
+  if (!row || typeof principalId !== 'string' || !parentRequest || parentRequest.workId !== row['parent_work_id']
+    || parentRequest.revisions.length + 1 !== parentRequestVersion
+    || message.fromUid !== row[created ? 'from_agent_id' : 'to_agent_id']) throw new Error('handoff has no valid source work')
   await services.permissionService.assertCan({ actorUserId: principalId, companyId: input.companyId,
     action: 'conversation:read', resource: { type: 'conversation', id: input.channelId } })
   const contextIds = Array.isArray(row['context_message_ids']) ? row['context_message_ids'].filter(id => typeof id === 'string') : []
   const text = [created ? `Handoff: ${String(row['title'])}` : `${identity[2] === 'completed' ? 'Completed' : 'Blocked'} handoff: ${String(row['title'])}`,
     row['note'] ? `Note: ${String(row['note'])}` : '', created && contextIds.length ? `Context message IDs: ${contextIds.join(', ')}` : ''].filter(Boolean).join('\n')
-  return { handoffId, principalId, authorName: String(row['name']), text }
+  return { handoffId, principalId, authorName: String(row['name']), text,
+    parentWorkId: parentRequest.workId, rootWorkId: String(row['root_work_id'] ?? parentRequest.rootWorkId ?? parentRequest.workId),
+    parentRequestVersion, instructionAuthorId: message.fromUid, parentRequest: structuredClone(parentRequest) }
 }

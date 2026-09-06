@@ -67,6 +67,7 @@ export interface WorkStoreOptions {
 
 export interface WorkStore {
   hasPendingChild(parent: Omit<WorkItem, 'leaseToken'>, childId: string, requestVersion: number): Promise<boolean>
+  ownsBudgetRoot(work: Omit<WorkItem, 'leaseToken'>, rootWorkId: string): Promise<boolean>
   enqueue(input: EnqueueWorkInput): Promise<EnqueueResult>
 
   /**
@@ -107,8 +108,29 @@ export interface StoreLeaseProof {
   leaseTokenHash: string
 }
 
+export interface ModelBudgetLimits {
+  maxModelCalls: number
+  maxTokens: number
+  maxCostMicros: number
+  deadlineAt: string
+}
+
+export interface ModelBudgetReservation {
+  allowed: boolean
+  remainingCalls: number
+  remainingTokens: number
+  remainingCostMicros: number
+  deadlineAt: string
+}
+
+/** Durable budget shared by every attempt and delegated child of one root work item. */
+export interface ModelBudgetStore {
+  reserve(rootWorkId: string, callId: string, limits: ModelBudgetLimits): Promise<ModelBudgetReservation>
+  record(rootWorkId: string, callId: string, inputTokens: number, outputTokens: number, costMicros: number): Promise<void>
+}
+
 export interface SessionStore {
-  get(key: string): Promise<SessionRecord | null>
+  get(key: string, workId?: string): Promise<SessionRecord | null>
   /**
    * Optimistic save: succeeds only when the stored revision equals
    * `session.revision` (or the session does not exist and revision is 0).

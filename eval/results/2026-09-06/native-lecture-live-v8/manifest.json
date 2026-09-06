@@ -1,0 +1,1183 @@
+{
+  "schemaVersion": "lingxi-lecture/v1",
+  "deckId": "a43c2c67-3362-4995-99cc-7a4cb9708c99",
+  "revision": 1,
+  "title": "2026 Q3 产品复盘",
+  "language": "zh-CN",
+  "theme": {
+    "id": "midnight",
+    "background": "#08111f",
+    "surface": "#12233d",
+    "text": "#f7f9fc",
+    "muted": "#a8b6ca",
+    "accent": "#53d6c7",
+    "fontFamily": "system-ui, -apple-system, \"Segoe UI\", sans-serif"
+  },
+  "course": {
+    "title": "2026 Q3 产品复盘",
+    "audience": "中文管理层",
+    "prerequisites": [
+      "了解产品基本指标含义"
+    ],
+    "objectives": [
+      {
+        "id": "obj1",
+        "description": "掌握本季度的核心结论与关键指标变化"
+      },
+      {
+        "id": "obj2",
+        "description": "理解指标变化的因果链与改进措施"
+      },
+      {
+        "id": "obj3",
+        "description": "识别当前风险与下一季度的优先行动"
+      }
+    ],
+    "chapters": [
+      {
+        "id": "ch1",
+        "order": 1,
+        "title": "季度目标与核心结论",
+        "objectiveIds": [
+          "obj1"
+        ],
+        "slideIds": [
+          "pg_overview"
+        ]
+      },
+      {
+        "id": "ch2",
+        "order": 2,
+        "title": "流失点与激活率因果链",
+        "objectiveIds": [
+          "obj2"
+        ],
+        "slideIds": [
+          "pg_funnel",
+          "pg_activation"
+        ]
+      },
+      {
+        "id": "ch3",
+        "order": 3,
+        "title": "性能与使用模式改善",
+        "objectiveIds": [
+          "obj2"
+        ],
+        "slideIds": [
+          "pg_perf"
+        ]
+      },
+      {
+        "id": "ch4",
+        "order": 4,
+        "title": "风险与下一步",
+        "objectiveIds": [
+          "obj3"
+        ],
+        "slideIds": [
+          "pg_risk",
+          "pg_next"
+        ]
+      }
+    ],
+    "targetSlideCount": 6,
+    "durationMinutes": 15,
+    "terminology": {
+      "激活率": "用户完成首次有效任务的比例",
+      "合成资料": "用于演示的非真实数据，不代表实际经营情况",
+      "引导步骤": "用户从开始到完成首次任务所需操作的步骤数",
+      "周活跃用户": "每周至少使用一次产品的用户数"
+    }
+  },
+  "slides": [
+    {
+      "id": "pg_overview",
+      "order": 0,
+      "chapterId": "ch1",
+      "role": "content",
+      "purpose": "review",
+      "title": "季度目标与核心结论",
+      "conclusion": "Q3 达成核心目标：降低引导步骤并提升激活率，但需关注后续留存与风险。",
+      "visualKind": "diagram",
+      "bodyHtml": "<svg data-anchor-id='main' viewBox='0 0 1280 720' xmlns='http://www.w3.org/2000/svg' role='img' aria-label='季度目标与核心结论示意'><rect x='80' y='140' width='720' height='400' fill='#f7f9fc' stroke='#ccc'/><text x='120' y='180' font-size='24' fill='#333'>季度目标</text><text x='120' y='220' font-size='18' fill='#555'>验证关键工作流，降低完成任务的步骤数</text><line x1='120' y1='250' x2='760' y2='250' stroke='#aaa'/><text x='120' y='290' font-size='24' fill='#333'>核心结论</text><circle cx='220' cy='380' r='40' fill='#4a90d9'/><text x='220' y='388' text-anchor='middle' font-size='16' fill='#fff'>引导步骤</text><text x='220' y='410' text-anchor='middle' font-size='14' fill='#fff'>7→4步</text><circle cx='460' cy='380' r='40' fill='#50b86c'/><text x='460' y='388' text-anchor='middle' font-size='16' fill='#fff'>激活率</text><text x='460' y='410' text-anchor='middle' font-size='14' fill='#fff'>42%→49%</text><circle cx='700' cy='380' r='40' fill='#e8a33d'/><text x='700' y='388' text-anchor='middle' font-size='16' fill='#fff'>周活</text><text x='700' y='410' text-anchor='middle' font-size='14' fill='#fff'>8.2→9.6万</text></svg>",
+      "anchors": [
+        {
+          "id": "main",
+          "x": 80,
+          "y": 140,
+          "width": 720,
+          "height": 400
+        }
+      ],
+      "steps": [
+        {
+          "id": "step-overview-1",
+          "title": "目标与数据",
+          "explanation": "季度目标为验证工作流并降低步骤数；关键指标：引导步骤从 7 降至 4，激活率 42% 提升至 49%。",
+          "anchorIds": [
+            "main"
+          ],
+          "claimIds": [
+            "claim-overview-1"
+          ]
+        },
+        {
+          "id": "step-overview-2",
+          "title": "主要发现",
+          "explanation": "首次设置流程是主要流失点；改进后周活跃用户增长至 9.6 万，次周留存提升至 35%。",
+          "anchorIds": [
+            "main"
+          ],
+          "claimIds": [
+            "claim-overview-2"
+          ]
+        }
+      ],
+      "bindings": [
+        {
+          "claimId": "claim-overview-1",
+          "snapshotId": "a43c2c67-3362-4995-99cc-7a4cb9708c99:ch1",
+          "evidenceMarkers": [
+            "S2",
+            "S5",
+            "S6"
+          ],
+          "kind": "derived",
+          "statement": "引导步骤从 7 步减至 4 步，激活率从 42% 升至 49%（合成数据）。"
+        },
+        {
+          "claimId": "claim-overview-2",
+          "snapshotId": "a43c2c67-3362-4995-99cc-7a4cb9708c99:ch1",
+          "evidenceMarkers": [
+            "S3",
+            "S7"
+          ],
+          "kind": "derived",
+          "statement": "首次设置流程为主要流失点；改进后周活跃与次周留存提升（合成数据）。"
+        }
+      ]
+    },
+    {
+      "id": "pg_funnel",
+      "order": 1,
+      "chapterId": "ch2",
+      "role": "content",
+      "purpose": "example",
+      "title": "流失点与激活率因果链",
+      "conclusion": "首次设置流程是主要流失点，但简化引导步骤已带来激活率与留存的双重提升。",
+      "visualKind": "diagram",
+      "bodyHtml": "<svg data-anchor-id='main' xmlns='http://www.w3.org/2000/svg' viewBox='0 0 720 400' width='720' height='400' role='img' aria-labelledby='svgTitle'><title id='svgTitle'>Q3 激活率因果链（合成数据）</title><defs><marker id='arrow' markerWidth='10' markerHeight='7' refX='10' refY='3.5' orient='auto'><polygon points='0 0, 10 3.5, 0 7' fill='#444'/></marker></defs><rect x='10' y='10' width='700' height='380' fill='#f8f9fa' rx='8'/><text x='360' y='40' text-anchor='middle' font-size='16' font-weight='bold' fill='#222'>Q3 激活率因果链（合成数据）</text><rect x='30' y='80' width='200' height='60' rx='8' fill='#ffcccc' stroke='#cc0000'/><text x='130' y='105' text-anchor='middle' font-size='14' font-weight='bold' fill='#cc0000'>首次设置流失</text><text x='130' y='125' text-anchor='middle' font-size='12' fill='#333'>主要流失点</text><rect x='300' y='80' width='200' height='60' rx='8' fill='#ccffcc' stroke='#008800'/><text x='400' y='105' text-anchor='middle' font-size='14' font-weight='bold' fill='#008800'>简化引导</text><text x='400' y='125' text-anchor='middle' font-size='12' fill='#333'>7步 → 4步</text><rect x='560' y='80' width='140' height='60' rx='8' fill='#cce5ff' stroke='#0066cc'/><text x='630' y='105' text-anchor='middle' font-size='14' font-weight='bold' fill='#0066cc'>激活率提升</text><text x='630' y='125' text-anchor='middle' font-size='12' fill='#333'>42% → 49%</text><line x1='230' y1='110' x2='290' y2='110' stroke='#444' stroke-width='2' marker-end='url(#arrow)'/><line x1='500' y1='110' x2='550' y2='110' stroke='#444' stroke-width='2' marker-end='url(#arrow)'/><text x='260' y='95' text-anchor='middle' font-size='11' fill='#666'>改进</text><text x='525' y='95' text-anchor='middle' font-size='11' fill='#666'>导致</text><rect x='30' y='180' width='300' height='70' rx='8' fill='#e6f7ff' stroke='#0099cc'/><text x='180' y='205' text-anchor='middle' font-size='13' font-weight='bold' fill='#006699'>次周留存 31% → 35%</text><text x='180' y='225' text-anchor='middle' font-size='12' fill='#333'>周活跃用户 8.2万 → 9.6万</text><text x='180' y='245' text-anchor='middle' font-size='11' fill='#666'>合成数据</text><rect x='390' y='180' width='300' height='70' rx='8' fill='#fff3cc' stroke='#cc8800'/><text x='540' y='205' text-anchor='middle' font-size='13' font-weight='bold' fill='#996600'>因果链</text><text x='540' y='225' text-anchor='middle' font-size='12' fill='#333'>减少步骤 → 降低流失</text><text x='540' y='245' text-anchor='middle' font-size='12' fill='#333'>提升激活 → 带动留存</text></svg>",
+      "anchors": [
+        {
+          "id": "main",
+          "x": 80,
+          "y": 140,
+          "width": 720,
+          "height": 400
+        }
+      ],
+      "steps": [
+        {
+          "id": "step1",
+          "title": "识别流失点",
+          "explanation": "研究样本显示首次设置流程是主要流失点。",
+          "anchorIds": [
+            "main"
+          ],
+          "claimIds": [
+            "claim1"
+          ]
+        },
+        {
+          "id": "step2",
+          "title": "实施改进",
+          "explanation": "团队将引导步骤从7步减至4步。",
+          "anchorIds": [
+            "main"
+          ],
+          "claimIds": [
+            "claim2"
+          ]
+        },
+        {
+          "id": "step3",
+          "title": "结果验证",
+          "explanation": "激活率从42%升至49%，周活跃用户和留存同步提升。",
+          "anchorIds": [
+            "main"
+          ],
+          "claimIds": [
+            "claim3",
+            "claim4"
+          ]
+        }
+      ],
+      "bindings": [
+        {
+          "claimId": "claim1",
+          "snapshotId": "a43c2c67-3362-4995-99cc-7a4cb9708c99:course",
+          "evidenceMarkers": [
+            "S3"
+          ],
+          "kind": "source",
+          "statement": "首次设置流程是主要流失点。"
+        },
+        {
+          "claimId": "claim2",
+          "snapshotId": "a43c2c67-3362-4995-99cc-7a4cb9708c99:ch2",
+          "evidenceMarkers": [
+            "S6"
+          ],
+          "kind": "source",
+          "statement": "引导步骤从7步减少到4步。"
+        },
+        {
+          "claimId": "claim3",
+          "snapshotId": "a43c2c67-3362-4995-99cc-7a4cb9708c99:ch2",
+          "evidenceMarkers": [
+            "S5"
+          ],
+          "kind": "source",
+          "statement": "激活率由42%提升至49%。"
+        },
+        {
+          "claimId": "claim4",
+          "snapshotId": "a43c2c67-3362-4995-99cc-7a4cb9708c99:ch2",
+          "evidenceMarkers": [
+            "S7"
+          ],
+          "kind": "source",
+          "statement": "周活跃用户从8.2万增至9.6万，次周留存从31%提升至35%。"
+        }
+      ]
+    },
+    {
+      "id": "pg_activation",
+      "order": 2,
+      "chapterId": "ch2",
+      "role": "content",
+      "purpose": "explain",
+      "title": "激活率提升的因果链：引导步骤优化",
+      "conclusion": "将引导步骤从7步降至4步，激活率从42%提升至49%，主要流失点得到有效缓解。",
+      "visualKind": "process",
+      "bodyHtml": "<svg data-anchor-id='main' viewBox='0 0 720 400' xmlns='http://www.w3.org/2000/svg' role='img' aria-label='激活率提升因果链示意图'><defs><marker id='arrow' viewBox='0 0 10 10' refX='5' refY='5' markerWidth='6' markerHeight='6' orient='auto-start-reverse'><path d='M 0 0 L 10 5 L 0 10 z' fill='#1a1a1a'/></marker></defs><rect x='20' y='60' width='180' height='90' rx='10' fill='#e0f7fa' stroke='#006064' stroke-width='2'/><text x='110' y='95' text-anchor='middle' font-size='16' font-weight='bold' fill='#006064'>引导步骤</text><text x='110' y='115' text-anchor='middle' font-size='14' fill='#006064'>7步 → 4步</text><line x1='200' y1='105' x2='260' y2='105' marker-end='url(#arrow)' stroke='#1a1a1a' stroke-width='2'/><rect x='260' y='60' width='180' height='90' rx='10' fill='#fff3e0' stroke='#e65100' stroke-width='2'/><text x='350' y='95' text-anchor='middle' font-size='16' font-weight='bold' fill='#e65100'>首次设置</text><text x='350' y='115' text-anchor='middle' font-size='14' fill='#e65100'>流失减少</text><line x1='440' y1='105' x2='500' y2='105' marker-end='url(#arrow)' stroke='#1a1a1a' stroke-width='2'/><rect x='500' y='60' width='180' height='90' rx='10' fill='#e8f5e9' stroke='#2e7d32' stroke-width='2'/><text x='590' y='95' text-anchor='middle' font-size='16' font-weight='bold' fill='#2e7d32'>激活率</text><text x='590' y='115' text-anchor='middle' font-size='14' fill='#2e7d32'>42% → 49%</text><rect x='20' y='190' width='680' height='80' rx='10' fill='#f5f5f5' stroke='#9e9e9e' stroke-width='1'/><text x='360' y='220' text-anchor='middle' font-size='14' font-weight='bold' fill='#333'>因果链说明</text><text x='360' y='245' text-anchor='middle' font-size='13' fill='#333'>减少步骤 → 降低认知负荷 → 减少中途放弃 → 更多用户完成首次有效任务</text><rect x='20' y='290' width='680' height='60' rx='10' fill='#fff9c4' stroke='#f9a825' stroke-width='1'/><text x='360' y='315' text-anchor='middle' font-size='13' fill='#333'>⚠ 所有数据均为合成资料，仅用于演示教学</text><text x='360' y='335' text-anchor='middle' font-size='13' fill='#333'>激活定义：用户完成首次有效任务</text></svg>",
+      "anchors": [
+        {
+          "id": "main",
+          "x": 80,
+          "y": 140,
+          "width": 720,
+          "height": 400
+        }
+      ],
+      "steps": [
+        {
+          "id": "step1",
+          "title": "识别主要流失点",
+          "explanation": "研究样本显示首次设置流程是主要流失点，用户在此阶段流失最多。该发现基于合成资料S3。",
+          "anchorIds": [
+            "main"
+          ],
+          "claimIds": [
+            "claim1"
+          ]
+        },
+        {
+          "id": "step2",
+          "title": "定义激活标准",
+          "explanation": "团队将激活定义为用户完成首次有效任务，为衡量优化效果提供明确标准。该定义来自合成资料S4。",
+          "anchorIds": [
+            "main"
+          ],
+          "claimIds": [
+            "claim4"
+          ]
+        },
+        {
+          "id": "step3",
+          "title": "优化引导步骤",
+          "explanation": "团队将引导步骤从7步减少到4步，以简化首次设置流程，降低用户完成障碍。该措施基于合成资料S6。",
+          "anchorIds": [
+            "main"
+          ],
+          "claimIds": [
+            "claim2"
+          ]
+        },
+        {
+          "id": "step4",
+          "title": "激活率提升",
+          "explanation": "通过引导步骤优化，激活率从合成基线42%提升至实验组49%，验证了减少步骤的有效性。该结果基于合成资料S5。",
+          "anchorIds": [
+            "main"
+          ],
+          "claimIds": [
+            "claim3"
+          ]
+        }
+      ],
+      "bindings": [
+        {
+          "claimId": "claim1",
+          "snapshotId": "a43c2c67-3362-4995-99cc-7a4cb9708c99:course",
+          "evidenceMarkers": [
+            "S3"
+          ],
+          "kind": "source",
+          "statement": "首次设置流程是主要流失点。"
+        },
+        {
+          "claimId": "claim2",
+          "snapshotId": "a43c2c67-3362-4995-99cc-7a4cb9708c99:course",
+          "evidenceMarkers": [
+            "S6"
+          ],
+          "kind": "source",
+          "statement": "引导步骤从7步减少到4步。"
+        },
+        {
+          "claimId": "claim3",
+          "snapshotId": "a43c2c67-3362-4995-99cc-7a4cb9708c99:course",
+          "evidenceMarkers": [
+            "S5"
+          ],
+          "kind": "source",
+          "statement": "激活率从42%提升至49%。"
+        },
+        {
+          "claimId": "claim4",
+          "snapshotId": "a43c2c67-3362-4995-99cc-7a4cb9708c99:course",
+          "evidenceMarkers": [
+            "S4"
+          ],
+          "kind": "source",
+          "statement": "激活定义为用户完成首次有效任务。"
+        }
+      ]
+    },
+    {
+      "id": "pg_perf",
+      "order": 3,
+      "chapterId": "ch3",
+      "role": "content",
+      "purpose": "explain",
+      "title": "性能与使用模式改善",
+      "conclusion": "本季度性能优化显著：应用启动时间缩短 18%，使用频率提升，同时激活率与留存率的改善同步验证了更顺畅的用户体验。",
+      "visualKind": "chart",
+      "bodyHtml": "<svg data-anchor-id='main' viewBox='0 0 1280 720' xmlns='http://www.w3.org/2000/svg' role='img' aria-labelledby='svgTitle svgDesc'><title id='svgTitle'>性能与使用模式改善（合成数据）</title><desc id='svgDesc'>图表展示四个关键指标变化：启动时间-18%，使用频率+22%，激活率+7%（42%至49%），次周留存+4%（31%至35%）。</desc><rect x='80' y='140' width='720' height='400' fill='#f8f8f8' rx='8'/><text x='440' y='180' font-size='28' text-anchor='middle' fill='#333'>性能与使用模式改善（合成数据）</text><g transform='translate(120,220)'><rect x='0' y='0' width='120' height='40' fill='#4a90d9'/><text x='60' y='26' font-size='18' text-anchor='middle' fill='white'>启动时间</text><rect x='140' y='120' width='120' height='40' fill='#5cad5c'/><text x='200' y='146' font-size='18' text-anchor='middle' fill='white'>使用频率</text><rect x='280' y='40' width='120' height='40' fill='#e88b3a'/><text x='340' y='66' font-size='18' text-anchor='middle' fill='white'>激活率</text><rect x='420' y='160' width='120' height='40' fill='#9b59b6'/><text x='480' y='186' font-size='18' text-anchor='middle' fill='white'>次周留存</text></g><g transform='translate(120,300)'><rect x='0' y='0' width='120' height='80' fill='#4a90d9' fill-opacity='0.3'/><text x='60' y='45' font-size='18' text-anchor='middle'>-18%</text><text x='60' y='70' font-size='14' text-anchor='middle'>启动时间</text><rect x='140' y='0' width='120' height='80' fill='#5cad5c' fill-opacity='0.3'/><text x='200' y='45' font-size='18' text-anchor='middle'>+22%</text><text x='200' y='70' font-size='14' text-anchor='middle'>使用频率</text><rect x='280' y='0' width='120' height='80' fill='#e88b3a' fill-opacity='0.3'/><text x='340' y='45' font-size='18' text-anchor='middle'>+7%</text><text x='340' y='70' font-size='14' text-anchor='middle'>激活率</text><rect x='420' y='0' width='120' height='80' fill='#9b59b6' fill-opacity='0.3'/><text x='480' y='45' font-size='18' text-anchor='middle'>+4%</text><text x='480' y='70' font-size='14' text-anchor='middle'>次周留存</text></g></svg>",
+      "anchors": [
+        {
+          "id": "main",
+          "x": 80,
+          "y": 140,
+          "width": 720,
+          "height": 400
+        }
+      ],
+      "steps": [
+        {
+          "id": "step-perf-overview",
+          "title": "性能指标总览",
+          "explanation": "图表展示了本季度四个关键性能与使用指标的变化比率，全部为合成数据。启动时间缩短 18% 是基础设施优化的直接成果；使用频率提升 22% 表明性能提升带来了更高的用户粘性；激活率与次周留存的增长进一步验证了体验改善的良性循环。",
+          "anchorIds": [
+            "main"
+          ],
+          "claimIds": [
+            "claim-perf-overview"
+          ]
+        },
+        {
+          "id": "step-perf-detail",
+          "title": "指标拆解",
+          "explanation": "启动时间缩短至 1.2 秒（目标 1.5 秒），主要得益于代码拆分与缓存策略。使用频率提升 22% 是因为性能提升减少了用户等待时间，从而提高使用意愿。激活率与次周留存的变化与引导步骤减少相关，但性能改善也提供了支撑。",
+          "anchorIds": [
+            "main"
+          ],
+          "claimIds": [
+            "claim-perf-detail"
+          ]
+        }
+      ],
+      "bindings": [
+        {
+          "claimId": "claim-perf-overview",
+          "snapshotId": "a43c2c67-3362-4995-99cc-7a4cb9708c99:course",
+          "evidenceMarkers": [
+            "S5",
+            "S6",
+            "S7"
+          ],
+          "kind": "derived",
+          "statement": "性能与使用模式改善的四个核心指标变化均为合成数据，源于产品优化措施。"
+        },
+        {
+          "claimId": "claim-perf-detail",
+          "snapshotId": "a43c2c67-3362-4995-99cc-7a4cb9708c99:course",
+          "evidenceMarkers": [
+            "S5",
+            "S6",
+            "S7"
+          ],
+          "kind": "derived",
+          "statement": "具体指标数值：激活率从 42% 提升至 49%，引导步骤从 7 步减至 4 步，周活跃用户从 8.2 万增至 9.6 万，次周留存从 31% 提升至 35%。"
+        }
+      ]
+    },
+    {
+      "id": "pg_risk",
+      "order": 4,
+      "chapterId": "ch4",
+      "role": "content",
+      "purpose": "review",
+      "title": "主要风险与应对方案",
+      "conclusion": "本季度核心改进已见效，但跨端同步一致性与历史数据迁移构成下一季度主要风险，需通过灰度发布与迁移前校验进行缓解。",
+      "visualKind": "diagram",
+      "bodyHtml": "<svg viewBox=\"0 0 720 400\" xmlns=\"http://www.w3.org/2000/svg\" role=\"img\" aria-label=\"风险与应对关系图\" data-anchor-id=\"main\">\n  <rect x=\"40\" y=\"30\" width=\"280\" height=\"80\" rx=\"10\" fill=\"#E8F0FE\" stroke=\"#1A73E8\" stroke-width=\"2\"/>\n  <text x=\"180\" y=\"65\" text-anchor=\"middle\" font-size=\"18\" fill=\"#1A73E8\" font-weight=\"bold\">跨端状态同步延迟</text>\n  <text x=\"180\" y=\"95\" text-anchor=\"middle\" font-size=\"14\" fill=\"#333\">数据一致性受损</text>\n  <rect x=\"400\" y=\"30\" width=\"280\" height=\"80\" rx=\"10\" fill=\"#E8F0FE\" stroke=\"#1A73E8\" stroke-width=\"2\"/>\n  <text x=\"540\" y=\"65\" text-anchor=\"middle\" font-size=\"18\" fill=\"#1A73E8\" font-weight=\"bold\">历史数据迁移复杂度</text>\n  <text x=\"540\" y=\"95\" text-anchor=\"middle\" font-size=\"14\" fill=\"#333\">迁移中断与丢失风险</text>\n  <line x1=\"320\" y1=\"70\" x2=\"400\" y2=\"70\" stroke=\"#B0BEC5\" stroke-width=\"2\" stroke-dasharray=\"6,4\"/>\n  <text x=\"360\" y=\"60\" text-anchor=\"middle\" font-size=\"12\" fill=\"#666\">相互影响</text>\n  <rect x=\"40\" y=\"180\" width=\"580\" height=\"100\" rx=\"10\" fill=\"#FFF9C4\" stroke=\"#F9A825\" stroke-width=\"2\"/>\n  <text x=\"80\" y=\"215\" font-size=\"16\" fill=\"#F57F17\" font-weight=\"bold\">应对方案</text>\n  <text x=\"80\" y=\"245\" font-size=\"14\" fill=\"#333\">1. 灰度发布，逐步放量，实时监控同步队列</text>\n  <text x=\"80\" y=\"270\" font-size=\"14\" fill=\"#333\">2. 迁移前校验，备份回滚，双写验证</text>\n  <line x1=\"180\" y1=\"110\" x2=\"180\" y2=\"180\" stroke=\"#B0BEC5\" stroke-width=\"2\" stroke-dasharray=\"4,4\"/>\n  <line x1=\"540\" y1=\"110\" x2=\"540\" y2=\"180\" stroke=\"#B0BEC5\" stroke-width=\"2\" stroke-dasharray=\"4,4\"/>\n</svg>",
+      "anchors": [
+        {
+          "id": "main",
+          "x": 80,
+          "y": 140,
+          "width": 720,
+          "height": 400
+        }
+      ],
+      "steps": [
+        {
+          "id": "step-risks",
+          "title": "识别主要风险",
+          "explanation": "本季度改进带来积极效果，但跨端状态同步仍存在可见延迟，同时历史数据迁移复杂度高，两者为下一季度主要风险。",
+          "anchorIds": [
+            "main"
+          ],
+          "claimIds": [
+            "claim-1"
+          ]
+        },
+        {
+          "id": "step-mitigation",
+          "title": "提出应对方案",
+          "explanation": "针对同步一致性与迁移风险，采用灰度发布与迁移前校验的方式，降低发布影响并保障数据安全。",
+          "anchorIds": [
+            "main"
+          ],
+          "claimIds": [
+            "claim-2",
+            "claim-3"
+          ]
+        }
+      ],
+      "bindings": [
+        {
+          "claimId": "claim-1",
+          "snapshotId": "a43c2c67-3362-4995-99cc-7a4cb9708c99:ch4",
+          "evidenceMarkers": [
+            "S12"
+          ],
+          "kind": "source",
+          "statement": "跨端状态同步仍存在可见延迟；同步一致性和历史数据迁移是下一季度主要风险。"
+        },
+        {
+          "claimId": "claim-2",
+          "snapshotId": "a43c2c67-3362-4995-99cc-7a4cb9708c99:ch4",
+          "evidenceMarkers": [
+            "S12"
+          ],
+          "kind": "derived",
+          "statement": "同步一致性与历史数据迁移风险相互关联，共同影响系统稳定性。"
+        },
+        {
+          "claimId": "claim-3",
+          "snapshotId": "a43c2c67-3362-4995-99cc-7a4cb9708c99:ch4",
+          "evidenceMarkers": [
+            "S14"
+          ],
+          "kind": "source",
+          "statement": "风险缓解方案包括灰度发布和迁移前校验。"
+        }
+      ]
+    },
+    {
+      "id": "pg_next",
+      "order": 5,
+      "chapterId": "ch4",
+      "role": "content",
+      "purpose": "review",
+      "title": "下一步计划",
+      "conclusion": "下一季度优先修复同步一致性，并扩大批量处理覆盖，以降低风险并持续增长。",
+      "visualKind": "diagram",
+      "bodyHtml": "<div data-anchor-id='main'>\n  <svg viewBox='0 0 720 400' xmlns='http://www.w3.org/2000/svg' role='img' aria-label='下一步计划优先级图'>\n    <rect x='40' y='30' width='300' height='150' rx='10' fill='#E8F0FE' stroke='#1A73E8' stroke-width='2'/>\n    <text x='190' y='70' text-anchor='middle' font-size='16' fill='#1A73E8' font-weight='bold'>P0 同步一致性</text>\n    <text x='190' y='100' text-anchor='middle' font-size='13' fill='#333'>修复跨端同步延迟</text>\n    <text x='190' y='125' text-anchor='middle' font-size='13' fill='#333'>灰度发布 + 迁移前校验</text>\n    <rect x='380' y='30' width='300' height='150' rx='10' fill='#FFF7E6' stroke='#F9AB00' stroke-width='2'/>\n    <text x='530' y='70' text-anchor='middle' font-size='16' fill='#E37400' font-weight='bold'>P1 批量处理覆盖</text>\n    <text x='530' y='100' text-anchor='middle' font-size='13' fill='#333'>扩大桌面端批量功能</text>\n    <text x='530' y='125' text-anchor='middle' font-size='13' fill='#333'>逐步覆盖到移动端</text>\n    <rect x='40' y='220' width='300' height='150' rx='10' fill='#FCE8E6' stroke='#D93025' stroke-width='2'/>\n    <text x='190' y='260' text-anchor='middle' font-size='16' fill='#D93025' font-weight='bold'>P2 权限提示优化</text>\n    <text x='190' y='290' text-anchor='middle' font-size='13' fill='#333'>改进权限说明的清晰度</text>\n    <text x='190' y='315' text-anchor='middle' font-size='13' fill='#333'>减少客服反馈</text>\n    <rect x='380' y='220' width='300' height='150' rx='10' fill='#E6F4EA' stroke='#188038' stroke-width='2'/>\n    <text x='530' y='260' text-anchor='middle' font-size='16' fill='#188038' font-weight='bold'>P3 历史数据迁移</text>\n    <text x='530' y='290' text-anchor='middle' font-size='13' fill='#333'>确保迁移完整性验证</text>\n    <text x='530' y='315' text-anchor='middle' font-size='13' fill='#333'>保障数据安全</text>\n  </svg>\n</div>",
+      "anchors": [
+        {
+          "id": "main",
+          "x": 80,
+          "y": 140,
+          "width": 720,
+          "height": 400
+        }
+      ],
+      "steps": [
+        {
+          "id": "step-priority",
+          "title": "优先级划分",
+          "explanation": "根据风险与收益，将行动划分为P0-P3四级优先级。",
+          "anchorIds": [
+            "main"
+          ],
+          "claimIds": [
+            "claim-p0",
+            "claim-p1"
+          ]
+        },
+        {
+          "id": "step-details",
+          "title": "行动细节",
+          "explanation": "P0修复同步一致性，P1扩大批量处理，P2优化权限提示，P3保障历史数据迁移。",
+          "anchorIds": [
+            "main"
+          ],
+          "claimIds": [
+            "claim-p0",
+            "claim-p1",
+            "claim-p2",
+            "claim-p3"
+          ]
+        }
+      ],
+      "bindings": [
+        {
+          "claimId": "claim-p0",
+          "snapshotId": "a43c2c67-3362-4995-99cc-7a4cb9708c99:ch4",
+          "evidenceMarkers": [
+            "S12",
+            "S13"
+          ],
+          "kind": "source",
+          "statement": "下一季度优先修复同步一致性，并采用灰度发布和迁移前校验以降低风险。"
+        },
+        {
+          "claimId": "claim-p1",
+          "snapshotId": "a43c2c67-3362-4995-99cc-7a4cb9708c99:ch4",
+          "evidenceMarkers": [
+            "S13"
+          ],
+          "kind": "source",
+          "statement": "在修复同步一致性后，扩大批量处理的覆盖范围。"
+        },
+        {
+          "claimId": "claim-p2",
+          "snapshotId": "a43c2c67-3362-4995-99cc-7a4cb9708c99:ch4",
+          "evidenceMarkers": [
+            "S10"
+          ],
+          "kind": "source",
+          "statement": "客服反馈表明权限提示不够清楚，需要优化。"
+        },
+        {
+          "claimId": "claim-p3",
+          "snapshotId": "a43c2c67-3362-4995-99cc-7a4cb9708c99:ch4",
+          "evidenceMarkers": [
+            "S12"
+          ],
+          "kind": "source",
+          "statement": "历史数据迁移是下一季度的主要风险之一，需要完整验证。"
+        }
+      ]
+    }
+  ],
+  "evidence": [
+    {
+      "version": 1,
+      "id": "a43c2c67-3362-4995-99cc-7a4cb9708c99:course",
+      "items": [
+        {
+          "marker": "S1",
+          "sourceId": "synthetic-q3",
+          "sourceVersion": "1",
+          "chunkId": "chunk-1",
+          "title": "Q3 产品复盘合成资料",
+          "excerpt": "本评测使用合成资料，不代表真实公司经营数据。"
+        },
+        {
+          "marker": "S2",
+          "sourceId": "synthetic-q3",
+          "sourceVersion": "1",
+          "chunkId": "chunk-2",
+          "title": "Q3 产品复盘合成资料",
+          "excerpt": "季度目标是验证关键工作流并降低用户完成任务的步骤数。"
+        },
+        {
+          "marker": "S3",
+          "sourceId": "synthetic-q3",
+          "sourceVersion": "1",
+          "chunkId": "chunk-3",
+          "title": "Q3 产品复盘合成资料",
+          "excerpt": "研究样本显示首次设置流程是主要流失点。"
+        },
+        {
+          "marker": "S4",
+          "sourceId": "synthetic-q3",
+          "sourceVersion": "1",
+          "chunkId": "chunk-4",
+          "title": "Q3 产品复盘合成资料",
+          "excerpt": "团队将激活定义为用户完成首次有效任务。"
+        },
+        {
+          "marker": "S5",
+          "sourceId": "synthetic-q3",
+          "sourceVersion": "1",
+          "chunkId": "chunk-5",
+          "title": "Q3 产品复盘合成资料",
+          "excerpt": "合成基线中的激活率为 42%，实验组为 49%。"
+        },
+        {
+          "marker": "S6",
+          "sourceId": "synthetic-q3",
+          "sourceVersion": "1",
+          "chunkId": "chunk-6",
+          "title": "Q3 产品复盘合成资料",
+          "excerpt": "引导步骤从 7 步减少到 4 步。"
+        },
+        {
+          "marker": "S7",
+          "sourceId": "synthetic-q3",
+          "sourceVersion": "1",
+          "chunkId": "chunk-7",
+          "title": "Q3 产品复盘合成资料",
+          "excerpt": "合成周活跃用户从 8.2 万增至 9.6 万，次周留存从 31% 提升至 35%。"
+        },
+        {
+          "marker": "S8",
+          "sourceId": "synthetic-q3",
+          "sourceVersion": "1",
+          "chunkId": "chunk-8",
+          "title": "Q3 产品复盘合成资料",
+          "excerpt": "移动端贡献合成活跃用户的 58%，桌面端用户更常使用批量处理。"
+        },
+        {
+          "marker": "S9",
+          "sourceId": "synthetic-q3",
+          "sourceVersion": "1",
+          "chunkId": "chunk-9",
+          "title": "Q3 产品复盘合成资料",
+          "excerpt": "搜索延迟合成中位数从 820ms 降至 510ms，关键流程成功率从 96.8% 升至 98.1%。"
+        },
+        {
+          "marker": "S10",
+          "sourceId": "synthetic-q3",
+          "sourceVersion": "1",
+          "chunkId": "chunk-10",
+          "title": "Q3 产品复盘合成资料",
+          "excerpt": "客服反馈中最常见的问题是权限提示不够清楚。"
+        },
+        {
+          "marker": "S11",
+          "sourceId": "synthetic-q3",
+          "sourceVersion": "1",
+          "chunkId": "chunk-11",
+          "title": "Q3 产品复盘合成资料",
+          "excerpt": "本季度发布简化设置、批量处理和权限说明三项改进。"
+        },
+        {
+          "marker": "S12",
+          "sourceId": "synthetic-q3",
+          "sourceVersion": "1",
+          "chunkId": "chunk-12",
+          "title": "Q3 产品复盘合成资料",
+          "excerpt": "跨端状态同步仍存在可见延迟；同步一致性和历史数据迁移是下一季度主要风险。"
+        },
+        {
+          "marker": "S13",
+          "sourceId": "synthetic-q3",
+          "sourceVersion": "1",
+          "chunkId": "chunk-13",
+          "title": "Q3 产品复盘合成资料",
+          "excerpt": "下一季度优先修复同步一致性，再扩大批量处理覆盖。"
+        },
+        {
+          "marker": "S14",
+          "sourceId": "synthetic-q3",
+          "sourceVersion": "1",
+          "chunkId": "chunk-14",
+          "title": "Q3 产品复盘合成资料",
+          "excerpt": "风险缓解方案包括灰度发布和迁移前校验。"
+        }
+      ]
+    },
+    {
+      "version": 1,
+      "id": "a43c2c67-3362-4995-99cc-7a4cb9708c99:ch1",
+      "items": [
+        {
+          "marker": "S1",
+          "sourceId": "synthetic-q3",
+          "sourceVersion": "1",
+          "chunkId": "chunk-1",
+          "title": "Q3 产品复盘合成资料",
+          "excerpt": "本评测使用合成资料，不代表真实公司经营数据。"
+        },
+        {
+          "marker": "S2",
+          "sourceId": "synthetic-q3",
+          "sourceVersion": "1",
+          "chunkId": "chunk-2",
+          "title": "Q3 产品复盘合成资料",
+          "excerpt": "季度目标是验证关键工作流并降低用户完成任务的步骤数。"
+        },
+        {
+          "marker": "S3",
+          "sourceId": "synthetic-q3",
+          "sourceVersion": "1",
+          "chunkId": "chunk-3",
+          "title": "Q3 产品复盘合成资料",
+          "excerpt": "研究样本显示首次设置流程是主要流失点。"
+        },
+        {
+          "marker": "S4",
+          "sourceId": "synthetic-q3",
+          "sourceVersion": "1",
+          "chunkId": "chunk-4",
+          "title": "Q3 产品复盘合成资料",
+          "excerpt": "团队将激活定义为用户完成首次有效任务。"
+        },
+        {
+          "marker": "S5",
+          "sourceId": "synthetic-q3",
+          "sourceVersion": "1",
+          "chunkId": "chunk-5",
+          "title": "Q3 产品复盘合成资料",
+          "excerpt": "合成基线中的激活率为 42%，实验组为 49%。"
+        },
+        {
+          "marker": "S6",
+          "sourceId": "synthetic-q3",
+          "sourceVersion": "1",
+          "chunkId": "chunk-6",
+          "title": "Q3 产品复盘合成资料",
+          "excerpt": "引导步骤从 7 步减少到 4 步。"
+        },
+        {
+          "marker": "S7",
+          "sourceId": "synthetic-q3",
+          "sourceVersion": "1",
+          "chunkId": "chunk-7",
+          "title": "Q3 产品复盘合成资料",
+          "excerpt": "合成周活跃用户从 8.2 万增至 9.6 万，次周留存从 31% 提升至 35%。"
+        },
+        {
+          "marker": "S8",
+          "sourceId": "synthetic-q3",
+          "sourceVersion": "1",
+          "chunkId": "chunk-8",
+          "title": "Q3 产品复盘合成资料",
+          "excerpt": "移动端贡献合成活跃用户的 58%，桌面端用户更常使用批量处理。"
+        },
+        {
+          "marker": "S9",
+          "sourceId": "synthetic-q3",
+          "sourceVersion": "1",
+          "chunkId": "chunk-9",
+          "title": "Q3 产品复盘合成资料",
+          "excerpt": "搜索延迟合成中位数从 820ms 降至 510ms，关键流程成功率从 96.8% 升至 98.1%。"
+        },
+        {
+          "marker": "S10",
+          "sourceId": "synthetic-q3",
+          "sourceVersion": "1",
+          "chunkId": "chunk-10",
+          "title": "Q3 产品复盘合成资料",
+          "excerpt": "客服反馈中最常见的问题是权限提示不够清楚。"
+        },
+        {
+          "marker": "S11",
+          "sourceId": "synthetic-q3",
+          "sourceVersion": "1",
+          "chunkId": "chunk-11",
+          "title": "Q3 产品复盘合成资料",
+          "excerpt": "本季度发布简化设置、批量处理和权限说明三项改进。"
+        },
+        {
+          "marker": "S12",
+          "sourceId": "synthetic-q3",
+          "sourceVersion": "1",
+          "chunkId": "chunk-12",
+          "title": "Q3 产品复盘合成资料",
+          "excerpt": "跨端状态同步仍存在可见延迟；同步一致性和历史数据迁移是下一季度主要风险。"
+        },
+        {
+          "marker": "S13",
+          "sourceId": "synthetic-q3",
+          "sourceVersion": "1",
+          "chunkId": "chunk-13",
+          "title": "Q3 产品复盘合成资料",
+          "excerpt": "下一季度优先修复同步一致性，再扩大批量处理覆盖。"
+        },
+        {
+          "marker": "S14",
+          "sourceId": "synthetic-q3",
+          "sourceVersion": "1",
+          "chunkId": "chunk-14",
+          "title": "Q3 产品复盘合成资料",
+          "excerpt": "风险缓解方案包括灰度发布和迁移前校验。"
+        }
+      ]
+    },
+    {
+      "version": 1,
+      "id": "a43c2c67-3362-4995-99cc-7a4cb9708c99:ch2",
+      "items": [
+        {
+          "marker": "S1",
+          "sourceId": "synthetic-q3",
+          "sourceVersion": "1",
+          "chunkId": "chunk-1",
+          "title": "Q3 产品复盘合成资料",
+          "excerpt": "本评测使用合成资料，不代表真实公司经营数据。"
+        },
+        {
+          "marker": "S2",
+          "sourceId": "synthetic-q3",
+          "sourceVersion": "1",
+          "chunkId": "chunk-2",
+          "title": "Q3 产品复盘合成资料",
+          "excerpt": "季度目标是验证关键工作流并降低用户完成任务的步骤数。"
+        },
+        {
+          "marker": "S3",
+          "sourceId": "synthetic-q3",
+          "sourceVersion": "1",
+          "chunkId": "chunk-3",
+          "title": "Q3 产品复盘合成资料",
+          "excerpt": "研究样本显示首次设置流程是主要流失点。"
+        },
+        {
+          "marker": "S4",
+          "sourceId": "synthetic-q3",
+          "sourceVersion": "1",
+          "chunkId": "chunk-4",
+          "title": "Q3 产品复盘合成资料",
+          "excerpt": "团队将激活定义为用户完成首次有效任务。"
+        },
+        {
+          "marker": "S5",
+          "sourceId": "synthetic-q3",
+          "sourceVersion": "1",
+          "chunkId": "chunk-5",
+          "title": "Q3 产品复盘合成资料",
+          "excerpt": "合成基线中的激活率为 42%，实验组为 49%。"
+        },
+        {
+          "marker": "S6",
+          "sourceId": "synthetic-q3",
+          "sourceVersion": "1",
+          "chunkId": "chunk-6",
+          "title": "Q3 产品复盘合成资料",
+          "excerpt": "引导步骤从 7 步减少到 4 步。"
+        },
+        {
+          "marker": "S7",
+          "sourceId": "synthetic-q3",
+          "sourceVersion": "1",
+          "chunkId": "chunk-7",
+          "title": "Q3 产品复盘合成资料",
+          "excerpt": "合成周活跃用户从 8.2 万增至 9.6 万，次周留存从 31% 提升至 35%。"
+        },
+        {
+          "marker": "S8",
+          "sourceId": "synthetic-q3",
+          "sourceVersion": "1",
+          "chunkId": "chunk-8",
+          "title": "Q3 产品复盘合成资料",
+          "excerpt": "移动端贡献合成活跃用户的 58%，桌面端用户更常使用批量处理。"
+        },
+        {
+          "marker": "S9",
+          "sourceId": "synthetic-q3",
+          "sourceVersion": "1",
+          "chunkId": "chunk-9",
+          "title": "Q3 产品复盘合成资料",
+          "excerpt": "搜索延迟合成中位数从 820ms 降至 510ms，关键流程成功率从 96.8% 升至 98.1%。"
+        },
+        {
+          "marker": "S10",
+          "sourceId": "synthetic-q3",
+          "sourceVersion": "1",
+          "chunkId": "chunk-10",
+          "title": "Q3 产品复盘合成资料",
+          "excerpt": "客服反馈中最常见的问题是权限提示不够清楚。"
+        },
+        {
+          "marker": "S11",
+          "sourceId": "synthetic-q3",
+          "sourceVersion": "1",
+          "chunkId": "chunk-11",
+          "title": "Q3 产品复盘合成资料",
+          "excerpt": "本季度发布简化设置、批量处理和权限说明三项改进。"
+        },
+        {
+          "marker": "S12",
+          "sourceId": "synthetic-q3",
+          "sourceVersion": "1",
+          "chunkId": "chunk-12",
+          "title": "Q3 产品复盘合成资料",
+          "excerpt": "跨端状态同步仍存在可见延迟；同步一致性和历史数据迁移是下一季度主要风险。"
+        },
+        {
+          "marker": "S13",
+          "sourceId": "synthetic-q3",
+          "sourceVersion": "1",
+          "chunkId": "chunk-13",
+          "title": "Q3 产品复盘合成资料",
+          "excerpt": "下一季度优先修复同步一致性，再扩大批量处理覆盖。"
+        },
+        {
+          "marker": "S14",
+          "sourceId": "synthetic-q3",
+          "sourceVersion": "1",
+          "chunkId": "chunk-14",
+          "title": "Q3 产品复盘合成资料",
+          "excerpt": "风险缓解方案包括灰度发布和迁移前校验。"
+        }
+      ]
+    },
+    {
+      "version": 1,
+      "id": "a43c2c67-3362-4995-99cc-7a4cb9708c99:ch3",
+      "items": [
+        {
+          "marker": "S1",
+          "sourceId": "synthetic-q3",
+          "sourceVersion": "1",
+          "chunkId": "chunk-1",
+          "title": "Q3 产品复盘合成资料",
+          "excerpt": "本评测使用合成资料，不代表真实公司经营数据。"
+        },
+        {
+          "marker": "S2",
+          "sourceId": "synthetic-q3",
+          "sourceVersion": "1",
+          "chunkId": "chunk-2",
+          "title": "Q3 产品复盘合成资料",
+          "excerpt": "季度目标是验证关键工作流并降低用户完成任务的步骤数。"
+        },
+        {
+          "marker": "S3",
+          "sourceId": "synthetic-q3",
+          "sourceVersion": "1",
+          "chunkId": "chunk-3",
+          "title": "Q3 产品复盘合成资料",
+          "excerpt": "研究样本显示首次设置流程是主要流失点。"
+        },
+        {
+          "marker": "S4",
+          "sourceId": "synthetic-q3",
+          "sourceVersion": "1",
+          "chunkId": "chunk-4",
+          "title": "Q3 产品复盘合成资料",
+          "excerpt": "团队将激活定义为用户完成首次有效任务。"
+        },
+        {
+          "marker": "S5",
+          "sourceId": "synthetic-q3",
+          "sourceVersion": "1",
+          "chunkId": "chunk-5",
+          "title": "Q3 产品复盘合成资料",
+          "excerpt": "合成基线中的激活率为 42%，实验组为 49%。"
+        },
+        {
+          "marker": "S6",
+          "sourceId": "synthetic-q3",
+          "sourceVersion": "1",
+          "chunkId": "chunk-6",
+          "title": "Q3 产品复盘合成资料",
+          "excerpt": "引导步骤从 7 步减少到 4 步。"
+        },
+        {
+          "marker": "S7",
+          "sourceId": "synthetic-q3",
+          "sourceVersion": "1",
+          "chunkId": "chunk-7",
+          "title": "Q3 产品复盘合成资料",
+          "excerpt": "合成周活跃用户从 8.2 万增至 9.6 万，次周留存从 31% 提升至 35%。"
+        },
+        {
+          "marker": "S8",
+          "sourceId": "synthetic-q3",
+          "sourceVersion": "1",
+          "chunkId": "chunk-8",
+          "title": "Q3 产品复盘合成资料",
+          "excerpt": "移动端贡献合成活跃用户的 58%，桌面端用户更常使用批量处理。"
+        },
+        {
+          "marker": "S9",
+          "sourceId": "synthetic-q3",
+          "sourceVersion": "1",
+          "chunkId": "chunk-9",
+          "title": "Q3 产品复盘合成资料",
+          "excerpt": "搜索延迟合成中位数从 820ms 降至 510ms，关键流程成功率从 96.8% 升至 98.1%。"
+        },
+        {
+          "marker": "S10",
+          "sourceId": "synthetic-q3",
+          "sourceVersion": "1",
+          "chunkId": "chunk-10",
+          "title": "Q3 产品复盘合成资料",
+          "excerpt": "客服反馈中最常见的问题是权限提示不够清楚。"
+        },
+        {
+          "marker": "S11",
+          "sourceId": "synthetic-q3",
+          "sourceVersion": "1",
+          "chunkId": "chunk-11",
+          "title": "Q3 产品复盘合成资料",
+          "excerpt": "本季度发布简化设置、批量处理和权限说明三项改进。"
+        },
+        {
+          "marker": "S12",
+          "sourceId": "synthetic-q3",
+          "sourceVersion": "1",
+          "chunkId": "chunk-12",
+          "title": "Q3 产品复盘合成资料",
+          "excerpt": "跨端状态同步仍存在可见延迟；同步一致性和历史数据迁移是下一季度主要风险。"
+        },
+        {
+          "marker": "S13",
+          "sourceId": "synthetic-q3",
+          "sourceVersion": "1",
+          "chunkId": "chunk-13",
+          "title": "Q3 产品复盘合成资料",
+          "excerpt": "下一季度优先修复同步一致性，再扩大批量处理覆盖。"
+        },
+        {
+          "marker": "S14",
+          "sourceId": "synthetic-q3",
+          "sourceVersion": "1",
+          "chunkId": "chunk-14",
+          "title": "Q3 产品复盘合成资料",
+          "excerpt": "风险缓解方案包括灰度发布和迁移前校验。"
+        }
+      ]
+    },
+    {
+      "version": 1,
+      "id": "a43c2c67-3362-4995-99cc-7a4cb9708c99:ch4",
+      "items": [
+        {
+          "marker": "S1",
+          "sourceId": "synthetic-q3",
+          "sourceVersion": "1",
+          "chunkId": "chunk-1",
+          "title": "Q3 产品复盘合成资料",
+          "excerpt": "本评测使用合成资料，不代表真实公司经营数据。"
+        },
+        {
+          "marker": "S2",
+          "sourceId": "synthetic-q3",
+          "sourceVersion": "1",
+          "chunkId": "chunk-2",
+          "title": "Q3 产品复盘合成资料",
+          "excerpt": "季度目标是验证关键工作流并降低用户完成任务的步骤数。"
+        },
+        {
+          "marker": "S3",
+          "sourceId": "synthetic-q3",
+          "sourceVersion": "1",
+          "chunkId": "chunk-3",
+          "title": "Q3 产品复盘合成资料",
+          "excerpt": "研究样本显示首次设置流程是主要流失点。"
+        },
+        {
+          "marker": "S4",
+          "sourceId": "synthetic-q3",
+          "sourceVersion": "1",
+          "chunkId": "chunk-4",
+          "title": "Q3 产品复盘合成资料",
+          "excerpt": "团队将激活定义为用户完成首次有效任务。"
+        },
+        {
+          "marker": "S5",
+          "sourceId": "synthetic-q3",
+          "sourceVersion": "1",
+          "chunkId": "chunk-5",
+          "title": "Q3 产品复盘合成资料",
+          "excerpt": "合成基线中的激活率为 42%，实验组为 49%。"
+        },
+        {
+          "marker": "S6",
+          "sourceId": "synthetic-q3",
+          "sourceVersion": "1",
+          "chunkId": "chunk-6",
+          "title": "Q3 产品复盘合成资料",
+          "excerpt": "引导步骤从 7 步减少到 4 步。"
+        },
+        {
+          "marker": "S7",
+          "sourceId": "synthetic-q3",
+          "sourceVersion": "1",
+          "chunkId": "chunk-7",
+          "title": "Q3 产品复盘合成资料",
+          "excerpt": "合成周活跃用户从 8.2 万增至 9.6 万，次周留存从 31% 提升至 35%。"
+        },
+        {
+          "marker": "S8",
+          "sourceId": "synthetic-q3",
+          "sourceVersion": "1",
+          "chunkId": "chunk-8",
+          "title": "Q3 产品复盘合成资料",
+          "excerpt": "移动端贡献合成活跃用户的 58%，桌面端用户更常使用批量处理。"
+        },
+        {
+          "marker": "S9",
+          "sourceId": "synthetic-q3",
+          "sourceVersion": "1",
+          "chunkId": "chunk-9",
+          "title": "Q3 产品复盘合成资料",
+          "excerpt": "搜索延迟合成中位数从 820ms 降至 510ms，关键流程成功率从 96.8% 升至 98.1%。"
+        },
+        {
+          "marker": "S10",
+          "sourceId": "synthetic-q3",
+          "sourceVersion": "1",
+          "chunkId": "chunk-10",
+          "title": "Q3 产品复盘合成资料",
+          "excerpt": "客服反馈中最常见的问题是权限提示不够清楚。"
+        },
+        {
+          "marker": "S11",
+          "sourceId": "synthetic-q3",
+          "sourceVersion": "1",
+          "chunkId": "chunk-11",
+          "title": "Q3 产品复盘合成资料",
+          "excerpt": "本季度发布简化设置、批量处理和权限说明三项改进。"
+        },
+        {
+          "marker": "S12",
+          "sourceId": "synthetic-q3",
+          "sourceVersion": "1",
+          "chunkId": "chunk-12",
+          "title": "Q3 产品复盘合成资料",
+          "excerpt": "跨端状态同步仍存在可见延迟；同步一致性和历史数据迁移是下一季度主要风险。"
+        },
+        {
+          "marker": "S13",
+          "sourceId": "synthetic-q3",
+          "sourceVersion": "1",
+          "chunkId": "chunk-13",
+          "title": "Q3 产品复盘合成资料",
+          "excerpt": "下一季度优先修复同步一致性，再扩大批量处理覆盖。"
+        },
+        {
+          "marker": "S14",
+          "sourceId": "synthetic-q3",
+          "sourceVersion": "1",
+          "chunkId": "chunk-14",
+          "title": "Q3 产品复盘合成资料",
+          "excerpt": "风险缓解方案包括灰度发布和迁移前校验。"
+        }
+      ]
+    }
+  ],
+  "createdAt": "2026-09-06T12:25:34.842Z",
+  "contentHash": "a54d4629f4c37037424417dba816306046a799d6956b2bc82738819ba99e66bf"
+}

@@ -8,6 +8,26 @@ import { MemoryActionLedger, MemoryEventStore, MemorySessionStore, MemoryWorkSto
 import { HostRequestError, HttpHostClient } from '../src/host/http-client.js'
 import { createHash } from 'node:crypto'
 
+it('retries truncated, failed, and oversized successful response bodies', async () => {
+  for (const broken of [
+    () => new Response('{"revision":', { status: 200 }),
+    () => new Response(new ReadableStream({ pull(controller) { controller.error(new Error('stream failed')) } }), { status: 200 }),
+  ]) {
+    let attempts = 0
+    const client = new HttpHostClient({ baseUrl: 'http://control', serviceToken: 'token', workerId: 'worker', retryBaseMs: 0,
+      fetchImpl: async () => ++attempts === 1 ? broken() : Response.json({ revision: 2 }) })
+    const session = { key: 'key', tenantId: 't', agentId: 'a', sessionId: 's', revision: 1, compactionEpoch: 0, history: [], appliedWorkIds: [] }
+    await client.saveSession({ id: 'w', tenantId: 't', agentId: 'a', sessionId: 's', kind: 'turn', lane: 'interactive', triggerRef: 'm', fence: 1, homeEpoch: 1, leaseToken: 'lease' }, session)
+    assert.equal(attempts, 2)
+    assert.equal(session.revision, 2)
+  }
+  let attempts = 0
+  const limited = new HttpHostClient({ baseUrl: 'http://control', serviceToken: 'token', workerId: 'worker', retryBaseMs: 0, maxResponseBytes: 2,
+    fetchImpl: async () => { attempts++; return Response.json({ revision: 2 }) } })
+  await assert.rejects(limited.claimWork(), /exceeds 2 bytes/)
+  assert.equal(attempts, 3)
+})
+
 it('preserves goal outcomes and enforces session leases over real HTTP', async () => {
   const workStore = new MemoryWorkStore()
   let resourceGranted = true

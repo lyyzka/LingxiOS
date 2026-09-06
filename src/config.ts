@@ -41,13 +41,13 @@ export interface WorkerConfig {
     id: string
     apiKey: string
     baseUrl: string
-    reasoningEffort: 'high' | 'max'
+    reasoningEffort?: 'high' | 'max'
   }
 }
 
 export function loadWorkerConfig(env: NodeJS.ProcessEnv = process.env): WorkerConfig {
-  const reasoningEffort = env['AGENT_OS_REASONING_EFFORT']?.trim() || DEFAULT_MODEL.reasoningEffort
-  if (reasoningEffort !== 'high' && reasoningEffort !== 'max') throw new ConfigError('AGENT_OS_REASONING_EFFORT must be high or max')
+  const reasoningEffort = env['AGENT_OS_REASONING_EFFORT']?.trim()
+  if (reasoningEffort !== undefined && reasoningEffort !== 'high' && reasoningEffort !== 'max') throw new ConfigError('AGENT_OS_REASONING_EFFORT must be high or max')
   return {
     controlPlaneUrl: requiredEnv('AGENT_OS_CONTROL_PLANE_URL', env),
     serviceToken: requiredEnv('AGENT_OS_SERVICE_TOKEN', env),
@@ -60,7 +60,7 @@ export function loadWorkerConfig(env: NodeJS.ProcessEnv = process.env): WorkerCo
       id: env['AGENT_OS_MODEL']?.trim() || DEFAULT_MODEL.id,
       apiKey: requiredEnv('AGENT_OS_MODEL_API_KEY', env),
       baseUrl: env['AGENT_OS_MODEL_BASE_URL']?.trim() || DEFAULT_MODEL.baseUrl,
-      reasoningEffort,
+      ...(reasoningEffort ? { reasoningEffort } : {}),
     },
   }
 }

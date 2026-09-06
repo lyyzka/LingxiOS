@@ -33,7 +33,7 @@ import { sessionKeyOf, actionKeyOf } from '../protocol/types.js'
 import { isGoalOutcome, type GoalOutcome } from '../protocol/outcome.js'
 import type {
   ActionExecutor, ActionLedgerStore, ActionResolution, ArtifactStager, CapabilityResolver, ContextProvider,
-  DeliveryPort, EventStore, SessionStore, WorkStore,
+  DeliveryPort, EventStore, ModelBudgetLimits, ModelBudgetStore, SessionStore, WorkStore,
 } from './stores.js'
 import { isModelItem } from './stores.js'
 
@@ -42,6 +42,7 @@ export interface ControlPlaneDeps {
   sessions: SessionStore
   events: EventStore
   actions: ActionLedgerStore
+  modelBudgets?: ModelBudgetStore
   contextProvider: ContextProvider
   actionExecutor: ActionExecutor
   capabilityResolver: CapabilityResolver
@@ -91,6 +92,28 @@ export class ControlPlaneService {
 
   constructor(private readonly deps: ControlPlaneDeps) {
     this.logger = deps.logger ?? nullLogger
+  }
+
+  async reserveModelCall(proof: LeaseProof, callId: string, limits: ModelBudgetLimits) {
+    const work = await this.requireLease(proof, { rejectCancelled: true })
+    if (!this.deps.modelBudgets) throw new ControlPlaneError(501, 'durable model budgets are unavailable')
+    const rootWorkId = typeof work.meta?.['rootWorkId'] === 'string' ? work.meta['rootWorkId'] : work.id
+    if (!await this.deps.work.ownsBudgetRoot(work, rootWorkId)) throw new ControlPlaneError(409, 'model budget root is outside this work lineage')
+    if (!callId || callId.length > 256 || !Number.isSafeInteger(limits?.maxModelCalls) || limits.maxModelCalls < 1
+      || !Number.isSafeInteger(limits.maxTokens) || limits.maxTokens < 1
+      || !Number.isSafeInteger(limits.maxCostMicros) || limits.maxCostMicros < 1
+      || !Number.isFinite(Date.parse(limits.deadlineAt))) throw new ControlPlaneError(400, 'invalid model budget reservation')
+    return this.deps.modelBudgets.reserve(rootWorkId, callId, limits)
+  }
+
+  async recordModelUsage(proof: LeaseProof, callId: string, usage: { inputTokens: number; outputTokens: number; costMicros: number }): Promise<void> {
+    const work = await this.requireLease(proof, { rejectCancelled: true })
+    if (!this.deps.modelBudgets) throw new ControlPlaneError(501, 'durable model budgets are unavailable')
+    const rootWorkId = typeof work.meta?.['rootWorkId'] === 'string' ? work.meta['rootWorkId'] : work.id
+    if (!await this.deps.work.ownsBudgetRoot(work, rootWorkId)) throw new ControlPlaneError(409, 'model budget root is outside this work lineage')
+    if (!callId || callId.length > 256 || [usage?.inputTokens, usage?.outputTokens, usage?.costMicros]
+      .some(value => !Number.isSafeInteger(value) || value < 0)) throw new ControlPlaneError(400, 'invalid model usage')
+    await this.deps.modelBudgets.record(rootWorkId, callId, usage.inputTokens, usage.outputTokens, usage.costMicros)
   }
 
   /** Internal/operator API: append authoritative evidence settling an uncertain action. */
@@ -423,6 +446,20 @@ export class ControlPlaneService {
     })
   }
 
+  async recoverStep(proof: LeaseProof, cellId: string): Promise<{ output: string; artifacts: KernelArtifact[] } | null> {
+    const work = await this.requireLease(proof, { rejectCancelled: true })
+    if (!cellId || cellId.length > 512) throw new ControlPlaneError(400, 'invalid cellId')
+    const request = (await this.getSession(proof, sessionKeyOf(work)))?.request
+    const requestVersion = request?.workId === work.id ? request.revisions.length + 1 : null
+    if (requestVersion === null || work.fence <= 1) return null
+    const events = await this.deps.events.listRange(work.id, 0, (work.fence - 1) * RUN_SEQUENCE_SPAN, ['ipython.completed'])
+    const matches = events.filter(event => event.data['callId'] === cellId && event.data['requestVersion'] === requestVersion)
+    if (matches.length !== 1) return null
+    const output = matches[0]!.data['output'], artifacts = matches[0]!.data['artifacts']
+    if (typeof output !== 'string' || !Array.isArray(artifacts)) return null
+    return { output, artifacts: snapshotArtifacts(artifacts as KernelArtifact[]) }
+  }
+
   async stageArtifact(proof: LeaseProof, artifact: KernelArtifact, contentBase64: string): Promise<void> {
     const work = await this.requireLease(proof, { rejectCancelled: true })
     if (!this.deps.artifactStager) throw new ControlPlaneError(501, 'artifact upload is unavailable')
@@ -590,7 +627,7 @@ export class ControlPlaneService {
   async getSession(proof: LeaseProof, key: string): Promise<SessionRecord | null> {
     const work = await this.requireLease(proof)
     if (key !== sessionKeyOf(work)) throw new ControlPlaneError(403, 'session is outside this work lease')
-    const session = await this.deps.sessions.get(key)
+    const session = await this.deps.sessions.get(key, work.id)
     if (session && (session.tenantId !== work.tenantId || session.agentId !== work.agentId
       || session.sessionId !== work.sessionId || session.threadId !== work.threadId)) {
       throw new ControlPlaneError(409, 'stored session identity mismatch')
@@ -619,7 +656,8 @@ export class ControlPlaneService {
         || typeof session.request.authorId !== 'string' || typeof session.request.sourceRef !== 'string'
         || session.request.sourceRef !== work.triggerRef
         || (work.principalId !== undefined && session.request.authorId !== work.principalId)
-        || (typeof work.meta?.['text'] === 'string' && session.request.originalText !== work.meta['text'])
+        || (typeof work.meta?.['text'] === 'string' && (work.meta?.['delegation']
+          ? session.request.delegatedAssignment !== work.meta['text'] : session.request.originalText !== work.meta['text']))
         || typeof session.request.originalText !== 'string' || !Array.isArray(session.request.revisions)
         || !session.request.revisions.every((item) => item && typeof item.id === 'string'
           && typeof item.text === 'string' && typeof item.createdAt === 'string')
@@ -660,7 +698,7 @@ export class ControlPlaneService {
         throw new ControlPlaneError(400, 'request revisions do not match persisted human steering')
       }
     }
-    const previous = (await this.deps.sessions.get(expectedKey))?.request
+    const previous = (await this.deps.sessions.get(expectedKey, work.id))?.request
     const previousChecks = previous?.workId === work.id ? previous.resourceChecks ?? [] : []
     const nextChecks = session.request?.resourceChecks ?? []
     if (!Array.isArray(nextChecks) || nextChecks.length > 64
@@ -721,7 +759,7 @@ export class ControlPlaneService {
     })
     if (!saved.ok) {
       await this.requireLease(proof)
-      const current = await this.deps.sessions.get(session.key)
+      const current = await this.deps.sessions.get(session.key, work.id)
       if (current && current.revision === session.revision + 1
         && isDeepStrictEqual(current, { ...session, revision: current.revision })) {
         return { revision: current.revision }

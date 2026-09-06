@@ -28,7 +28,8 @@ export async function recallMemoryContext(work: Omit<WorkItem, 'leaseToken'>,
     { tenantId: work.tenantId, scopeType: 'agent_role', scopeId: work.agentId },
   ]
   if (!semantic) return snapshotMemories(await Promise.all(scopes.map(async scope => ({ scope, items: await recallMemories(database, scope, '', 12) }))))
-  const saved = await database.query('SELECT request_snapshot FROM lingxios.agent_os_sessions WHERE session_key=$1', [sessionKeyOf(work)])
+  const saved = await database.query(`SELECT request_snapshot FROM lingxios.agent_request_snapshots
+    WHERE session_key=$1 AND work_id=$2`, [sessionKeyOf(work), work.id])
   const request = saved.rows[0]?.['request_snapshot'] as RequestSnapshot | undefined
   const query = (request?.workId === work.id ? `${request.revisions.at(-1)?.text ?? ''}\n${request.originalText}` : String(work.meta?.['text'] ?? '')).slice(0, 2000).replace(/[\uD800-\uDBFF]$/, '')
   const groups = []
@@ -68,11 +69,12 @@ export async function executeMemory(work: Omit<WorkItem, 'leaseToken'>, action: 
     || !/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d{1,3})?(?:Z|[+-]\d\d:\d\d)$/.test(validUntil)
     || !Number.isFinite(Date.parse(validUntil)) || Date.parse(validUntil) <= Date.now())) throw new Error('validUntil must be a future ISO timestamp')
   return withTransaction(database, async client => {
-    const { rows } = await client.query(`SELECT s.request_snapshot FROM lingxios.agent_work_items w
+    const { rows } = await client.query(`SELECT snapshot.request_snapshot FROM lingxios.agent_work_items w
       JOIN lingxios.agent_os_sessions s ON s.session_key=$4
+      JOIN lingxios.agent_request_snapshots snapshot ON snapshot.work_id=w.id AND snapshot.session_key=s.session_key
       WHERE w.id=$1 AND w.fence=$2 AND w.status='leased' AND w.lease_expires_at>NOW() AND w.cancel_requested_at IS NULL
-        AND w.principal_id=$3 AND s.request_snapshot->>'workId'=w.id
-        AND jsonb_array_length(s.request_snapshot->'revisions')=jsonb_array_length(w.steer_inputs)
+        AND w.principal_id=$3
+        AND jsonb_array_length(snapshot.request_snapshot->'revisions')=jsonb_array_length(w.steer_inputs)
       FOR UPDATE OF w`, [work.id, work.fence, work.principalId, sessionKeyOf(work)])
     const request = rows[0]?.['request_snapshot'] as RequestSnapshot | undefined
     if (!request) throw new Error('memory write requires the current leased request')

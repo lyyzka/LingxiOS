@@ -68,7 +68,7 @@ export async function deliverLingxiLoopEvent(database: SqlPool, services: Lingxi
       },
     })
     await publish([{ type: 'message-finish', path: [], finishReason: 'tool-calls', usage: { inputTokens: 0, outputTokens: 0 } }], event.seq * 2 + 1)
-  } else if (event.visibility === 'user') {
+  } else if (event.visibility === 'user' && event.kind !== 'run.completed') {
     await services.wukongClient().sendMessage(work.sessionId, channelType, work.agentId, {
       version: 1, kind: 'tool_activity', clientMsgNo: `activity-${event.runId}-${event.seq}`, body: event.kind,
       refs: { runId: event.runId, agentId: work.agentId }, data: { stage: event.stage, suppressAgentWake: true },

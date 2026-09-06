@@ -9,7 +9,7 @@ CREATE TABLE IF NOT EXISTS lingxios.schema_version (
   singleton BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
   version INT NOT NULL
 );
-INSERT INTO lingxios.schema_version(singleton, version) VALUES(TRUE, 2)
+INSERT INTO lingxios.schema_version(singleton, version) VALUES(TRUE, 4)
 ON CONFLICT (singleton) DO UPDATE SET version=GREATEST(lingxios.schema_version.version, EXCLUDED.version);
 
 CREATE TABLE IF NOT EXISTS lingxios.agent_work_items (
@@ -47,6 +47,27 @@ CREATE TABLE IF NOT EXISTS lingxios.agent_work_items (
 CREATE INDEX IF NOT EXISTS agent_work_items_claim_idx
   ON lingxios.agent_work_items (status, available_at)
   WHERE status IN ('queued','leased');
+
+CREATE TABLE IF NOT EXISTS lingxios.agent_model_budgets (
+  root_work_id       TEXT PRIMARY KEY REFERENCES lingxios.agent_work_items(id),
+  max_model_calls    INT NOT NULL CHECK (max_model_calls > 0),
+  max_tokens         BIGINT NOT NULL CHECK (max_tokens > 0),
+  max_cost_micros    BIGINT NOT NULL CHECK (max_cost_micros > 0),
+  deadline_at        TIMESTAMPTZ NOT NULL,
+  model_calls        INT NOT NULL DEFAULT 0,
+  tokens             BIGINT NOT NULL DEFAULT 0,
+  cost_micros        BIGINT NOT NULL DEFAULT 0,
+  updated_at         TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS lingxios.agent_model_budget_calls (
+  root_work_id TEXT NOT NULL REFERENCES lingxios.agent_model_budgets(root_work_id) ON DELETE CASCADE,
+  call_id      TEXT NOT NULL,
+  input_tokens BIGINT,
+  output_tokens BIGINT,
+  cost_micros  BIGINT,
+  PRIMARY KEY (root_work_id, call_id)
+);
 
 -- Native professional HTML lecture decks. The record is versioned as one
 -- immutable JSON document; checkpoints make long generation resumable.
@@ -176,8 +197,11 @@ CREATE TABLE IF NOT EXISTS lingxios.agent_run_events (
   visibility  TEXT NOT NULL CHECK (visibility IN ('user','internal')),
   data        JSONB NOT NULL DEFAULT '{}'::jsonb,
   recorded_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  expires_at  TIMESTAMPTZ,
   PRIMARY KEY (run_id, seq)
 );
+ALTER TABLE lingxios.agent_run_events ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ;
+CREATE INDEX IF NOT EXISTS agent_run_events_expiry_idx ON lingxios.agent_run_events(expires_at) WHERE expires_at IS NOT NULL;
 
 -- An intent without a receipt is uncertain, never automatically re-executed.
 CREATE TABLE IF NOT EXISTS lingxios.agent_action_intents (
@@ -212,6 +236,43 @@ CREATE TABLE IF NOT EXISTS lingxios.agent_delivery_outbox (
   claim_token TEXT,
   attempts INTEGER NOT NULL DEFAULT 0
 );
+
+-- Each unfinished request owns its snapshot; the session row only keeps the
+-- active pointer for backward-compatible readers.
+CREATE TABLE IF NOT EXISTS lingxios.agent_request_snapshots (
+  work_id          TEXT PRIMARY KEY REFERENCES lingxios.agent_work_items(id) ON DELETE CASCADE,
+  session_key      TEXT NOT NULL REFERENCES lingxios.agent_os_sessions(session_key) ON DELETE CASCADE,
+  request_snapshot JSONB NOT NULL CHECK (jsonb_typeof(request_snapshot)='object'),
+  updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS agent_request_snapshots_session_idx
+  ON lingxios.agent_request_snapshots(session_key);
+
+CREATE TABLE IF NOT EXISTS lingxios.agent_inbox_events (
+  event_id    TEXT PRIMARY KEY,
+  work_input  JSONB NOT NULL CHECK (jsonb_typeof(work_input)='object'),
+  recorded_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE OR REPLACE FUNCTION lingxios.sync_agent_request_snapshot() RETURNS trigger AS $$
+BEGIN
+  IF NEW.request_snapshot IS NOT NULL AND NEW.request_snapshot->>'workId' IS NOT NULL THEN
+    INSERT INTO lingxios.agent_request_snapshots(work_id,session_key,request_snapshot)
+    VALUES(NEW.request_snapshot->>'workId',NEW.session_key,NEW.request_snapshot)
+    ON CONFLICT(work_id) DO UPDATE SET request_snapshot=EXCLUDED.request_snapshot,updated_at=NOW()
+      WHERE lingxios.agent_request_snapshots.session_key=EXCLUDED.session_key;
+  END IF;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+DROP TRIGGER IF EXISTS agent_session_request_snapshot ON lingxios.agent_os_sessions;
+CREATE TRIGGER agent_session_request_snapshot AFTER INSERT OR UPDATE OF request_snapshot ON lingxios.agent_os_sessions
+FOR EACH ROW EXECUTE FUNCTION lingxios.sync_agent_request_snapshot();
+
+INSERT INTO lingxios.agent_request_snapshots(work_id,session_key,request_snapshot)
+SELECT request_snapshot->>'workId',session_key,request_snapshot FROM lingxios.agent_os_sessions
+WHERE request_snapshot IS NOT NULL AND request_snapshot->>'workId' IS NOT NULL
+ON CONFLICT(work_id) DO NOTHING;
 
 -- Reconciliation is append-only: it settles an uncertain action without
 -- overwriting either the pre-execution intent or its original receipt.

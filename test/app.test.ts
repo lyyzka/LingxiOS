@@ -8,7 +8,8 @@ import { join } from 'node:path'
 import { it } from 'node:test'
 import { PGlite } from '@electric-sql/pglite'
 import { executeRequest } from '../src/eval/index.js'
-import { createLingxiOS } from '../src/index.js'
+import { createLingxiOS, DefaultRuntimePolicy } from '../src/index.js'
+import type { ContextProvider, PromptContext, TurnContext } from '../src/index.js'
 import type { SqlPool } from '../src/control-plane/pg-store.js'
 import { kernelHome } from '../src/kernel/manager.js'
 import { persistArtifacts } from '../src/app/artifacts.js'
@@ -73,7 +74,25 @@ it('assembles the public app through HTTP model and Python, persisting results a
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
   const address = server.address()
   assert.ok(address && typeof address === 'object')
-  const options = { database: pool, model: { id: 'test', apiKey: 'test', baseUrl: `http://127.0.0.1:${address.port}` }, kernel: { homesRoot: join(directory, 'homes') }, worker: { healthPort: 0, pollIdleMs: 50 } }
+  class InjectedPolicy extends DefaultRuntimePolicy {
+    override assembleSystemPrompt(candidate: PromptContext) {
+      return `${super.assembleSystemPrompt(candidate)}\n\nInjected policy marker.`
+    }
+
+    override dynamicContextItems(context: TurnContext) {
+      return context.dynamic ? [{ role: 'user' as const, content: `Injected context: ${JSON.stringify(context.dynamic)}` }] : []
+    }
+  }
+  const contextProvider: ContextProvider = { loadContext: async (work) => {
+    const persona = { name: 'Injected assistant', role: 'assistant', instructions: 'Use injected context.' }
+    return { persona, capabilities: [], dynamic: { tenant: work.tenantId },
+      messages: [{ ref: work.triggerRef, authorId: work.principalId!, authorName: String(work.meta?.['authorName'] ?? 'User'), authorKind: 'human' as const, body: String(work.meta?.['text']), createdAt: work.createdAt ?? '' }],
+      promptContextCandidate: { version: 2 as const, epoch: 0, assembledAt: '', systemInstructions: '', persona, capabilities: [], sourceVersions: { persona: 'injected-v1' } },
+    }
+  } }
+  const options = { database: pool, model: { id: 'test', apiKey: 'test', baseUrl: `http://127.0.0.1:${address.port}` }, kernel: { homesRoot: join(directory, 'homes') }, worker: { healthPort: 0, pollIdleMs: 50 },
+    contextProvider, policy: new InjectedPolicy(),
+    modelTrace: { recordPayloads: true, redact: () => ({ redacted: true }), sampleRate: 1, retentionDays: 1 } }
   let app: Awaited<ReturnType<typeof createLingxiOS>> | undefined
   let controlApp: Awaited<ReturnType<typeof createLingxiOS>> | undefined
   try {
@@ -117,12 +136,19 @@ it('assembles the public app through HTTP model and Python, persisting results a
     assert.equal(requests.length, 2)
     assert.equal((await app.readMessage(identity))?.body, '4')
     assert.equal(contentChecks, 1)
+    const traces = (await db.query<{ data: Record<string, unknown>; expires_at: string }>(
+      "SELECT data,expires_at FROM lingxios.agent_run_events WHERE run_id=$1 AND kind LIKE 'model.%' AND data ? 'input' OR run_id=$1 AND kind LIKE 'model.%' AND data ? 'output'", [identity.runId])).rows
+    assert.ok(traces.length >= 2)
+    assert.ok(traces.every(trace => JSON.stringify(trace.data).includes('redacted') && !JSON.stringify(trace.data).includes('Calculate 2 + 2')))
+    assert.ok(traces.every(trace => trace.expires_at))
     assert.deepEqual(await app.readOutcome(identity), { status: 'satisfied', verification: 'inconclusive', requestVersion: 1 })
     assert.deepEqual(evaluation.message?.envelope.assessment, { status: 'satisfied', gaps: [],
       checks: [{ requirement: 'Calculate 2 + 2 using Python.', status: 'met', basis: 'Python returned 4.' }] })
     assert.equal(await app.readMessage({ ...identity, tenantId: 'another' }), null)
     assert.equal(requests.length, 2)
     assert.match(requests[0]!.messages[0]!.content, /Tooling contract/)
+    assert.match(requests[0]!.messages[0]!.content, /Injected policy marker/)
+    assert.match(JSON.stringify(requests[0]!.messages), /Injected context:.*tenant/)
     const output = requests[1]!.messages.find((item) => item.role === 'tool')!
     assert.equal(JSON.parse(output.content).stdout, '4\n')
     const { healthPort } = await app.start()
@@ -211,7 +237,7 @@ it('assembles the public app through HTTP model and Python, persisting results a
     reviseBeforeCommit = true
     assert.equal(await app.runNext(), true)
     assert.equal(reviseBeforeCommit, false)
-    assert.equal(await app.readMessage(lateIdentity), null)
+    assert.equal((await app.readMessage(lateIdentity))?.envelope?.goalOutcome.status, 'partial')
     assert.deepEqual((await db.query('SELECT * FROM lingxios.agent_delivery_outbox WHERE run_id=$1', [lateIdentity.runId])).rows, [])
     exhaustBudget = true
     const partialIdentity = { ...identity, runId: 'partial-request', sessionId: 'partial-session' }
@@ -232,9 +258,9 @@ it('assembles the public app through HTTP model and Python, persisting results a
     await app.enqueue({ ...missingIdentity, id: missingIdentity.runId, principalId: 'user', text: 'Create a result file.' })
     assert.equal(await app.runNext(), true)
     assert.equal(missingArtifactCalls, 2)
-    assert.equal(await app.readMessage(missingIdentity), null)
-    assert.equal((await app.readOutcome(missingIdentity))?.status, 'blocked')
-    assert.equal(await app.readArtifact({ ...missingIdentity, principalId: 'user' }, 'missing.txt'), null)
+    assert.equal((await app.readMessage(missingIdentity))?.body, 'File prepared.')
+    assert.equal((await app.readOutcome(missingIdentity))?.status, 'satisfied')
+    assert.equal((await app.readArtifact({ ...missingIdentity, principalId: 'user' }, 'missing.txt'))?.bytes.toString(), 'result')
     const beforeCorruptRecovery = requests.length
     await db.query("UPDATE lingxios.agent_messages SET message=message-'envelope' WHERE run_id=$1", [identity.runId])
     await db.query("UPDATE lingxios.agent_work_items SET status='queued',available_at=NOW() WHERE id=$1", [identity.runId])
