@@ -8,10 +8,11 @@ const slide = (input: Parameters<LectureAuthor['slide']>[0]): SlideSpec => ({
   purpose: input.order === input.course.targetSlideCount - 1 ? 'review' : 'explain',
   title: input.previous ? `${input.previous.title} revised` : `Slide ${input.order + 1}`,
   conclusion: input.instruction ?? `Conclusion ${input.order + 1}`, visualKind: 'diagram',
-  bodyHtml: `<svg viewBox="0 0 1280 720" role="img" aria-label="diagram"><rect data-anchor-id="main" x="100" y="100" width="300" height="180" fill="#53d6c7"/></svg>`,
-  anchors: [{ id: 'main', x: 100, y: 100, width: 300, height: 180 }],
+  bodyHtml: `<svg viewBox="0 0 1280 720" role="img" aria-label="diagram"><rect data-anchor-id="input" x="100" y="220" width="300" height="180" fill="#53d6c7"/><rect data-anchor-id="result" x="500" y="220" width="300" height="180" fill="#53d6c7"/></svg>`,
+  anchors: [{ id: 'input', x: 100, y: 220, width: 300, height: 180 }, { id: 'result', x: 500, y: 220, width: 300, height: 180 }],
   bindings: [{ claimId: 'claim', snapshotId: input.evidence[0]!.id, evidenceMarkers: ['S1'], kind: 'source', statement: 'Supported statement' }],
-  steps: [{ id: 'step', title: 'Explain', explanation: 'Detailed explanation', anchorIds: ['main'], claimIds: ['claim'] }],
+  steps: [{ id: 'step-input', title: 'Input', explanation: 'Observe the input mechanism.', anchorIds: ['input'], claimIds: ['claim'] },
+    { id: 'step-result', title: 'Result', explanation: 'Connect the mechanism to its result.', anchorIds: ['result'], claimIds: ['claim'] }],
 })
 
 test('native lecture pipeline publishes offline HTML and revises only selected pages', async () => {
@@ -78,10 +79,10 @@ test('rejects empty teaching pages and encoded or CSS-based active content', () 
   const bad = slide({ request: { requirements: 'x', targetSlideCount: 3, durationMinutes: 10 },
     course: { title: 'x', audience: 'x', prerequisites: [], objectives: [{ id: 'o', description: 'x' }], chapters: [{ id: 'c', order: 0, title: 'c', objectiveIds: ['o'], slideIds: ['pg_x'] }], targetSlideCount: 3, durationMinutes: 10, terminology: {} },
     chapter: { id: 'c', order: 0, title: 'c', objectiveIds: ['o'], slideIds: ['pg_x'] }, order: 0, pageId: 'pg_x', evidence: [{ version: 1, id: 'e', items: [{ marker: 'S1', sourceId: 's', sourceVersion: 'v', chunkId: 'c', title: 's', excerpt: 'e' }] }] })
-  bad.role = 'content'; bad.bodyHtml = '<p>Only text</p>'; bad.anchors = []; bad.steps = []; bad.bindings = []
+  bad.role = 'content'; bad.bodyHtml = '<p>Only text</p>'; bad.anchors = []; bad.steps[1]!.anchorIds = ['input']; bad.bindings = []
   const report = validateDeck({ schemaVersion: 'lingxi-lecture/v1', deckId: 'd', revision: 1, title: 'x', language: 'zh-CN', theme: { id: 'x', background: '#000000', surface: '#111111', text: '#ffffff', muted: '#aaaaaa', accent: '#00ffff' },
     course: { title: 'x', audience: 'x', prerequisites: [], objectives: [{ id: 'o', description: 'x' }], chapters: [{ id: 'c', order: 0, title: 'c', objectiveIds: ['o'], slideIds: ['pg_x'] }], targetSlideCount: 3, durationMinutes: 10, terminology: {} }, slides: [bad], evidence: [], createdAt: '2026-01-01T00:00:00.000Z' })
-  for (const code of ['visual.missing', 'visual.primary', 'citation.missing', 'step.missing']) assert.ok(report.issues.some(issue => issue.code === code), code)
+  for (const code of ['visual.missing', 'visual.primary', 'citation.missing', 'step.focus-reused']) assert.ok(report.issues.some(issue => issue.code === code), code)
 })
 
 test('real model adapter repairs malformed structured output before accepting it', async () => {

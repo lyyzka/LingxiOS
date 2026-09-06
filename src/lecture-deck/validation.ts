@@ -74,6 +74,8 @@ export function validateDeck(input: DeckManifest): ValidationReport {
       anchors.set(anchor.id, anchor)
       const escaped = anchor.id.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
       if (!new RegExp(`data-anchor-id\\s*=\\s*["']${escaped}["']`).test(slide.bodyHtml)) add('anchor.dom', 'Anchor has no matching rendered element', slide.id, anchor.id)
+      if (instructional && (anchor.x < 40 || anchor.y < 184 || anchor.x + anchor.width > 1240 || anchor.y + anchor.height > 640)) add('layout.safe-area', 'Instructional anchors must stay below the title and above the footer', slide.id, anchor.id)
+      if (instructional && (anchor.width < 96 || anchor.height < 48)) add('anchor.size', 'An explanation anchor must contain a complete readable component', slide.id, anchor.id)
     }
     if (instructional && (!anchors.size || Math.max(0, ...[...anchors.values()].map(anchor => anchor.width * anchor.height)) < 1280 * 720 * .05)) add('visual.primary', 'Instructional slide requires a substantial anchored primary visual', slide.id)
     const claimIds = new Set<string>()
@@ -88,14 +90,18 @@ export function validateDeck(input: DeckManifest): ValidationReport {
     }
     if (instructional && !claimIds.size) add('citation.missing', 'Instructional slide requires claim-level evidence or an explicit teaching example', slide.id)
     const steps = new Set<string>(), usedClaims = new Set<string>()
+    const primaryAnchors = new Set<string>()
     for (const step of slide.steps ?? []) {
       if (!step.id?.trim() || steps.has(step.id)) add('step.id', 'Step ID is missing or duplicated', slide.id, step.id)
       steps.add(step.id)
       if (!step.anchorIds.length || step.anchorIds.some(id => !anchors.has(id))) add('step.anchor', 'Step references an unknown anchor', slide.id, step.id)
+      if (step.anchorIds[0] && primaryAnchors.has(step.anchorIds[0])) add('step.focus-reused', 'Each explanation step requires a different primary SVG component', slide.id, step.id)
+      if (step.anchorIds[0]) primaryAnchors.add(step.anchorIds[0])
       if (!step.claimIds.length || step.claimIds.some(id => !claimIds.has(id))) add('step.claim', 'Step requires known claim references', slide.id, step.id)
       step.claimIds.forEach(id => usedClaims.add(id))
     }
     if (instructional && !steps.size) add('step.missing', 'Instructional slide requires at least one explanation step', slide.id)
+    if (instructional && (steps.size < 2 || steps.size > 4)) add('step.count', 'Instructional slides require 2–4 component-level explanation steps', slide.id)
     if ([...claimIds].some(id => !usedClaims.has(id))) add('citation.unused', 'Every claim must be explained by a step', slide.id)
   }
   const expectedOrders = Array.from({ length: input?.slides?.length ?? 0 }, (_, index) => index)
