@@ -26,6 +26,7 @@ import { createHash } from 'node:crypto'
 import { assembleApp, type LingxiOSOptions } from '../../app/index.js'
 import { executeKnowledge, KNOWLEDGE_METHODS } from './actions.js'
 import { executePresentation, PRESENTATION_METHODS } from './presentations.js'
+import { createNativePresentationBridge } from './native-presentations.js'
 import { approvePresentation, requestPresentationApproval } from './presentation-approvals.js'
 import { executeChat, CHAT_METHODS } from './chat.js'
 import { executeEmail, EMAIL_APPROVAL_METHODS, EMAIL_METHODS } from './email.js'
@@ -351,6 +352,7 @@ export async function createLingxiLoop(options: LingxiLoopOptions) {
       },
     },
   })
+  if (!services.presentations && options.lectureDeck) services.presentations = createNativePresentationBridge(app, options.lectureDeck)
   const { enqueue, continueInput, ...lifecycle } = app
   return { ...lifecycle,
     reconcileKnowledgeApproval: (input: { companyId: string; userId: string; approvalId: string }) => reconcileKnowledgeApproval(database, services, input),

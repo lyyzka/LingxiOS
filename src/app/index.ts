@@ -23,6 +23,7 @@ import type { GoalOutcome } from '../protocol/outcome.js'
 import type { ControlPlaneDeps } from '../control-plane/service.js'
 import type { ActionResolution } from '../control-plane/stores.js'
 import { lectureDeckProcessor, type LectureDeckService } from '../lecture-deck/service.js'
+import { contentHash } from '../lecture-deck/contracts.js'
 
 export interface LingxiOSOptions {
   database: SqlPool
@@ -56,6 +57,11 @@ export interface MessageIdentity {
   tenantId: string
   agentId: string
   sessionId: string
+}
+
+export interface LectureRequestInput extends Omit<RequestInput, 'text' | 'attachments' | 'authorName'> { request: unknown }
+export interface LectureOperationInput extends Omit<LectureRequestInput, 'request' | 'id'> {
+  deckId: string; operation: 'retry' | 'revise'; idempotencyKey: string; request?: unknown
 }
 
 export type ActionResolutionInput = ActionResolution & Pick<RequestInput,
@@ -262,6 +268,36 @@ export async function assembleApp(options: LingxiOSOptions, integration?: Pick<C
       return service.enqueue({ ...input, kind: 'turn', lane: 'interactive', triggerRef: input.sourceRef ?? input.id ?? randomUUID(),
         meta: { text: input.text, authorName: input.authorName ?? 'User', attachments: snapshotAttachments(input.attachments ?? []) },
       })
+    },
+    async enqueueLecture(input: LectureRequestInput) {
+      if (!options.lectureDeck) throw new Error('native lecture-deck capability is not configured')
+      if (!input?.principalId?.trim()) throw new Error('authenticated principalId is required')
+      const requestId = input.id ?? randomUUID()
+      const deckId = `deck_${contentHash([input.tenantId, input.principalId, requestId]).slice(0, 32)}`
+      const deck = await options.lectureDeck.begin({ tenantId: input.tenantId, principalId: input.principalId }, input.request, deckId)
+      const workId = `lecture_${deck.id}_r${deck.revision}`
+      const queued = await service.enqueue({ id: workId, tenantId: input.tenantId, agentId: input.agentId, sessionId: input.sessionId,
+        ...(input.threadId ? { threadId: input.threadId } : {}), principalId: input.principalId, kind: 'lecture_deck', lane: 'background',
+        triggerRef: input.sourceRef ?? requestId, meta: { operation: 'run', deckId: deck.id } })
+      return { ...queued, deckId: deck.id, revision: deck.revision, status: deck.status }
+    },
+    async enqueueLectureOperation(input: LectureOperationInput) {
+      if (!options.lectureDeck) throw new Error('native lecture-deck capability is not configured')
+      if (!input?.principalId?.trim() || !input.idempotencyKey?.trim()) throw new Error('authenticated principalId and idempotencyKey are required')
+      const deck = await options.lectureDeck.get({ tenantId: input.tenantId, principalId: input.principalId }, input.deckId)
+      const workId = `lecture_${contentHash([deck.id, deck.revision, input.operation, input.idempotencyKey]).slice(0, 48)}`
+      const queued = await service.enqueue({ id: workId, tenantId: input.tenantId, agentId: input.agentId, sessionId: input.sessionId,
+        ...(input.threadId ? { threadId: input.threadId } : {}), principalId: input.principalId, kind: 'lecture_deck', lane: 'background',
+        triggerRef: input.sourceRef ?? input.idempotencyKey, meta: { operation: input.operation, deckId: deck.id, ...(input.request === undefined ? {} : { request: input.request }) } })
+      return { ...queued, deckId: deck.id, revision: deck.revision, status: deck.status }
+    },
+    async readLecture(input: { tenantId: string; principalId: string; deckId: string }) {
+      if (!options.lectureDeck) throw new Error('native lecture-deck capability is not configured')
+      return options.lectureDeck.get({ tenantId: input.tenantId, principalId: input.principalId }, input.deckId)
+    },
+    async readLectureHtml(input: { tenantId: string; principalId: string; deckId: string }) {
+      if (!options.lectureDeck) throw new Error('native lecture-deck capability is not configured')
+      return options.lectureDeck.readHtml({ tenantId: input.tenantId, principalId: input.principalId }, input.deckId)
     },
     async runNext() {
       const { runtime } = localExecution()
