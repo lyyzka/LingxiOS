@@ -59,7 +59,7 @@
     "test:only": "node --test --test-concurrency=1 \"dist/test/**/*.test.js\"",
     "eval:live": "npm run build && node scripts/eval-live.mjs",
     "eval:presentations": "npm run build && node scripts/eval-presentations-live.mjs",
-    "eval:presentation-artifact": "..\\LingxiLoop\\node_modules\\.bin\\tsx scripts/eval-presentation-artifact.mts",
+    "eval:presentation-artifact": "npm run build && node scripts/eval-presentation-artifact.mjs",
     "test:contracts": "node scripts/check-lingxiloop-contracts.mjs",
     "test:postgres-stores": "npm run build && node scripts/test-postgres-stores.mjs",
     "test:native-missions": "npm run build && node scripts/test-native-missions.mjs",

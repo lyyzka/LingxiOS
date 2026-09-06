@@ -12,6 +12,11 @@ import { validateDeck } from './validation.js'
 
 export type LectureStage = 'plan-course' | 'plan-chapter' | 'author-slide' | 'validate-slide' | 'repair-slide' | 'validate-deck' | 'publish-deck'
 export type LectureStatus = 'planning' | 'generating' | 'validating' | 'publishing' | 'ready' | 'failed' | 'cancelled'
+export interface LectureProgress {
+  deckId: string; revision: number; stage: LectureStage; status: 'started' | 'completed' | 'failed'
+  pageId?: string; chapterId?: string; completedSlides?: number; totalSlides?: number; message?: string
+}
+export type LectureProgressObserver = (progress: LectureProgress) => void | Promise<void>
 export interface LectureCheckpoint { stage: LectureStage; key: string; inputHash: string; output: unknown; outputHash: string; attempts: number; completedAt: string }
 export interface LectureRecord {
   id: string; tenantId: string; principalId: string; revision: number; status: LectureStatus; request: LectureDeckCreateRequest
@@ -29,7 +34,7 @@ export interface LectureEvidenceProvider {
   search(input: { tenantId: string; principalId: string; sourceIds: string[]; queries: string[]; limit: number; signal?: AbortSignal }): Promise<EvidenceItem[]>
 }
 export interface LecturePublisher { publish(record: LectureRecord, artifact: LectureArtifact): Promise<void>; read?(record: LectureRecord): Promise<Uint8Array | null> }
-export interface LectureReviewer { review(deck: DeckManifest, signal?: AbortSignal): Promise<ValidationReport> }
+export interface LectureReviewer { review(deck: DeckManifest, signal?: AbortSignal, progress?: LectureProgressObserver): Promise<ValidationReport> }
 export interface LectureAuthor {
   plan(request: LectureDeckCreateRequest, evidence: EvidenceSnapshot, signal?: AbortSignal): Promise<CoursePlan>
   slide(input: { request: LectureDeckCreateRequest; course: CoursePlan; chapter: ChapterPlan; order: number; pageId: string; evidence: EvidenceSnapshot[]; previous?: SlideSpec; instruction?: string }, signal?: AbortSignal): Promise<SlideSpec>
@@ -37,7 +42,7 @@ export interface LectureAuthor {
 
 export interface LectureDeckDependencies {
   repository: LectureRepository; evidence: LectureEvidenceProvider; author: LectureAuthor; reviewer: LectureReviewer; publisher: LecturePublisher
-  now?: () => string; maxRepairAttempts?: number; maxArtifactBytes?: number
+  now?: () => string; maxRepairAttempts?: number; maxArtifactBytes?: number; modelStageTimeoutMs?: number
 }
 
 const abortIfNeeded = (signal?: AbortSignal) => { if (signal?.aborted) throw signal.reason instanceof Error ? signal.reason : new Error('lecture generation cancelled') }
@@ -61,27 +66,27 @@ export class LectureDeckService {
     return record
   }
 
-  async create(scope: { tenantId: string; principalId: string }, value: unknown, signal?: AbortSignal): Promise<LectureRecord> {
+  async create(scope: { tenantId: string; principalId: string }, value: unknown, signal?: AbortSignal, progress?: LectureProgressObserver): Promise<LectureRecord> {
     const record = await this.begin(scope, value)
-    return this.run(scope, record.id, signal)
+    return this.run(scope, record.id, signal, progress)
   }
 
-  async run(scope: { tenantId: string; principalId: string }, id: string, signal?: AbortSignal): Promise<LectureRecord> {
+  async run(scope: { tenantId: string; principalId: string }, id: string, signal?: AbortSignal, progress?: LectureProgressObserver): Promise<LectureRecord> {
     const record = await this.owned(scope, id)
     if (!['planning', 'generating', 'validating'].includes(record.status)) throw new Error('lecture is not awaiting generation or recovery')
-    return this.withCancellation(record.id, signal, activeSignal => this.generate(record, activeSignal))
+    return this.withCancellation(record.id, signal, activeSignal => this.generate(record, activeSignal, progress))
   }
 
-  async retry(scope: { tenantId: string; principalId: string }, id: string, signal?: AbortSignal): Promise<LectureRecord> {
+  async retry(scope: { tenantId: string; principalId: string }, id: string, signal?: AbortSignal, progress?: LectureProgressObserver): Promise<LectureRecord> {
     const record = await this.owned(scope, id)
     if (!['failed', 'cancelled'].includes(record.status)) throw new Error('only failed or cancelled lectures can be retried')
     const { error: _error, ...retryable } = record
     const next: LectureRecord = { ...retryable, status: 'planning' }
     await this.deps.repository.save(next, record.revision)
-    return this.withCancellation(next.id, signal, activeSignal => this.generate(next, activeSignal))
+    return this.withCancellation(next.id, signal, activeSignal => this.generate(next, activeSignal, progress))
   }
 
-  async revise(scope: { tenantId: string; principalId: string }, id: string, value: unknown, signal?: AbortSignal): Promise<LectureRecord> {
+  async revise(scope: { tenantId: string; principalId: string }, id: string, value: unknown, signal?: AbortSignal, progress?: LectureProgressObserver): Promise<LectureRecord> {
     const request = validateRevisionRequest(value)
     const current = await this.owned(scope, id)
     if (!current.manifest || current.status !== 'ready') throw new Error('only ready lectures can be revised')
@@ -97,10 +102,10 @@ export class LectureDeckService {
         for (const original of affected) {
           abortIfNeeded(activeSignal)
           const chapter = current.manifest!.course.chapters.find(item => item.id === original.chapterId)!
-          slides[original.order] = await this.authorSlide(next, current.manifest!.course, chapter, original.order, original.id, current.manifest!.evidence, original, request.instruction, activeSignal)
+          slides[original.order] = await this.authorSlide(next, current.manifest!.course, chapter, original.order, original.id, current.manifest!.evidence, original, request.instruction, activeSignal, progress)
         }
         const { contentHash: _hash, ...base } = current.manifest!
-        return await this.finish(next, { ...base, revision, slides, createdAt: this.now() }, activeSignal)
+        return await this.finish(next, { ...base, revision, slides, createdAt: this.now() }, activeSignal, progress)
       })
     } catch (error) { return this.fail(next, error) }
   }
@@ -124,13 +129,14 @@ export class LectureDeckService {
     return cancelled
   }
 
-  private async generate(record: LectureRecord, signal?: AbortSignal): Promise<LectureRecord> {
+  private async generate(record: LectureRecord, signal?: AbortSignal, progress?: LectureProgressObserver): Promise<LectureRecord> {
     try {
       abortIfNeeded(signal)
       const sourceIds = record.request.sourceIds ?? []
       const broadItems = await this.deps.evidence.search({ tenantId: record.tenantId, principalId: record.principalId, sourceIds, queries: [record.request.requirements], limit: 200, ...(signal ? { signal } : {}) })
       const broad = this.trimEvidence(snapshotEvidence(`${record.id}:course`, broadItems), 40)
-      const course = await this.cached(record, 'plan-course', 'course', { request: record.request, evidence: broad }, () => this.deps.author.plan(record.request, broad, signal))
+      const course = await this.modelStage(record, { stage: 'plan-course' }, signal, progress,
+        activeSignal => this.cached(record, 'plan-course', 'course', { request: record.request, evidence: broad }, () => this.deps.author.plan(record.request, broad, activeSignal)))
       this.validatePlan(course, record.request.targetSlideCount)
       record = { ...record, status: 'generating' }
       await this.deps.repository.save(record, record.revision)
@@ -145,26 +151,28 @@ export class LectureDeckService {
       const slides: SlideSpec[] = []
       for (let order = 0; order < orderedIds.length; order++) {
         const pageId = orderedIds[order]!
-        slides.push(await this.authorSlide(record, course, chapterForOrder.get(pageId)!, order, pageId, evidence, undefined, undefined, signal))
+        slides.push(await this.authorSlide(record, course, chapterForOrder.get(pageId)!, order, pageId, evidence, undefined, undefined, signal, progress))
       }
       const manifest: DeckManifest = { schemaVersion: LECTURE_SCHEMA_VERSION, deckId: record.id, revision: record.revision,
         title: record.request.title ?? course.title, language: record.request.language ?? 'zh-CN', theme: record.request.theme ?? DEFAULT_LECTURE_THEME,
         course, slides, evidence, createdAt: this.now() }
-      return await this.finish(record, manifest, signal)
+      return await this.finish(record, manifest, signal, progress)
     } catch (error) { return this.fail(record, error) }
   }
 
-  private async authorSlide(record: LectureRecord, course: CoursePlan, chapter: ChapterPlan, order: number, pageId: string, evidence: EvidenceSnapshot[], previous?: SlideSpec, instruction?: string, signal?: AbortSignal) {
+  private async authorSlide(record: LectureRecord, course: CoursePlan, chapter: ChapterPlan, order: number, pageId: string, evidence: EvidenceSnapshot[], previous?: SlideSpec, instruction?: string, signal?: AbortSignal, progress?: LectureProgressObserver) {
     if (!chapter) throw new Error(`no chapter planned for slide ${order}`)
     const key = previous?.id ?? pageId
     const scopedEvidence = this.slideEvidence(evidence, chapter, order)
     const input = { request: record.request, course, chapter, order, pageId: key, evidence: scopedEvidence, ...(previous ? { previous } : {}), ...(instruction ? { instruction } : {}) }
-    let slide = await this.cached(record, previous ? 'repair-slide' : 'author-slide', key, input, () => this.deps.author.slide(input, signal))
+    let slide = await this.modelStage(record, { stage: previous ? 'repair-slide' : 'author-slide', pageId: key, chapterId: chapter.id, completedSlides: order, totalSlides: course.targetSlideCount }, signal, progress,
+      activeSignal => this.cached(record, previous ? 'repair-slide' : 'author-slide', key, input, () => this.deps.author.slide(input, activeSignal)))
     slide = { ...slide, id: key, order, chapterId: chapter.id }
     for (let attempt = 0; attempt < (this.deps.maxRepairAttempts ?? 2); attempt++) {
       const probe = this.partialManifest(record, course, scopedEvidence, slide)
       if (validateDeck(probe).issues.every(issue => issue.pageId !== slide.id && !issue.code.startsWith('security.'))) break
-      slide = await this.deps.author.slide({ ...input, previous: slide, instruction: 'Repair deterministic validation errors only.' }, signal)
+      slide = await this.modelStage(record, { stage: 'repair-slide', pageId: key, chapterId: chapter.id, completedSlides: order, totalSlides: course.targetSlideCount }, signal, progress,
+        activeSignal => this.deps.author.slide({ ...input, previous: slide, instruction: 'Repair deterministic validation errors only.' }, activeSignal))
       slide = { ...slide, id: key, order, chapterId: chapter.id }
     }
     return slide
@@ -175,13 +183,14 @@ export class LectureDeckService {
       theme: record.request.theme ?? DEFAULT_LECTURE_THEME, course: { ...course, chapters: course.chapters.map(chapter => ({ ...chapter, slideIds: chapter.id === slide.chapterId ? [slide.id] : [] })) }, slides: [{ ...slide, order: 0 }], evidence, createdAt: this.now() }
   }
 
-  private async finish(record: LectureRecord, manifest: DeckManifest, signal?: AbortSignal) {
+  private async finish(record: LectureRecord, manifest: DeckManifest, signal?: AbortSignal, progress?: LectureProgressObserver) {
     abortIfNeeded(signal)
     record = { ...record, status: 'validating' }
     await this.deps.repository.save(record, record.revision)
     let report = validateDeck(manifest)
     if (report.passed) {
-      const semantic = await this.deps.reviewer.review(manifest, signal)
+      const semantic = await this.modelStage(record, { stage: 'validate-deck', completedSlides: manifest.slides.length, totalSlides: manifest.slides.length }, signal, progress,
+        activeSignal => this.deps.reviewer.review(manifest, activeSignal, progress))
       report = { passed: semantic.passed, issues: [...report.issues, ...semantic.issues] }
     }
     if (!report.passed) throw new Error(`lecture quality gate failed: ${report.issues.map(issue => issue.code).join(', ')}`)
@@ -226,6 +235,30 @@ export class LectureDeckService {
     const chapterStart = chapterEvidence?.items.length ? (order * 18) % chapterEvidence.items.length : 0
     const scoped = chapterEvidence ? this.trimEvidence({ ...chapterEvidence, items: chapterEvidence.items.slice(chapterStart, chapterStart + 12) }, 12) : undefined
     return [course, scoped].filter((item): item is EvidenceSnapshot => Boolean(item))
+  }
+
+  private async modelStage<T>(record: LectureRecord, event: Omit<LectureProgress, 'deckId' | 'revision' | 'status'>, signal: AbortSignal | undefined,
+    progress: LectureProgressObserver | undefined, run: (signal: AbortSignal) => Promise<T>): Promise<T> {
+    const timeoutMs = this.deps.modelStageTimeoutMs ?? 120_000
+    if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1_000) throw new Error('modelStageTimeoutMs must be an integer of at least 1000')
+    const timeout = new AbortController(), timer = setTimeout(() => timeout.abort(new Error(`${event.stage} timed out after ${timeoutMs}ms`)), timeoutMs)
+    const active = signal ? AbortSignal.any([signal, timeout.signal]) : timeout.signal
+    await this.observe(progress, { deckId: record.id, revision: record.revision, ...event, status: 'started' })
+    try {
+      const result = await run(active)
+      await this.observe(progress, { deckId: record.id, revision: record.revision, ...event,
+        ...(event.pageId && event.completedSlides !== undefined ? { completedSlides: event.completedSlides + 1 } : {}), status: 'completed' })
+      return result
+    } catch (error) {
+      const message = timeout.signal.aborted && !signal?.aborted ? `${event.stage} timed out after ${timeoutMs}ms` : error instanceof Error ? error.message : String(error)
+      await this.observe(progress, { deckId: record.id, revision: record.revision, ...event, status: 'failed', message })
+      if (timeout.signal.aborted && !signal?.aborted) throw new Error(message, { cause: error })
+      throw error
+    } finally { clearTimeout(timer) }
+  }
+
+  private async observe(progress: LectureProgressObserver | undefined, event: LectureProgress) {
+    if (progress) await Promise.resolve(progress(event)).catch(() => undefined)
   }
 
   private async cached<T>(record: LectureRecord, stage: LectureStage, key: string, input: unknown, run: () => Promise<T>): Promise<T> {
@@ -279,10 +312,12 @@ export class ModelLectureAuthor implements LectureAuthor {
 
 export class ModelLectureReviewer implements LectureReviewer {
   constructor(private readonly model: ModelDriver) {}
-  async review(deck: DeckManifest, signal?: AbortSignal): Promise<ValidationReport> {
+  async review(deck: DeckManifest, signal?: AbortSignal, progress?: LectureProgressObserver): Promise<ValidationReport> {
     const issues: ValidationReport['issues'] = []
     for (let offset = 0; offset < deck.slides.length; offset += 10) {
       const slides = deck.slides.slice(offset, offset + 10), used = new Map<string, Set<string>>()
+      await Promise.resolve(progress?.({ deckId: deck.deckId, revision: deck.revision, stage: 'validate-deck', status: 'started',
+        completedSlides: offset, totalSlides: deck.slides.length, message: `reviewing pages ${offset + 1}-${offset + slides.length}` })).catch(() => undefined)
       for (const slide of slides) for (const binding of slide.bindings) {
         const markers = used.get(binding.snapshotId) ?? new Set<string>(); binding.evidenceMarkers.forEach(marker => markers.add(marker)); used.set(binding.snapshotId, markers)
       }
@@ -292,6 +327,8 @@ export class ModelLectureReviewer implements LectureReviewer {
       const report = result.value as ValidationReport
       if (!report || typeof report.passed !== 'boolean' || !Array.isArray(report.issues) || report.issues.some(issue => !issue || typeof issue.code !== 'string' || typeof issue.message !== 'string')) throw new Error('lecture reviewer returned an invalid report')
       issues.push(...report.issues)
+      await Promise.resolve(progress?.({ deckId: deck.deckId, revision: deck.revision, stage: 'validate-deck', status: 'completed',
+        completedSlides: offset + slides.length, totalSlides: deck.slides.length, message: `reviewed pages ${offset + 1}-${offset + slides.length}` })).catch(() => undefined)
     }
     return { passed: issues.length === 0, issues }
   }
@@ -304,10 +341,11 @@ export function lectureDeckProcessor(service: LectureDeckService): WorkProcessor
     const operation = work.meta?.['operation'] ?? 'create'
     await context.emit({ kind: 'lecture.stage', stage: 'started', visibility: 'user', data: { operation } })
     const scope = { tenantId: work.tenantId, principalId: work.principalId }
-    const result = operation === 'create' ? await service.run(scope, (await service.begin(scope, work.meta?.['request'], `deck_${contentHash([work.tenantId, work.id]).slice(0, 32)}`)).id, context.signal)
-      : operation === 'run' ? await service.run(scope, String(work.meta?.['deckId'] ?? ''), context.signal)
-      : operation === 'revise' ? await service.revise(scope, String(work.meta?.['deckId'] ?? ''), work.meta?.['request'], context.signal)
-      : operation === 'retry' ? await service.retry(scope, String(work.meta?.['deckId'] ?? ''), context.signal)
+    const progress: LectureProgressObserver = event => context.emit({ kind: 'lecture.progress', stage: event.status, visibility: 'user', data: { ...event } })
+    const result = operation === 'create' ? await service.run(scope, (await service.begin(scope, work.meta?.['request'], `deck_${contentHash([work.tenantId, work.id]).slice(0, 32)}`)).id, context.signal, progress)
+      : operation === 'run' ? await service.run(scope, String(work.meta?.['deckId'] ?? ''), context.signal, progress)
+      : operation === 'revise' ? await service.revise(scope, String(work.meta?.['deckId'] ?? ''), work.meta?.['request'], context.signal, progress)
+      : operation === 'retry' ? await service.retry(scope, String(work.meta?.['deckId'] ?? ''), context.signal, progress)
       : operation === 'cancel' ? await service.cancel(scope, String(work.meta?.['deckId'] ?? ''))
       : (() => { throw new Error('unsupported lecture operation') })()
     if (result.status === 'failed') throw new Error(result.error ?? 'lecture generation failed')

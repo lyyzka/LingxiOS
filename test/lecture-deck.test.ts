@@ -116,3 +116,18 @@ test('retry resumes completed slide checkpoints instead of regenerating them', a
   assert.equal(calls.get('pg_2'), 2)
   assert.equal(calls.get('pg_3'), 1)
 })
+
+test('reports page progress and bounds a stalled model stage', async () => {
+  const progress: string[] = []
+  const service = new LectureDeckService({ repository: new MemoryLectureRepository(), modelStageTimeoutMs: 1_000,
+    author: { async plan(_request, _evidence, signal) {
+      await new Promise((_, reject) => signal?.addEventListener('abort', () => reject(signal.reason), { once: true }))
+      throw new Error('unreachable')
+    }, async slide(input) { return slide(input) } },
+    evidence: { search: async () => [] }, reviewer: { review: async () => ({ passed: true, issues: [] }) }, publisher: { publish: async () => {} } })
+  const result = await service.create({ tenantId: 't', principalId: 'p' }, { requirements: 'x', targetSlideCount: 3 }, undefined,
+    event => { progress.push(`${event.stage}.${event.status}`) })
+  assert.equal(result.status, 'failed')
+  assert.match(result.error ?? '', /plan-course timed out after 1000ms/)
+  assert.deepEqual(progress, ['plan-course.started', 'plan-course.failed'])
+})
