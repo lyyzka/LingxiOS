@@ -1,0 +1,56 @@
+{
+  "caseId": "hint-only",
+  "repeat": 2,
+  "originalInputSha256": "27215f1bbd766dd539e8ebd52c331c9148cbb75ef12ed919697313eb92bb97e1",
+  "checks": [
+    {
+      "id": "committed_response",
+      "status": "pass"
+    }
+  ],
+  "failures": [
+    "Semantic review unavailable"
+  ],
+  "body": "对于方程 x² - 5x + 6 = 0，下一步提示：\n\n**尝试计算这个方程的判别式 Δ = b² - 4ac**\n\n（其中 a=1, b=-5, c=6）\n\n这样你就能知道方程根的情况了。",
+  "outcome": {
+    "gaps": [
+      "Goal acceptance has not been checked"
+    ],
+    "status": "partial",
+    "verification": "not_run",
+    "requestVersion": 1
+  },
+  "delivery": "observed",
+  "externalDelivery": "not_observed",
+  "executionDurationMs": 14100,
+  "modelCalls": [
+    {
+      "model": "Qwen/Qwen3.5-4B",
+      "usage": {
+        "available": true,
+        "inputTokens": 1241,
+        "outputTokens": 275
+      },
+      "diagnostics": {
+        "finishReasons": [
+          "tool_calls"
+        ]
+      }
+    },
+    {
+      "model": "Qwen/Qwen3.5-4B",
+      "usage": {
+        "available": true,
+        "inputTokens": 1392,
+        "outputTokens": 226
+      },
+      "diagnostics": {
+        "finishReasons": [
+          "stop"
+        ]
+      }
+    }
+  ],
+  "timedOut": false,
+  "durationMs": 74113
+}

@@ -11,6 +11,8 @@ export interface ModelUsage {
 }
 
 export interface ModelTurnResult {
+  /** Structured final response; the runtime validates it against the captured request. */
+  finalCandidate?: string
   /** Items to append to session history (assistant text and/or tool calls). */
   output: ModelItem[]
   /** Full assistant text of this turn ('' when the turn is a tool call). */
@@ -54,7 +56,10 @@ export interface CompactionResult {
 
 export interface ModelDriver {
   readonly modelId?: string
-  /** One agent-loop turn: single `ipython` tool exposed, at most one call. */
+  readonly contextWindowTokens?: number
+  readonly maxOutputTokens?: number
+  readonly toolDefinitionTokens?: number
+  /** One agent-loop turn: one Python call or a structured final candidate. */
   run(request: ModelTurnRequest): Promise<ModelTurnResult>
   /** One-shot JSON-mode call for auxiliary pipelines. */
   structured(request: StructuredCallRequest): Promise<StructuredCallResult>

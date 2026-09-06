@@ -1,0 +1,50 @@
+{
+  "caseId": "hint-only",
+  "repeat": 2,
+  "originalInputSha256": "27215f1bbd766dd539e8ebd52c331c9148cbb75ef12ed919697313eb92bb97e1",
+  "checks": [
+    {
+      "id": "committed_response",
+      "status": "pass"
+    }
+  ],
+  "failures": [
+    "Semantic review unavailable: model response did not finish normally"
+  ],
+  "body": "要解这个二次方程，你可以从因式分解开始：寻找两个数，它们的乘积是常数项6，而它们的和是一次项系数-5。",
+  "outcome": {
+    "gaps": [
+      "Goal acceptance has not been checked"
+    ],
+    "status": "partial",
+    "verification": "not_run",
+    "requestVersion": 1
+  },
+  "delivery": "observed",
+  "externalDelivery": "not_observed",
+  "executionDurationMs": 9187,
+  "modelCalls": [
+    {
+      "model": "Qwen/Qwen3.5-4B",
+      "usage": {
+        "available": true,
+        "inputTokens": 1299,
+        "outputTokens": 162
+      },
+      "diagnostics": {
+        "finishReasons": [
+          "stop"
+        ]
+      }
+    }
+  ],
+  "runtimeFailures": [],
+  "toolCalls": [],
+  "reviewFailureDiagnostics": {
+    "finishReasons": [
+      "length"
+    ]
+  },
+  "timedOut": false,
+  "durationMs": 31051
+}

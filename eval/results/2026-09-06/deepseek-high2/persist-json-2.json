@@ -1,0 +1,120 @@
+{
+  "caseId": "persist-json",
+  "repeat": 2,
+  "originalInputSha256": "7e63aa0043d0519d469de8b2bb0e7257d1eb8833b6ce4ce362bde9f29d868027",
+  "checks": [
+    {
+      "id": "committed_response",
+      "status": "pass"
+    },
+    {
+      "id": "goal_status",
+      "status": "pass"
+    },
+    {
+      "id": "artifact_json",
+      "status": "pass"
+    }
+  ],
+  "failures": [],
+  "body": "已用 Python 创建 answer.json（内容为 {\"sum\":385}），并将该文件作为附件交付到本回复中。",
+  "outcome": {
+    "status": "satisfied",
+    "verification": "not_run",
+    "requestVersion": 1
+  },
+  "assessment": {
+    "gaps": [],
+    "checks": [
+      {
+        "basis": "通过 Python 执行 json.dump 写入 answer.json，并读取验证内容为 {\"sum\":385}；attach_file 调用返回了该文件的附件条目（size 12, mime application/json）。",
+        "status": "met",
+        "requirement": "用 Python 创建 answer.json 文件，内容为 JSON 对象 {\"sum\":385}，然后将这个文件作为附件交付。不要仅把 JSON 写在聊天里。"
+      }
+    ],
+    "status": "satisfied"
+  },
+  "delivery": "observed",
+  "externalDelivery": "not_observed",
+  "executionDurationMs": 4170,
+  "modelCalls": [
+    {
+      "model": "deepseek-ai/DeepSeek-V4-Flash",
+      "usage": {
+        "available": true,
+        "inputTokens": 1949,
+        "outputTokens": 210
+      },
+      "diagnostics": {
+        "finishReasons": [
+          "tool_calls"
+        ]
+      }
+    },
+    {
+      "model": "deepseek-ai/DeepSeek-V4-Flash",
+      "usage": {
+        "available": true,
+        "inputTokens": 2178,
+        "outputTokens": 252
+      },
+      "diagnostics": {
+        "finishReasons": [
+          "stop"
+        ]
+      }
+    }
+  ],
+  "runtimeFailures": [],
+  "toolCalls": [
+    {
+      "name": "ipython",
+      "type": "function_call",
+      "callId": "01a0755d4c73c38c439e4bfce39232bc",
+      "arguments": "{\"code\": \"import json\\nwith open(\\\"answer.json\\\", \\\"w\\\", encoding=\\\"utf-8\\\") as f:\\n    json.dump({\\\"sum\\\": 385}, f)\\n# Verify content\\nwith open(\\\"answer.json\\\", \\\"r\\\", encoding=\\\"utf-8\\\") as f:\\n    print(f.read())\\nattach_file(\\\"answer.json\\\")\"}"
+    }
+  ],
+  "artifact": {
+    "mime": "application/json",
+    "path": "answer.json",
+    "size": 12,
+    "sha256": "cdb547306910a8b79cd75523bd4094b28eef60e03fcc4105fe0131be78141d94"
+  },
+  "artifactFile": "persist-json-2.artifact",
+  "resourceObservations": [
+    {
+      "resource": "artifact:answer.json",
+      "requestVersion": 1,
+      "value": {
+        "status": "observed",
+        "source": "app.readArtifact",
+        "artifact": {
+          "mime": "application/json",
+          "path": "answer.json",
+          "size": 12,
+          "sha256": "cdb547306910a8b79cd75523bd4094b28eef60e03fcc4105fe0131be78141d94"
+        },
+        "json": {
+          "sum": 385
+        },
+        "externalDelivery": "not_observed"
+      }
+    }
+  ],
+  "review": {
+    "kind": "model_review",
+    "calibration": "not_calibrated",
+    "inputSha256": "cb77050d9794679bea899e59094bdb29347bb3ad00c4ec4303296b0935562b86",
+    "model": "deepseek-ai/DeepSeek-V4-Flash",
+    "verdict": "meets_rubric",
+    "rationale": "Answer explicitly states it created answer.json with {\"sum\":385} and delivered it as an attachment, pointing to the delivered file rather than merely showing JSON in chat. Independent observation confirms artifact answer.json exists with MIME application/json, size 12, and parsed JSON {\"sum\":385}, matching the requested content. External delivery is not observed, but the artifact itself is independently verified.",
+    "usage": {
+      "available": true,
+      "inputTokens": 487,
+      "outputTokens": 351
+    },
+    "durationMs": 2852
+  },
+  "timedOut": false,
+  "durationMs": 7026
+}

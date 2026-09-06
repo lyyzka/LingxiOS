@@ -7,9 +7,10 @@
  * for atomicity.
  */
 import { createHash, randomBytes, randomUUID } from 'node:crypto'
+import { isDeepStrictEqual } from 'node:util'
 import { sessionKeyOf, type HostActionResult, type SessionRecord, type WorkCompletion, type WorkItem, WORK_LANE_PRIORITY } from '../protocol/types.js'
 import type {
-  ActionLedgerStore, EnqueueResult, EnqueueWorkInput, EventStore, HeartbeatRow,
+  ActionIntent, ActionLedgerStore, EnqueueResult, EnqueueWorkInput, EventStore, HeartbeatRow,
   LeasedWork, SaveSessionResult, SessionStore, StoredRunEvent, WorkStore, WorkStoreOptions,
 } from './stores.js'
 
@@ -18,6 +19,7 @@ export function hashToken(token: string): string {
 }
 
 interface WorkRow {
+  goalOutcome?: WorkCompletion['goalOutcome']
   id: string
   fence: number
   tenantId: string
@@ -57,6 +59,12 @@ interface SessionLease {
 }
 
 export class MemoryWorkStore implements WorkStore {
+  async hasPendingChild(parent: Omit<WorkItem, 'leaseToken'>, childId: string, requestVersion: number): Promise<boolean> {
+    const child = this.rows.get(childId)
+    return Boolean(child && ['queued', 'leased'].includes(child.status) && !child.cancelRequestedAt
+      && child.tenantId === parent.tenantId && child.sessionId === parent.sessionId && child.principalId === parent.principalId
+      && child.meta?.['parentWorkId'] === parent.id && child.meta?.['parentRequestVersion'] === requestVersion)
+  }
   private readonly rows = new Map<string, WorkRow>()
   private readonly routes = new Map<string, SessionRoute>()
   private readonly sessionLeases = new Map<string, SessionLease>()
@@ -71,7 +79,18 @@ export class MemoryWorkStore implements WorkStore {
 
   async enqueue(input: EnqueueWorkInput): Promise<EnqueueResult> {
     const id = input.id ?? randomUUID()
-    if (this.rows.has(id)) return { id, deduplicated: true }
+    const existing = this.rows.get(id)
+    if (existing) {
+      if (existing.tenantId !== input.tenantId || existing.agentId !== input.agentId
+        || existing.sessionId !== input.sessionId || existing.threadId !== input.threadId
+        || existing.principalId !== input.principalId || existing.kind !== input.kind
+        || existing.lane !== input.lane || existing.triggerRef !== input.triggerRef
+        || existing.priority !== (input.priority ?? 0)
+        || !isDeepStrictEqual(existing.meta, input.meta)) {
+        throw new Error('work identity reused with a different request or principal')
+      }
+      return { id, deduplicated: true }
+    }
     const nowIso = new Date(this.now()).toISOString()
     this.rows.set(id, {
       id,
@@ -79,7 +98,7 @@ export class MemoryWorkStore implements WorkStore {
       tenantId: input.tenantId,
       agentId: input.agentId,
       sessionId: input.sessionId,
-      ...(input.threadId ? { threadId: input.threadId } : {}),
+      ...(input.threadId !== undefined ? { threadId: input.threadId } : {}),
       kind: input.kind,
       lane: input.lane,
       triggerRef: input.triggerRef,
@@ -98,7 +117,7 @@ export class MemoryWorkStore implements WorkStore {
       steerInputs: [],
       resultText: null,
       error: null,
-      ...(input.meta ? { meta: input.meta } : {}),
+      ...(input.meta ? { meta: structuredClone(input.meta) } : {}),
     })
     return { id, deduplicated: false }
   }
@@ -120,6 +139,7 @@ export class MemoryWorkStore implements WorkStore {
     }
     const candidates = [...this.rows.values()]
       .filter((row) => {
+        if ((row.kind === 'memory_synthesis' || row.kind === 'memory_index') && row.attempts >= 3) return false
         const claimable = row.status === 'queued'
           || (row.status === 'leased' && (row.leaseExpiresAt ?? 0) <= now)
         if (!claimable || row.cancelRequestedAt !== null) return false
@@ -170,7 +190,7 @@ export class MemoryWorkStore implements WorkStore {
       tenantId: row.tenantId,
       agentId: row.agentId,
       sessionId: row.sessionId,
-      ...(row.threadId ? { threadId: row.threadId } : {}),
+      ...(row.threadId !== undefined ? { threadId: row.threadId } : {}),
       kind: row.kind,
       lane: row.lane,
       triggerRef: row.triggerRef,
@@ -232,9 +252,13 @@ export class MemoryWorkStore implements WorkStore {
   async complete(id: string, fence: number, leaseTokenHash: string, completion: WorkCompletion): Promise<boolean> {
     const row = this.validLease(id, fence, leaseTokenHash)
     if (!row) return false
+    if (completion.status === 'completed' && row.cancelRequestedAt !== null) return false
+    if (completion.status === 'completed' && typeof row.meta?.['text'] === 'string' && !completion.goalOutcome) return false
+    if (completion.status === 'completed' && completion.goalOutcome && completion.goalOutcome.requestVersion !== row.steerInputs.length + 1) return false
     row.status = completion.status
     row.resultText = completion.resultText ?? null
     row.error = completion.error ?? null
+    if (completion.goalOutcome) row.goalOutcome = structuredClone(completion.goalOutcome)
     row.leaseTokenHash = null
     row.leaseExpiresAt = null
     this.releaseSessionLease(row, fence)
@@ -272,12 +296,13 @@ export class MemoryWorkStore implements WorkStore {
   }
 
   /** Test helper: inspect a row's durable state. */
-  inspect(id: string): { status: string; fence: number; attempts: number; preemptions: number; resultText: string | null; error: string | null } | null {
+  inspect(id: string): { status: string; fence: number; attempts: number; preemptions: number; resultText: string | null; error: string | null; goalOutcome?: WorkCompletion['goalOutcome'] } | null {
     const row = this.rows.get(id)
     if (!row) return null
     return {
       status: row.status, fence: row.fence, attempts: row.attempts,
       preemptions: row.preemptions, resultText: row.resultText, error: row.error,
+      ...(row.goalOutcome ? { goalOutcome: structuredClone(row.goalOutcome) } : {}),
     }
   }
 
@@ -343,7 +368,47 @@ export class MemoryEventStore implements EventStore {
 }
 
 export class MemoryActionLedger implements ActionLedgerStore {
+  async hasWait(workId: string, requestVersion: number, wait: { approvalId: string } | { question: string }): Promise<boolean> {
+    for (const [key, intent] of this.intentDetails) {
+      if (intent.workId !== workId || intent.requestVersion !== requestVersion) continue
+      const result = this.results.get(key)
+      if (!result || result.executionState === 'unknown') continue
+      if ('approvalId' in wait ? result.approval?.status === 'PENDING' && result.approval.id === wait.approvalId
+        : intent.action.action === 'task.ask' && result.ok && result.directive?.type === 'defer'
+          && result.directive.reason === 'user' && result.directive.data?.['question'] === wait.question) return true
+    }
+    return false
+  }
+  async unsettled(workId: string) {
+    const pending: Array<{ actionKey: string; action: string; state: 'unknown' | 'awaiting_approval' }> = []
+    for (const [actionKey, intent] of this.intentDetails) {
+      if (intent.workId !== workId || intent.action.action.startsWith('task.')) continue
+      const result = this.results.get(actionKey)
+      const state = result?.approval?.status === 'PENDING' ? 'awaiting_approval' : !result || result.executionState === 'unknown' ? 'unknown' : undefined
+      if (state) pending.push({ actionKey, action: intent.action.action, state })
+      if (pending.length === 65) break
+    }
+    return pending
+  }
   private readonly results = new Map<string, HostActionResult>()
+  private readonly intents = new Map<string, string>()
+  private readonly intentDetails = new Map<string, ActionIntent>()
+
+  async reserve(idempotencyKey: string, fingerprint: string, intent: ActionIntent): Promise<'started' | 'existing'> {
+    if (!intent || intent.action?.idempotencyKey !== idempotencyKey) throw new Error('action intent is required and must match its key')
+    const existing = this.intents.get(idempotencyKey)
+    if (existing !== undefined) {
+      if (existing !== fingerprint) throw new Error('action identity reused with different parameters or authorization')
+      return 'existing'
+    }
+    this.intents.set(idempotencyKey, fingerprint)
+    this.intentDetails.set(idempotencyKey, structuredClone(intent))
+    return 'started'
+  }
+
+  async findIntent(idempotencyKey: string): Promise<ActionIntent | null> {
+    return structuredClone(this.intentDetails.get(idempotencyKey) ?? null)
+  }
 
   async find(idempotencyKey: string): Promise<HostActionResult | null> {
     const stored = this.results.get(idempotencyKey)
@@ -351,6 +416,7 @@ export class MemoryActionLedger implements ActionLedgerStore {
   }
 
   async record(idempotencyKey: string, result: HostActionResult): Promise<HostActionResult> {
+    if (!this.intents.has(idempotencyKey)) throw new Error('action intent is required before recording a receipt')
     const existing = this.results.get(idempotencyKey)
     if (existing) return structuredClone(existing)
     this.results.set(idempotencyKey, structuredClone(result))

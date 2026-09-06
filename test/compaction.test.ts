@@ -31,7 +31,7 @@ function fakeDriver(overrides: Partial<ModelDriver> = {}): ModelDriver {
 
 function session(history: ModelItem[], summary?: string): SessionRecord {
   return {
-    key: 't1:a1:s1:-', tenantId: 't1', agentId: 'a1', sessionId: 's1',
+    key: '[\"t1\",\"a1\",\"s1\",null]', tenantId: 't1', agentId: 'a1', sessionId: 's1',
     history, appliedWorkIds: [], revision: 1, compactionEpoch: 0,
     ...(summary !== undefined ? { summary } : {}),
   }
@@ -45,10 +45,10 @@ function longHistory(count: number): ModelItem[] {
 }
 
 describe('estimateTokens', () => {
-  it('estimates roughly chars / 4', () => {
+  it('uses a conservative byte bound', () => {
     const items: ModelItem[] = [{ role: 'user', content: 'a'.repeat(400) }]
     const estimated = estimateTokens(items)
-    const expected = Math.ceil(JSON.stringify(items).length / 4)
+    const expected = new TextEncoder().encode(JSON.stringify(items)).length
     assert.equal(estimated, expected)
   })
 })
@@ -63,6 +63,19 @@ describe('summaryItem', () => {
 })
 
 describe('compactIfNeeded', () => {
+  it('keeps tool pairs together and folds a prior summary only once', async () => {
+    const history: ModelItem[] = [summaryItem('old facts'), ...longHistory(5),
+      { type: 'function_call', callId: 'c1', name: 'ipython', arguments: '{}' },
+      { type: 'function_call_output', callId: 'c1', output: 'ok' },
+      { role: 'assistant', content: 'done' }]
+    const s = session(history, 'old facts')
+    const driver = fakeDriver({ compact: async (request) => {
+      assert.equal(request.items.filter((item) => 'role' in item && item.content.includes('old facts')).length, 1)
+      return { value: 'new summary', model: 'test', usage: { available: true, inputTokens: 1, outputTokens: 1 } }
+    } })
+    await compactIfNeeded(s, '', driver, { ...DEFAULT_COMPACTION, contextWindowTokens: 100, keepTailItems: 2 })
+    assert.deepEqual(s.history, [summaryItem('new summary'), ...history.slice(-3)])
+  })
   const smallOptions = {
     ...DEFAULT_COMPACTION,
     contextWindowTokens: 1_000,

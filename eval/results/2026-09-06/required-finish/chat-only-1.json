@@ -1,0 +1,76 @@
+{
+  "caseId": "chat-only",
+  "repeat": 1,
+  "originalInputSha256": "0f4529b9ceeb8647bca2cc31c7229093314ae4d22f402298b56b9dcb5f707f57",
+  "checks": [
+    {
+      "id": "committed_response",
+      "status": "not_observed"
+    },
+    {
+      "id": "goal_status",
+      "status": "fail"
+    },
+    {
+      "id": "answer_value",
+      "status": "not_observed"
+    },
+    {
+      "id": "no_execution",
+      "status": "fail"
+    },
+    {
+      "id": "no_artifacts",
+      "status": "not_observed"
+    }
+  ],
+  "failures": [],
+  "body": null,
+  "outcome": {
+    "gaps": [
+      "Execution was cancelled"
+    ],
+    "status": "blocked",
+    "verification": "inconclusive",
+    "requestVersion": 1
+  },
+  "assessment": null,
+  "delivery": "not_observed",
+  "externalDelivery": null,
+  "executionDurationMs": 120439,
+  "modelCalls": [
+    {
+      "model": "Qwen/Qwen3.5-4B",
+      "usage": {
+        "available": true,
+        "inputTokens": 1823,
+        "outputTokens": 275
+      },
+      "diagnostics": {
+        "finishReasons": [
+          "tool_calls"
+        ]
+      }
+    }
+  ],
+  "runtimeFailures": [
+    {
+      "kind": "model.failed",
+      "error": "model stream did not finish normally"
+    },
+    {
+      "kind": "model.failed",
+      "error": "run cancelled (user)"
+    }
+  ],
+  "toolCalls": [
+    {
+      "name": "ipython",
+      "type": "function_call",
+      "callId": "chatcmpl-tool-ad5012bcc6d46615",
+      "arguments": "{\"code\": \"sum(i**2 for i in range(1, 11))\"}"
+    }
+  ],
+  "timedOut": true,
+  "durationMs": 120444
+}

@@ -1,0 +1,60 @@
+{
+  "caseId": "persist-json",
+  "repeat": 1,
+  "originalInputSha256": "7e63aa0043d0519d469de8b2bb0e7257d1eb8833b6ce4ce362bde9f29d868027",
+  "checks": [
+    {
+      "id": "committed_response",
+      "status": "not_observed"
+    },
+    {
+      "id": "goal_status",
+      "status": "fail"
+    },
+    {
+      "id": "artifact_json",
+      "status": "not_observed"
+    }
+  ],
+  "failures": [],
+  "body": null,
+  "outcome": {
+    "gaps": [
+      "Execution failed before verified delivery"
+    ],
+    "status": "blocked",
+    "verification": "inconclusive",
+    "requestVersion": 1
+  },
+  "assessment": null,
+  "delivery": "not_observed",
+  "externalDelivery": null,
+  "executionDurationMs": 118592,
+  "modelCalls": [],
+  "runtimeFailures": [
+    {
+      "kind": "model.failed",
+      "error": "model stream did not finish normally"
+    },
+    {
+      "kind": "model.failed",
+      "error": "model stream did not finish normally"
+    },
+    {
+      "kind": "run.failed",
+      "error": "model stream did not finish normally"
+    }
+  ],
+  "toolCalls": [],
+  "resourceObservations": [
+    {
+      "resource": "artifact:answer.json",
+      "requestVersion": 1,
+      "value": {
+        "status": "not_observed"
+      }
+    }
+  ],
+  "timedOut": false,
+  "durationMs": 118598
+}

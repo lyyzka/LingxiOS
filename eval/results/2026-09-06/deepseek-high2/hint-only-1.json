@@ -1,0 +1,69 @@
+{
+  "caseId": "hint-only",
+  "repeat": 1,
+  "originalInputSha256": "27215f1bbd766dd539e8ebd52c331c9148cbb75ef12ed919697313eb92bb97e1",
+  "checks": [
+    {
+      "id": "committed_response",
+      "status": "pass"
+    },
+    {
+      "id": "goal_status",
+      "status": "pass"
+    }
+  ],
+  "failures": [],
+  "body": "试着把二次三项式分解成两个一次因式的乘积：找两个数，它们的乘积等于常数项 6，和等于一次项系数 -5。",
+  "outcome": {
+    "status": "satisfied",
+    "verification": "not_run",
+    "requestVersion": 1
+  },
+  "assessment": {
+    "gaps": [],
+    "checks": [
+      {
+        "basis": "给出了唯一一条因式分解提示，未给出根或完整解法。",
+        "status": "met",
+        "requirement": "我在解方程 x² - 5x + 6 = 0。只给一个下一步提示，不要给出根或完整解。"
+      }
+    ],
+    "status": "satisfied"
+  },
+  "delivery": "observed",
+  "externalDelivery": "not_observed",
+  "executionDurationMs": 1997,
+  "modelCalls": [
+    {
+      "model": "deepseek-ai/DeepSeek-V4-Flash",
+      "usage": {
+        "available": true,
+        "inputTokens": 1935,
+        "outputTokens": 191
+      },
+      "diagnostics": {
+        "finishReasons": [
+          "stop"
+        ]
+      }
+    }
+  ],
+  "runtimeFailures": [],
+  "toolCalls": [],
+  "review": {
+    "kind": "model_review",
+    "calibration": "not_calibrated",
+    "inputSha256": "57548e29fa6e9f2f01af5be016e2a59eaa502224c7d6efc71f4225dfe18f0e1e",
+    "model": "deepseek-ai/DeepSeek-V4-Flash",
+    "verdict": "meets_rubric",
+    "rationale": "回答只给了一个下一步提示：让用户找两个数，使乘积等于常数项 6、和等于一次项系数 -5。这对应 x²-5x+6 的因式分解思路，数学上正确且有用；同时没有列出两个根，也没有展示完整因式分解或完整解答，符合题目的限制。虽然 rubic 中允许的是“和为 5、积为 6”的数对，但那是等价地指向最终根的正数形式，不是唯一可接受的表述。",
+    "usage": {
+      "available": true,
+      "inputTokens": 393,
+      "outputTokens": 1385
+    },
+    "durationMs": 9882
+  },
+  "timedOut": false,
+  "durationMs": 11881
+}

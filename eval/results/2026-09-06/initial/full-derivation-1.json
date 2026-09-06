@@ -1,0 +1,54 @@
+{
+  "caseId": "full-derivation",
+  "repeat": 1,
+  "originalInputSha256": "20824b22f385871fa3104a4e09520b31872c07744e440c2286ad03afa3621983",
+  "checks": [
+    {
+      "id": "committed_response",
+      "status": "not_observed"
+    }
+  ],
+  "failures": [],
+  "body": null,
+  "outcome": {
+    "gaps": [
+      "Execution failed before verified delivery"
+    ],
+    "status": "blocked",
+    "verification": "inconclusive",
+    "requestVersion": 1
+  },
+  "delivery": "not_observed",
+  "externalDelivery": null,
+  "executionDurationMs": 35010,
+  "modelCalls": [
+    {
+      "model": "Qwen/Qwen3.5-4B",
+      "usage": {
+        "available": true,
+        "inputTokens": 1245,
+        "outputTokens": 1252
+      },
+      "diagnostics": {
+        "finishReasons": [
+          "tool_calls"
+        ]
+      }
+    },
+    {
+      "model": "Qwen/Qwen3.5-4B",
+      "usage": {
+        "available": true,
+        "inputTokens": 2380,
+        "outputTokens": 1135
+      },
+      "diagnostics": {
+        "finishReasons": [
+          "tool_calls"
+        ]
+      }
+    }
+  ],
+  "timedOut": false,
+  "durationMs": 35013
+}

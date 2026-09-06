@@ -1,0 +1,69 @@
+{
+  "caseId": "chat-only",
+  "repeat": 1,
+  "originalInputSha256": "0f4529b9ceeb8647bca2cc31c7229093314ae4d22f402298b56b9dcb5f707f57",
+  "checks": [
+    {
+      "id": "committed_response",
+      "status": "pass"
+    },
+    {
+      "id": "answer_value",
+      "status": "pass"
+    },
+    {
+      "id": "no_execution",
+      "status": "pass"
+    },
+    {
+      "id": "no_artifacts",
+      "status": "pass"
+    }
+  ],
+  "failures": [],
+  "body": "385",
+  "outcome": {
+    "gaps": [
+      "Goal acceptance has not been checked"
+    ],
+    "status": "partial",
+    "verification": "not_run",
+    "requestVersion": 1
+  },
+  "delivery": "observed",
+  "externalDelivery": "not_observed",
+  "executionDurationMs": 1263,
+  "modelCalls": [
+    {
+      "model": "Qwen/Qwen3.5-4B",
+      "usage": {
+        "available": true,
+        "inputTokens": 1297,
+        "outputTokens": 145
+      },
+      "diagnostics": {
+        "finishReasons": [
+          "stop"
+        ]
+      }
+    }
+  ],
+  "runtimeFailures": [],
+  "toolCalls": [],
+  "review": {
+    "kind": "model_review",
+    "calibration": "not_calibrated",
+    "inputSha256": "4b1d7d1818d1b7532b0ad935c8d194bd869e91de6c410dff3f0da36adb84c0bd",
+    "model": "Qwen/Qwen3.5-4B",
+    "verdict": "meets_rubric",
+    "rationale": "The answer '385' is mathematically correct for the sum of squares of integers from 1 to 10 ($\\sum_{i=1}^{10} i^2 = 385$). It strictly adheres to the formatting constraints by containing only the decimal integer without any explanatory text, markdown, or code execution artifacts, matching the rubric requirements exactly.",
+    "usage": {
+      "available": true,
+      "inputTokens": 193,
+      "outputTokens": 1593
+    },
+    "durationMs": 27353
+  },
+  "timedOut": false,
+  "durationMs": 28618
+}

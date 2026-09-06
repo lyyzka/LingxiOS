@@ -1,0 +1,15 @@
+*
+!Dockerfile
+!package.json
+!package-lock.json
+!tsconfig.json
+!scripts/
+!scripts/build.mjs
+!src/
+!src/**
+!test/
+!test/**
+!db/
+!db/schema.sql
+!kernel/
+!kernel/runner.py

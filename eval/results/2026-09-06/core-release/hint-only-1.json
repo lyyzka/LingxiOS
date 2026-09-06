@@ -1,0 +1,87 @@
+{
+  "caseId": "hint-only",
+  "repeat": 1,
+  "originalInputSha256": "27215f1bbd766dd539e8ebd52c331c9148cbb75ef12ed919697313eb92bb97e1",
+  "checks": [
+    {
+      "id": "committed_response",
+      "status": "pass"
+    },
+    {
+      "id": "goal_status",
+      "status": "pass"
+    }
+  ],
+  "failures": [],
+  "body": "试试把方程左边分解成两个一次因式的乘积：找两个数，使它们的乘积是 6，和是 5。",
+  "outcome": {
+    "status": "satisfied",
+    "verification": "not_run",
+    "requestVersion": 1
+  },
+  "assessment": {
+    "gaps": [],
+    "checks": [
+      {
+        "basis": "只给出了因式分解的引导提示，未给出根或完整解法。",
+        "status": "met",
+        "requirement": "只给一个下一步提示，不要给出根或完整解。"
+      }
+    ],
+    "status": "satisfied"
+  },
+  "delivery": "observed",
+  "externalDelivery": "not_observed",
+  "executionDurationMs": 5171,
+  "modelCalls": [
+    {
+      "model": "deepseek-ai/DeepSeek-V4-Flash",
+      "usage": {
+        "available": true,
+        "inputTokens": 1935,
+        "outputTokens": 268
+      },
+      "diagnostics": {
+        "finishReasons": [
+          "stop"
+        ]
+      }
+    },
+    {
+      "model": "deepseek-ai/DeepSeek-V4-Flash",
+      "usage": {
+        "available": true,
+        "inputTokens": 2098,
+        "outputTokens": 483
+      },
+      "diagnostics": {
+        "finishReasons": [
+          "stop"
+        ]
+      }
+    }
+  ],
+  "runtimeFailures": [
+    {
+      "kind": "response.withheld",
+      "error": "Unexpected token '试', \"试试把方程左边分解成\"... is not valid JSON"
+    }
+  ],
+  "toolCalls": [],
+  "review": {
+    "kind": "model_review",
+    "calibration": "not_calibrated",
+    "inputSha256": "5801f0bb9e5bfe406ee5f9b7509a9f9a53a3a752abf8c6488c46ff7bf24e15e5",
+    "model": "deepseek-ai/DeepSeek-V4-Flash",
+    "verdict": "meets_rubric",
+    "rationale": "答案只给了一个下一步提示：将左边分解为两个一次因式的乘积，并提示寻找和为 5、积为 6 的两个数。该提示数学正确，且没有列出根，也没有展示完整的因式分解或完整解答，符合用户要求与评分标准。",
+    "usage": {
+      "available": true,
+      "inputTokens": 388,
+      "outputTokens": 441
+    },
+    "durationMs": 3018
+  },
+  "timedOut": false,
+  "durationMs": 8192
+}

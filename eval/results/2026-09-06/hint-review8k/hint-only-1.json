@@ -1,0 +1,45 @@
+{
+  "caseId": "hint-only",
+  "repeat": 1,
+  "originalInputSha256": "27215f1bbd766dd539e8ebd52c331c9148cbb75ef12ed919697313eb92bb97e1",
+  "checks": [
+    {
+      "id": "committed_response",
+      "status": "pass"
+    }
+  ],
+  "failures": [
+    "Semantic review unavailable: The operation was aborted due to timeout"
+  ],
+  "body": "按题目当前进度，接下来的步骤是：\n\n**使用因式分解法：寻找两个数，它们的乘积是常数项 6，相加一次项系数 -5**",
+  "outcome": {
+    "gaps": [
+      "Goal acceptance has not been checked"
+    ],
+    "status": "partial",
+    "verification": "not_run",
+    "requestVersion": 1
+  },
+  "delivery": "observed",
+  "externalDelivery": "not_observed",
+  "executionDurationMs": 5020,
+  "modelCalls": [
+    {
+      "model": "Qwen/Qwen3.5-4B",
+      "usage": {
+        "available": true,
+        "inputTokens": 1299,
+        "outputTokens": 238
+      },
+      "diagnostics": {
+        "finishReasons": [
+          "stop"
+        ]
+      }
+    }
+  ],
+  "runtimeFailures": [],
+  "toolCalls": [],
+  "timedOut": false,
+  "durationMs": 65033
+}

@@ -14,6 +14,29 @@ function input(overrides: Partial<EnqueueWorkInput> = {}): EnqueueWorkInput {
 }
 
 describe('MemoryWorkStore lease state machine', () => {
+  it('requires live delegation owned by the current parent request', async () => {
+    const store = new MemoryWorkStore()
+    await store.enqueue(input({ id: 'parent', principalId: 'human' }))
+    const parent = (await store.claim('worker'))!
+    await store.enqueue(input({ id: 'child', agentId: 'child-agent', principalId: 'human',
+      meta: { parentWorkId: parent.id, parentRequestVersion: 1 } }))
+    assert.equal(await store.hasPendingChild(parent, 'child', 1), true)
+    assert.equal(await store.hasPendingChild(parent, 'child', 2), false)
+    assert.equal(await store.hasPendingChild({ ...parent, tenantId: 'other' }, 'child', 1), false)
+    await store.requestCancel('child')
+    assert.equal(await store.hasPendingChild(parent, 'child', 1), false)
+  })
+  it('rejects a completion outcome superseded by steering at the store boundary', async () => {
+    const store = new MemoryWorkStore()
+    await store.enqueue(input({ id: 'revised', meta: { text: 'Original' } }))
+    const work = (await store.claim('worker'))!
+    const token = hashToken(work.leaseToken)
+    assert.equal(await store.complete(work.id, work.fence, token, { status: 'completed' }), false)
+    await store.addSteer(work.id, 'Changed requirement')
+    assert.equal(await store.complete(work.id, work.fence, token, { status: 'completed', goalOutcome: { status: 'partial', verification: 'not_run', requestVersion: 1 } }), false)
+    assert.ok(await store.getLeased(work.id, work.fence, token))
+    assert.equal(await store.complete(work.id, work.fence, token, { status: 'completed', goalOutcome: { status: 'partial', verification: 'not_run', requestVersion: 2 } }), true)
+  })
   it('claims by lane priority, then priority, then age', async () => {
     const store = new MemoryWorkStore()
     await store.enqueue(input({ id: 'bg', lane: 'background', sessionId: 'sa' }))
@@ -125,7 +148,7 @@ describe('MemoryWorkStore lease state machine', () => {
 describe('MemorySessionStore optimistic concurrency', () => {
   function session(revision: number): SessionRecord {
     return {
-      key: 't1:a1:s1:-', tenantId: 't1', agentId: 'a1', sessionId: 's1',
+      key: '[\"t1\",\"a1\",\"s1\",null]', tenantId: 't1', agentId: 'a1', sessionId: 's1',
       history: [{ role: 'user', content: 'hi' }], appliedWorkIds: [], revision, compactionEpoch: 0,
     }
   }
@@ -136,7 +159,7 @@ describe('MemorySessionStore optimistic concurrency', () => {
     assert.deepEqual(created, { ok: true, revision: 1 })
     assert.deepEqual(await store.save(session(0)), { ok: false, conflict: true })
     assert.deepEqual(await store.save(session(1)), { ok: true, revision: 2 })
-    const loaded = await store.get('t1:a1:s1:-')
+    const loaded = await store.get('[\"t1\",\"a1\",\"s1\",null]')
     assert.equal(loaded?.revision, 2)
   })
 })
@@ -160,6 +183,8 @@ describe('MemoryActionLedger', () => {
   it('returns the first recorded result for duplicate keys', async () => {
     const ledger = new MemoryActionLedger()
     assert.equal(await ledger.find('k1'), null)
+    await ledger.reserve('k1', 'fingerprint', { workId: 'w', tenantId: 't', principalId: null, agentId: 'a', sessionId: 's', threadId: null, requestVersion: 1,
+      action: { runId: 'w', cellId: 'c', callIndex: 0, action: 'files.save', args: {}, idempotencyKey: 'k1' } })
     const first = await ledger.record('k1', { ok: true, value: 1 })
     assert.deepEqual(first, { ok: true, value: 1 })
     const second = await ledger.record('k1', { ok: true, value: 2 })

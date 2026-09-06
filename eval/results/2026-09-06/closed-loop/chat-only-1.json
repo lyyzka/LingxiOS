@@ -1,0 +1,86 @@
+{
+  "caseId": "chat-only",
+  "repeat": 1,
+  "originalInputSha256": "0f4529b9ceeb8647bca2cc31c7229093314ae4d22f402298b56b9dcb5f707f57",
+  "checks": [
+    {
+      "id": "committed_response",
+      "status": "not_observed"
+    },
+    {
+      "id": "goal_status",
+      "status": "fail"
+    },
+    {
+      "id": "answer_value",
+      "status": "not_observed"
+    },
+    {
+      "id": "no_execution",
+      "status": "not_observed"
+    },
+    {
+      "id": "no_artifacts",
+      "status": "not_observed"
+    }
+  ],
+  "failures": [],
+  "body": null,
+  "outcome": {
+    "gaps": [
+      "Execution failed before verified delivery"
+    ],
+    "status": "blocked",
+    "verification": "inconclusive",
+    "requestVersion": 1
+  },
+  "assessment": null,
+  "delivery": "not_observed",
+  "externalDelivery": null,
+  "executionDurationMs": 12125,
+  "modelCalls": [
+    {
+      "model": "Qwen/Qwen3.5-4B",
+      "usage": {
+        "available": true,
+        "inputTokens": 1622,
+        "outputTokens": 450
+      },
+      "diagnostics": {
+        "finishReasons": [
+          "stop"
+        ]
+      }
+    },
+    {
+      "model": "Qwen/Qwen3.5-4B",
+      "usage": {
+        "available": true,
+        "inputTokens": 1657,
+        "outputTokens": 269
+      },
+      "diagnostics": {
+        "finishReasons": [
+          "stop"
+        ]
+      }
+    }
+  ],
+  "runtimeFailures": [
+    {
+      "kind": "response.withheld",
+      "error": "invalid final candidate"
+    },
+    {
+      "kind": "response.withheld",
+      "error": "invalid final candidate"
+    },
+    {
+      "kind": "run.failed",
+      "error": "tool protocol correction exhausted: Correct the final JSON object against the original request. invalid final candidate"
+    }
+  ],
+  "toolCalls": [],
+  "timedOut": false,
+  "durationMs": 12128
+}

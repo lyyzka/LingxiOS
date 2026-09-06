@@ -1,0 +1,74 @@
+{
+  "caseId": "hint-only",
+  "repeat": 1,
+  "originalInputSha256": "27215f1bbd766dd539e8ebd52c331c9148cbb75ef12ed919697313eb92bb97e1",
+  "checks": [
+    {
+      "id": "committed_response",
+      "status": "pass"
+    },
+    {
+      "id": "goal_status",
+      "status": "pass"
+    }
+  ],
+  "failures": [],
+  "body": "尝试将二次三项式因式分解：找两个数，它们的乘积等于常数项 6，且它们的和等于一次项系数 -5。",
+  "outcome": {
+    "status": "satisfied",
+    "verification": "not_run",
+    "requestVersion": 1
+  },
+  "assessment": {
+    "gaps": [],
+    "checks": [
+      {
+        "basis": "只提供了一个因式分解的提示，没有多个步骤。",
+        "status": "met",
+        "requirement": "只给一个下一步提示"
+      },
+      {
+        "basis": "没有透露方程的根（x=2 或 x=3），也没有给出完整解题过程。",
+        "status": "met",
+        "requirement": "不要给出根或完整解"
+      }
+    ],
+    "status": "satisfied"
+  },
+  "delivery": "observed",
+  "externalDelivery": "not_observed",
+  "executionDurationMs": 5134,
+  "modelCalls": [
+    {
+      "model": "Qwen/Qwen3.5-397B-A17B",
+      "usage": {
+        "available": true,
+        "inputTokens": 1708,
+        "outputTokens": 352
+      },
+      "diagnostics": {
+        "finishReasons": [
+          "stop"
+        ]
+      }
+    }
+  ],
+  "runtimeFailures": [],
+  "toolCalls": [],
+  "review": {
+    "kind": "model_review",
+    "calibration": "not_calibrated",
+    "inputSha256": "c4d23c149829a30f828f2520b31734cdebd5fed465888f07e3c741db5cdab524",
+    "model": "Qwen/Qwen3.5-397B-A17B",
+    "verdict": "meets_rubric",
+    "rationale": "The answer provides exactly one next-step hint (factoring method) without revealing the roots (2 and 3) or the complete factorization. The mathematical instruction (product 6, sum -5) is correct for the given equation and adheres to the rubric's core constraints of not providing the solution, even though the sum sign differs slightly from the rubric's example (which is permissive rather than restrictive).",
+    "usage": {
+      "available": true,
+      "inputTokens": 321,
+      "outputTokens": 2960
+    },
+    "durationMs": 27299
+  },
+  "timedOut": false,
+  "durationMs": 32437
+}

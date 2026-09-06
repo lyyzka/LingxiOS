@@ -9,6 +9,7 @@
  */
 
 export type CorrectionCategory =
+  | 'content_acceptance' // candidate omitted a requirement from the original request
   | 'tool_protocol' // multiple calls, malformed arguments, empty turn
   | 'kernel_error' // cell raised; one retry to fix the code
   | 'response_protocol' // final text violated the visible-response policy

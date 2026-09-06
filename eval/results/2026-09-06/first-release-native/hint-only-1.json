@@ -1,0 +1,45 @@
+{
+  "caseId": "hint-only",
+  "repeat": 1,
+  "originalInputSha256": "27215f1bbd766dd539e8ebd52c331c9148cbb75ef12ed919697313eb92bb97e1",
+  "checks": [
+    {
+      "id": "committed_response",
+      "status": "pass"
+    }
+  ],
+  "failures": [
+    "Semantic review unavailable: The operation was aborted due to timeout"
+  ],
+  "body": "对于方程 x² - 5x + 6 = 0，下一步是：尝试将该方程**因式分解**，即寻找两个数，它们的乘积等于6，而它们的和等于-5。需要写成 (x - a)(x - b) = 0 的形式。",
+  "outcome": {
+    "gaps": [
+      "Goal acceptance has not been checked"
+    ],
+    "status": "partial",
+    "verification": "not_run",
+    "requestVersion": 1
+  },
+  "delivery": "observed",
+  "externalDelivery": "not_observed",
+  "executionDurationMs": 1629,
+  "modelCalls": [
+    {
+      "model": "Qwen/Qwen3.5-4B",
+      "usage": {
+        "available": true,
+        "inputTokens": 1299,
+        "outputTokens": 231
+      },
+      "diagnostics": {
+        "finishReasons": [
+          "stop"
+        ]
+      }
+    }
+  ],
+  "runtimeFailures": [],
+  "toolCalls": [],
+  "timedOut": false,
+  "durationMs": 61644
+}

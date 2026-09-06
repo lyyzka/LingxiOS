@@ -23,7 +23,7 @@ import {
 } from '../errors.js'
 import { nullLogger, type Logger } from '../logging.js'
 import type { KernelToManager, ManagerToKernel } from '../protocol/kernel-wire.js'
-import { sessionKeyOf, type CapabilityGrant, type HostAction, type HostActionResult, type KernelExecution, type WorkItem } from '../protocol/types.js'
+import { sessionKeyOf, actionKeyOf, type CapabilityGrant, type HostAction, type HostActionResult, type KernelExecution, type WorkItem } from '../protocol/types.js'
 
 export interface KernelHostBridge {
   execute(work: WorkItem, action: HostAction): Promise<HostActionResult>
@@ -209,7 +209,7 @@ class PersistentKernel {
       callIndex: message.callIndex,
       action: message.action,
       args: message.args ?? {},
-      idempotencyKey: `${pending.runId}:${pending.cellId}:${message.callIndex}`,
+      idempotencyKey: actionKeyOf({ runId: pending.runId, cellId: pending.cellId, callIndex: message.callIndex }),
     }
     try {
       await pending.options?.onHostAction?.({ stage: 'started', action })
@@ -316,6 +316,13 @@ function positiveInteger(value: string | number, name: string): number {
   return parsed
 }
 
+export function kernelHome(homesRoot: string, work: Pick<WorkItem, 'tenantId' | 'agentId' | 'sessionId' | 'threadId' | 'homeEpoch'>): string {
+  if (!Number.isSafeInteger(work.homeEpoch) || work.homeEpoch < 1) throw new Error('invalid kernel home epoch')
+  const segment = (value: string) => createHash('sha256').update(value).digest('hex').slice(0, 24)
+  return resolve(homesRoot, segment(work.tenantId), segment(work.agentId),
+    segment(JSON.stringify([work.sessionId, work.threadId ?? null])), `epoch-${work.homeEpoch}`)
+}
+
 export class KernelManager implements KernelExecutor {
   private readonly kernels = new Map<string, PersistentKernel>()
   private readonly options: Required<Omit<KernelManagerOptions, 'logger'>>
@@ -324,18 +331,18 @@ export class KernelManager implements KernelExecutor {
   private readonly capacityWaiters = new Set<() => void>()
   private closed = false
 
-  constructor(private readonly bridge: KernelHostBridge, options: KernelManagerOptions = {}) {
+  constructor(private readonly bridge: KernelHostBridge, options: KernelManagerOptions = {}, env: NodeJS.ProcessEnv = process.env) {
     const localPython = resolve(process.platform === 'win32' ? '.venv/Scripts/python.exe' : '.venv/bin/python')
     this.logger = options.logger ?? nullLogger
     this.options = {
-      pythonCommand: options.pythonCommand ?? process.env['AGENT_OS_PYTHON']
+      pythonCommand: options.pythonCommand ?? env['AGENT_OS_PYTHON']
         ?? (existsSync(localPython) ? localPython : process.platform === 'win32' ? 'python' : 'python3'),
-      runnerPath: resolve(options.runnerPath ?? process.env['AGENT_OS_KERNEL_RUNNER'] ?? fileURLToPath(new URL('../../../kernel/runner.py', import.meta.url))),
-      homesRoot: resolve(options.homesRoot ?? process.env['AGENT_OS_HOMES_ROOT'] ?? '.agent-os/homes'),
-      idleMs: options.idleMs ?? positiveInteger(process.env['AGENT_OS_KERNEL_IDLE_MS'] ?? 90 * 60_000, 'AGENT_OS_KERNEL_IDLE_MS'),
-      maxKernels: options.maxKernels === undefined && process.env['AGENT_OS_MAX_KERNELS'] === undefined
+      runnerPath: resolve(options.runnerPath ?? env['AGENT_OS_KERNEL_RUNNER'] ?? fileURLToPath(new URL('../../../kernel/runner.py', import.meta.url))),
+      homesRoot: resolve(options.homesRoot ?? env['AGENT_OS_HOMES_ROOT'] ?? '.agent-os/homes'),
+      idleMs: options.idleMs ?? positiveInteger(env['AGENT_OS_KERNEL_IDLE_MS'] ?? 90 * 60_000, 'AGENT_OS_KERNEL_IDLE_MS'),
+      maxKernels: options.maxKernels === undefined && env['AGENT_OS_MAX_KERNELS'] === undefined
         ? Number.POSITIVE_INFINITY
-        : positiveInteger(options.maxKernels ?? process.env['AGENT_OS_MAX_KERNELS']!, 'AGENT_OS_MAX_KERNELS'),
+        : positiveInteger(options.maxKernels ?? env['AGENT_OS_MAX_KERNELS']!, 'AGENT_OS_MAX_KERNELS'),
       executionTimeoutMs: options.executionTimeoutMs ?? 120_000,
       maxOutputChars: options.maxOutputChars ?? 8_000,
       allowNetwork: options.allowNetwork ?? false,
@@ -349,16 +356,7 @@ export class KernelManager implements KernelExecutor {
   }
 
   /** Identifiers are data, never path components: hash every segment. */
-  private homeOf(work: WorkItem): string {
-    const segment = (value: string) => createHash('sha256').update(value).digest('hex').slice(0, 24)
-    return resolve(
-      this.options.homesRoot,
-      segment(work.tenantId),
-      segment(work.agentId),
-      segment(`${work.sessionId}:${work.threadId ?? '-'}`),
-      `epoch-${work.homeEpoch}`,
-    )
-  }
+  private homeOf(work: WorkItem): string { return kernelHome(this.options.homesRoot, work) }
 
   private evictLeastRecentlyUsedIdle(): boolean {
     let candidate: [string, PersistentKernel] | undefined

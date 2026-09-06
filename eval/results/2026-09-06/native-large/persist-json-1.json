@@ -1,0 +1,99 @@
+{
+  "caseId": "persist-json",
+  "repeat": 1,
+  "originalInputSha256": "7e63aa0043d0519d469de8b2bb0e7257d1eb8833b6ce4ce362bde9f29d868027",
+  "checks": [
+    {
+      "id": "committed_response",
+      "status": "pass"
+    },
+    {
+      "id": "goal_status",
+      "status": "fail"
+    },
+    {
+      "id": "artifact_json",
+      "status": "not_observed"
+    }
+  ],
+  "failures": [],
+  "body": "Creating answer.json file with Python and then attaching it.",
+  "outcome": {
+    "gaps": [
+      "等待文件创建并验证",
+      "等待附件交付完成"
+    ],
+    "status": "partial",
+    "verification": "not_run",
+    "requestVersion": 1
+  },
+  "assessment": {
+    "gaps": [
+      "等待文件创建并验证",
+      "等待附件交付完成"
+    ],
+    "checks": [
+      {
+        "basis": "将要执行 Python 代码创建文件",
+        "status": "unknown",
+        "requirement": "用 Python 创建 answer.json 文件，内容为 JSON 对象 {\"sum\":385}"
+      },
+      {
+        "basis": "文件创建后将使用 attach_file() 附加",
+        "status": "unknown",
+        "requirement": "将这个文件作为附件交付"
+      },
+      {
+        "basis": "将实际创建文件并附加，而非仅输出文本",
+        "status": "unknown",
+        "requirement": "不要仅把 JSON 写在聊天里"
+      }
+    ],
+    "status": "partial"
+  },
+  "delivery": "observed",
+  "externalDelivery": "not_observed",
+  "executionDurationMs": 3335,
+  "modelCalls": [
+    {
+      "model": "Qwen/Qwen3.5-397B-A17B",
+      "usage": {
+        "available": true,
+        "inputTokens": 1724,
+        "outputTokens": 232
+      },
+      "diagnostics": {
+        "finishReasons": [
+          "stop"
+        ]
+      }
+    }
+  ],
+  "runtimeFailures": [],
+  "toolCalls": [],
+  "resourceObservations": [
+    {
+      "resource": "artifact:answer.json",
+      "requestVersion": 1,
+      "value": {
+        "status": "not_observed"
+      }
+    }
+  ],
+  "review": {
+    "kind": "model_review",
+    "calibration": "not_calibrated",
+    "inputSha256": "8f8b1fd2e23a0a7909a71a251e0b385b08b81fe160f2f920d806b93ee6040578",
+    "model": "Qwen/Qwen3.5-397B-A17B",
+    "verdict": "does_not_meet",
+    "rationale": "The observations show artifact:answer.json has status 'not_observed', meaning the file was not actually created or delivered as an attachment. The answer only claims to create and attach the file without providing actual file delivery. Per the rubric, file existence must be verified by independent observation, which failed here. The user explicitly requested the file be delivered as an attachment, not just described in chat.",
+    "usage": {
+      "available": true,
+      "inputTokens": 318,
+      "outputTokens": 554
+    },
+    "durationMs": 5857
+  },
+  "timedOut": false,
+  "durationMs": 9197
+}

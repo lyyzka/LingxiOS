@@ -6,7 +6,7 @@
  * chat-completions wire format (OpenAI, Azure, vLLM, LiteLLM, …).
  *
  * Protocol discipline enforced here, not in the runtime:
- * - exactly one tool (`ipython`) is advertised; parallel tool calls disabled;
+ * - one Python tool; final self-assessment is validated separately by the runtime;
  * - a turn that returns neither text nor a tool call is a driver error with
  *   diagnostics the runtime can use for a bounded protocol-correction retry.
  */
@@ -19,15 +19,20 @@ import type {
   StructuredCallRequest, StructuredCallResult,
 } from './driver.js'
 
+export const DEFAULT_MODEL = { id: 'deepseek-ai/DeepSeek-V4-Flash', baseUrl: 'https://api.siliconflow.cn/v1', reasoningEffort: 'high' } as const
+
 export interface OpenAIDriverOptions {
   apiKey: string
   baseUrl?: string
+  reasoningEffort?: 'high' | 'max'
   /** Max attempts per request across retryable failures (429/5xx/network). */
   maxAttempts?: number
   /** Base backoff in ms; grows exponentially with full jitter. */
   retryBaseMs?: number
   /** Per-request timeout in ms (wall clock, including streaming). */
   requestTimeoutMs?: number
+  maxOutputTokens?: number
+  contextWindowTokens?: number
   fetchImpl?: typeof fetch
   /** Injectable sleep for tests. */
   sleep?: (ms: number, signal?: AbortSignal) => Promise<void>
@@ -95,35 +100,57 @@ function defaultSleep(ms: number, signal?: AbortSignal): Promise<void> {
   })
 }
 
-/** Parse `text/event-stream` bodies into `data:` payload strings. */
-export async function* sseDataEvents(body: ReadableStream<Uint8Array>): AsyncGenerator<string> {
+async function* bodyText(body: ReadableStream<Uint8Array>): AsyncGenerator<string> {
   const decoder = new TextDecoder()
-  let buffer = ''
   const reader = body.getReader()
+  let bytes = 0
   try {
     while (true) {
       const { done, value } = await reader.read()
       if (done) break
-      buffer += decoder.decode(value, { stream: true })
-      let boundary: number
-      // An SSE event ends at a blank line; tolerate \r\n line endings.
-      while ((boundary = buffer.search(/\r?\n\r?\n/)) !== -1) {
-        const rawEvent = buffer.slice(0, boundary)
-        buffer = buffer.slice(boundary + (buffer[boundary] === '\r' ? 4 : 2))
-        const data = rawEvent
-          .split(/\r?\n/)
-          .filter((line) => line.startsWith('data:'))
-          .map((line) => line.slice(5).replace(/^ /, ''))
-          .join('\n')
-        if (data) yield data
-      }
+      bytes += value.byteLength
+      if (bytes > 16 * 1024 * 1024) throw new ModelDriverError('model response exceeds 16 MiB', { finishReasons: [] })
+      yield decoder.decode(value, { stream: true })
     }
+    const tail = decoder.decode()
+    if (tail) yield tail
   } finally {
+    await reader.cancel().catch(() => {})
     reader.releaseLock()
   }
 }
 
+async function responseJson(response: Response): Promise<unknown> {
+  if (!response.body) throw new ModelDriverError('model provider returned no response body', { finishReasons: [] })
+  let text = ''
+  for await (const chunk of bodyText(response.body)) text += chunk
+  return JSON.parse(text)
+}
+
+/** Parse bounded `text/event-stream` bodies into `data:` payload strings. */
+export async function* sseDataEvents(body: ReadableStream<Uint8Array>): AsyncGenerator<string> {
+  let buffer = ''
+  for await (const chunk of bodyText(body)) {
+    buffer += chunk
+    let boundary: number
+    // An SSE event ends at a blank line; tolerate \r\n line endings.
+    while ((boundary = buffer.search(/\r?\n\r?\n/)) !== -1) {
+      const rawEvent = buffer.slice(0, boundary)
+      buffer = buffer.slice(boundary + (buffer[boundary] === '\r' ? 4 : 2))
+      const data = rawEvent
+        .split(/\r?\n/)
+        .filter((line) => line.startsWith('data:'))
+        .map((line) => line.slice(5).replace(/^ /, ''))
+        .join('\n')
+      if (data) yield data
+    }
+  }
+}
+
 export class OpenAIChatDriver implements ModelDriver {
+  readonly contextWindowTokens: number
+  readonly maxOutputTokens: number
+  readonly toolDefinitionTokens = new TextEncoder().encode(JSON.stringify(IPYTHON_TOOL)).length
   private readonly baseUrl: string
   private readonly maxAttempts: number
   private readonly retryBaseMs: number
@@ -132,12 +159,17 @@ export class OpenAIChatDriver implements ModelDriver {
   private readonly sleep: (ms: number, signal?: AbortSignal) => Promise<void>
 
   constructor(readonly modelId: string, private readonly options: OpenAIDriverOptions) {
-    this.baseUrl = (options.baseUrl ?? 'https://api.openai.com/v1').replace(/\/+$/, '')
+    this.baseUrl = (options.baseUrl ?? DEFAULT_MODEL.baseUrl).replace(/\/+$/, '')
+    if (options.reasoningEffort !== undefined && !['high', 'max'].includes(options.reasoningEffort)) throw new Error('reasoningEffort must be high or max')
     this.maxAttempts = options.maxAttempts ?? 3
     this.retryBaseMs = options.retryBaseMs ?? 500
     this.requestTimeoutMs = options.requestTimeoutMs ?? 300_000
     this.fetchImpl = options.fetchImpl ?? fetch
     this.sleep = options.sleep ?? defaultSleep
+    this.contextWindowTokens = options.contextWindowTokens ?? 128_000
+    this.maxOutputTokens = options.maxOutputTokens ?? 8_192
+    if (!Number.isSafeInteger(this.maxOutputTokens) || this.maxOutputTokens < 1) throw new Error('maxOutputTokens must be a positive integer')
+    if (!Number.isSafeInteger(this.contextWindowTokens) || this.contextWindowTokens <= this.maxOutputTokens) throw new Error('contextWindowTokens must be an integer greater than maxOutputTokens')
   }
 
   private async request(body: Record<string, unknown>, signal?: AbortSignal): Promise<Response> {
@@ -154,7 +186,8 @@ export class OpenAIChatDriver implements ModelDriver {
             'content-type': 'application/json',
             authorization: `Bearer ${this.options.apiKey}`,
           },
-          body: JSON.stringify(body),
+          body: JSON.stringify({ max_tokens: this.maxOutputTokens, reasoning_effort: this.options.reasoningEffort ?? DEFAULT_MODEL.reasoningEffort,
+            ...(this.modelId === DEFAULT_MODEL.id ? { enable_thinking: true } : {}), ...body }),
           signal: combined,
         })
       } catch (error) {
@@ -166,7 +199,11 @@ export class OpenAIChatDriver implements ModelDriver {
       }
       if (response.ok) return response
       const status = response.status
-      const detail = (await response.text().catch(() => '')).slice(0, 2_000)
+      let detail = ''
+      if (response.body) for await (const chunk of bodyText(response.body)) {
+        detail += chunk.slice(0, 2_000 - detail.length)
+        if (detail.length === 2_000) break
+      }
       if ((status === 429 || status >= 500) && attempt < this.maxAttempts) {
         const retryAfter = Number(response.headers.get('retry-after'))
         const delay = Number.isFinite(retryAfter) && retryAfter > 0
@@ -255,15 +292,19 @@ export class OpenAIChatDriver implements ModelDriver {
       stream_options: { include_usage: true },
     }, request.signal)
     const accumulator = await this.consumeStream(response, request.onTextDelta)
+    if (!accumulator.finishReasons.length || accumulator.finishReasons.some(reason => reason !== 'stop' && reason !== 'tool_calls')) {
+      throw new ModelDriverError('model stream did not finish normally', { finishReasons: accumulator.finishReasons })
+    }
     const output: ModelItem[] = []
     const text = accumulator.text
     if (text.trim()) output.push({ role: 'assistant', content: text })
     for (const [, call] of [...accumulator.toolCalls.entries()].sort(([a], [b]) => a - b)) {
+      if (!call.id.trim() || call.name !== IPYTHON_TOOL_NAME) throw new ModelDriverError('model returned an invalid tool identity', { finishReasons: accumulator.finishReasons })
       output.push({
         type: 'function_call',
-        callId: call.id || `call-${output.length}`,
-        name: call.name || IPYTHON_TOOL_NAME,
-        arguments: call.arguments,
+        callId: call.id,
+        name: call.name,
+        arguments: call.arguments.trim(),
       })
     }
     if (output.length === 0) {
@@ -272,6 +313,7 @@ export class OpenAIChatDriver implements ModelDriver {
       })
     }
     const result: ModelTurnResult = { output, text, usage: this.usageOf(accumulator) }
+    if (!accumulator.toolCalls.size) result.finalCandidate = text
     if (accumulator.model !== undefined) result.model = accumulator.model
     if (accumulator.finishReasons.length > 0) result.diagnostics = { finishReasons: accumulator.finishReasons }
     return result
@@ -287,11 +329,12 @@ export class OpenAIChatDriver implements ModelDriver {
       response_format: { type: 'json_object' },
       stream: false,
     }, request.signal)
-    const payload = await response.json() as {
+    const payload = await responseJson(response) as {
       model?: string
       usage?: { prompt_tokens?: number; completion_tokens?: number }
-      choices?: Array<{ message?: { content?: string | null } }>
+      choices?: Array<{ finish_reason?: string | null; message?: { content?: string | null } }>
     }
+    if (payload.choices?.[0]?.finish_reason !== 'stop') throw new ModelDriverError('model response did not finish normally', { finishReasons: [payload.choices?.[0]?.finish_reason ?? 'missing'] })
     const content = payload.choices?.[0]?.message?.content
     if (typeof content !== 'string' || !content.trim()) {
       throw new ModelDriverError('structured call returned no content', { finishReasons: [] })
@@ -313,18 +356,18 @@ export class OpenAIChatDriver implements ModelDriver {
           role: 'system',
           content:
             'Summarize the following agent conversation for continuity. Preserve unresolved tasks, '
-            + 'commitments, key facts, user preferences, and identifiers verbatim. Output only the summary. '
-            + `Base system context:\n${request.instructions.slice(0, 4_000)}`,
+            + 'commitments, key facts, user preferences, and identifiers verbatim. Output only the summary.',
         },
         { role: 'user', content: JSON.stringify(request.items) },
       ],
       stream: false,
     }, request.signal)
-    const payload = await response.json() as {
+    const payload = await responseJson(response) as {
       model?: string
       usage?: { prompt_tokens?: number; completion_tokens?: number }
-      choices?: Array<{ message?: { content?: string | null } }>
+      choices?: Array<{ finish_reason?: string | null; message?: { content?: string | null } }>
     }
+    if (payload.choices?.[0]?.finish_reason !== 'stop') throw new ModelDriverError('model response did not finish normally', { finishReasons: [payload.choices?.[0]?.finish_reason ?? 'missing'] })
     const content = payload.choices?.[0]?.message?.content
     if (typeof content !== 'string' || !content.trim()) {
       throw new ModelDriverError('compaction returned no summary', { finishReasons: [] })

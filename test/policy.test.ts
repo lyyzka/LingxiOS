@@ -60,9 +60,9 @@ describe('DefaultRuntimePolicy.assembleSystemPrompt', () => {
 })
 
 describe('DefaultRuntimePolicy.dynamicContextItems', () => {
-  it('always returns empty (no product-specific dynamic context)', () => {
+  it('omits dynamic context when no memory snapshot is available', () => {
     const policy = new DefaultRuntimePolicy()
-    assert.deepEqual(policy.dynamicContextItems(), [])
+    assert.deepEqual(policy.dynamicContextItems(context()), [])
   })
 })
 
@@ -113,12 +113,5 @@ describe('DefaultRuntimePolicy.validateAssistantText', () => {
   it('rejects text that shows ipython code fences', () => {
     const text = '```ipython\nprint(1)\n```'
     assert.match(policy.validateAssistantText(text) ?? '', /SDK or tool code/)
-  })
-})
-
-describe('DefaultRuntimePolicy.completionGate', () => {
-  it('always allows completion', () => {
-    const policy = new DefaultRuntimePolicy()
-    assert.deepEqual(policy.completionGate(), { allowed: true })
   })
 })

@@ -5,6 +5,7 @@
  * Separated from `main.ts` so the whole lifecycle is testable in-process.
  */
 import http from 'node:http'
+import { setTimeout as delay } from 'node:timers/promises'
 import type { AddressInfo } from 'node:net'
 import { errorMessage } from '../errors.js'
 import type { HostPort } from '../host/port.js'
@@ -14,8 +15,8 @@ import type { MetricsRegistry } from '../metrics.js'
 import type { AgentRuntime } from '../runtime/runtime.js'
 
 export interface AgentWorkerOptions {
-  host: HostPort
-  runtime: AgentRuntime
+  host: Pick<HostPort, 'claimWork'>
+  runtime: Pick<AgentRuntime, 'runWork'>
   kernels?: KernelManager
   workerId: string
   maxConcurrentRuns: number
@@ -33,6 +34,9 @@ export class AgentWorker {
   private stopping = false
   private polling: Promise<void> | null = null
   private health: http.Server | null = null
+  private started = false
+  private readonly shutdown = new AbortController()
+  private readonly stopPolling = new AbortController()
 
   constructor(private readonly options: AgentWorkerOptions) {
     this.logger = (options.logger ?? nullLogger).child({ workerId: options.workerId })
@@ -43,6 +47,8 @@ export class AgentWorker {
   get draining(): boolean { return this.stopping }
 
   async start(): Promise<{ healthPort: number | null }> {
+    if (this.started || this.stopping) throw new Error('worker has already been started or stopped')
+    this.started = true
     let healthPort: number | null = null
     if (this.options.healthPort !== undefined) {
       this.health = http.createServer((req, res) => {
@@ -93,7 +99,7 @@ export class AgentWorker {
           await Promise.race(this.active.values())
           continue
         }
-        const work = await this.options.host.claimWork()
+        const work = await this.options.host.claimWork(this.stopPolling.signal)
         if (this.stopping) return
         if (!work) {
           await this.sleep(this.pollIdleMs)
@@ -101,7 +107,7 @@ export class AgentWorker {
         }
         if (this.active.has(work.id)) continue
         this.options.metrics?.gauge('agentos_worker_active_runs', 'Runs in flight').set(this.active.size + 1)
-        const done = this.options.runtime.runWork(work)
+        const done = this.options.runtime.runWork(work, this.shutdown.signal)
           .catch((error: unknown) => {
             this.logger.error('work escaped runtime handling', { workId: work.id, error: errorMessage(error) })
           })
@@ -118,11 +124,12 @@ export class AgentWorker {
     }
   }
 
-  private sleep(ms: number): Promise<void> {
-    return new Promise((resolveSleep) => {
-      const timer = setTimeout(resolveSleep, ms)
-      timer.unref?.()
-    })
+  private async sleep(ms: number): Promise<void> {
+    try {
+      await delay(ms, undefined, { ref: false, signal: this.stopPolling.signal })
+    } catch (error) {
+      if (!this.stopPolling.signal.aborted) throw error
+    }
   }
 
   /**
@@ -135,6 +142,7 @@ export class AgentWorker {
       return { timedOut: false }
     }
     this.stopping = true
+    this.stopPolling.abort()
     let graceTimer: NodeJS.Timeout | undefined
     const timedOut = await Promise.race([
       Promise.allSettled([this.polling, ...this.active.values()]).then(() => false),
@@ -144,7 +152,10 @@ export class AgentWorker {
       }),
     ])
     if (graceTimer) clearTimeout(graceTimer)
-    if (timedOut) this.logger.error('shutdown grace period expired', { graceMs: this.options.shutdownGraceMs })
+    if (timedOut) {
+      this.shutdown.abort(new Error('worker shutdown grace period expired'))
+      this.logger.error('shutdown grace period expired', { graceMs: this.options.shutdownGraceMs })
+    }
     this.options.kernels?.close()
     if (this.health) {
       await new Promise<void>((resolveClose) => {

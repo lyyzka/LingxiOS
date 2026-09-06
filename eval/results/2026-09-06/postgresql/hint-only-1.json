@@ -1,0 +1,45 @@
+{
+  "caseId": "hint-only",
+  "repeat": 1,
+  "originalInputSha256": "27215f1bbd766dd539e8ebd52c331c9148cbb75ef12ed919697313eb92bb97e1",
+  "checks": [
+    {
+      "id": "committed_response",
+      "status": "pass"
+    }
+  ],
+  "failures": [
+    "Semantic review unavailable: model response did not finish normally"
+  ],
+  "body": "这是一个一元二次方程，您可以使用因式分解法求解。\n\n**下一步提示：** 寻找哪两个数，它们的乘积等于常数项 6，而它们的和等于一次项系数 -5？\n\n（如果这两个数分别是 a 和 b，则方程可以写成 (x + a)(x + b) = 0 的形式）",
+  "outcome": {
+    "gaps": [
+      "Goal acceptance has not been checked"
+    ],
+    "status": "partial",
+    "verification": "not_run",
+    "requestVersion": 1
+  },
+  "delivery": "observed",
+  "externalDelivery": "not_observed",
+  "executionDurationMs": 4499,
+  "modelCalls": [
+    {
+      "model": "Qwen/Qwen3.5-4B",
+      "usage": {
+        "available": true,
+        "inputTokens": 1241,
+        "outputTokens": 317
+      },
+      "diagnostics": {
+        "finishReasons": [
+          "stop"
+        ]
+      }
+    }
+  ],
+  "runtimeFailures": [],
+  "toolCalls": [],
+  "timedOut": false,
+  "durationMs": 63626
+}

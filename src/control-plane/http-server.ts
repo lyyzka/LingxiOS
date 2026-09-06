@@ -14,6 +14,7 @@ import { ControlPlaneError, ControlPlaneService, type LeaseProof } from './servi
 
 export interface ControlPlaneServerOptions {
   service: ControlPlaneService
+  claimWork: (workerId: string) => Promise<import('../protocol/types.js').WorkItem | null>
   serviceToken: string
   logger?: Logger
   metrics?: MetricsRegistry
@@ -51,12 +52,16 @@ function json(res: http.ServerResponse, status: number, payload: unknown): void 
   res.end(body)
 }
 
+function stringField(body: Record<string, unknown>, key: string): string {
+  const value = body[key]
+  if (typeof value !== 'string') throw new ControlPlaneError(400, `${key} must be a string`)
+  return value
+}
+
 function leaseProofOf(id: string, body: Record<string, unknown>): LeaseProof {
-  return {
-    id,
-    fence: Number(body['fence']),
-    leaseToken: String(body['leaseToken'] ?? ''),
-  }
+  const fence = body['fence']
+  if (!Number.isSafeInteger(fence) || Number(fence) < 1) throw new ControlPlaneError(400, 'fence must be a positive safe integer')
+  return { id, fence: fence as number, leaseToken: stringField(body, 'leaseToken') }
 }
 
 export class ControlPlaneServer {
@@ -108,7 +113,9 @@ export class ControlPlaneServer {
     }
 
     const maxBody = this.options.maxBodyBytes ?? 8 * 1024 * 1024
-    const body = (method === 'GET' ? {} : await readBody(req, maxBody)) as Record<string, unknown>
+    const parsed = method === 'GET' ? {} : await readBody(req, maxBody)
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new ControlPlaneError(400, 'request body must be a JSON object')
+    const body = parsed as Record<string, unknown>
 
     // Route table -----------------------------------------------------------
     if (method === 'POST' && path === '/v2/work') {
@@ -116,7 +123,7 @@ export class ControlPlaneServer {
       return
     }
     if (method === 'POST' && path === '/v2/work/claim') {
-      json(res, 200, await service.claim(String(body['workerId'] ?? '')))
+      json(res, 200, await this.options.claimWork(stringField(body, 'workerId')))
       return
     }
 
@@ -138,6 +145,8 @@ export class ControlPlaneServer {
         switch (operation) {
           case 'heartbeat':
             json(res, 200, await service.heartbeat(proof)); return
+          case 'session':
+            json(res, 200, { session: await service.getSession(proof, stringField(body, 'key')) }); return
           case 'yield':
             await service.yieldWork(proof); json(res, 200, { ok: true }); return
           case 'actions':
@@ -151,6 +160,7 @@ export class ControlPlaneServer {
               status: body['status'] as WorkCompletion['status'],
               ...(typeof body['resultText'] === 'string' ? { resultText: body['resultText'] } : {}),
               ...(typeof body['error'] === 'string' ? { error: body['error'] } : {}),
+              ...(body['goalOutcome'] === undefined ? {} : { goalOutcome: body['goalOutcome'] as NonNullable<WorkCompletion['goalOutcome']> }),
             })
             json(res, 200, { ok: true }); return
           case 'cancel':
@@ -158,18 +168,13 @@ export class ControlPlaneServer {
           case 'preempt':
             json(res, 200, { ok: await service.requestPreempt(id) }); return
           case 'steer':
-            json(res, 200, { ok: await service.addSteer(id, String(body['text'] ?? '')) }); return
+            json(res, 200, { ok: await service.addSteer(id, stringField(body, 'text')) }); return
         }
       }
     }
 
-    const sessionMatch = /^\/v2\/sessions\/(.+)$/.exec(path)
-    if (method === 'GET' && sessionMatch) {
-      json(res, 200, { session: await service.getSession(decodeURIComponent(sessionMatch[1]!)) })
-      return
-    }
     if (method === 'PUT' && path === '/v2/sessions') {
-      const proof = leaseProofOf(String(body['workId'] ?? ''), body)
+      const proof = leaseProofOf(stringField(body, 'workId'), body)
       json(res, 200, await service.saveSession(proof, body['session'] as SessionRecord))
       return
     }

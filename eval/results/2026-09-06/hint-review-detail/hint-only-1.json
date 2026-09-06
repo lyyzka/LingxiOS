@@ -1,0 +1,57 @@
+{
+  "caseId": "hint-only",
+  "repeat": 1,
+  "originalInputSha256": "27215f1bbd766dd539e8ebd52c331c9148cbb75ef12ed919697313eb92bb97e1",
+  "checks": [
+    {
+      "id": "committed_response",
+      "status": "pass"
+    }
+  ],
+  "failures": [],
+  "body": "你这个一元二次方程可以通过几种方法求解。接下来你可以考虑：\n\n**提示方向1（因式分解法）：** 寻找两个数，它们的和是 -5，积是 6，然后用十字相乘法将方程左边分解为两个因式的乘积。\n\n**提示方向2（求根公式法）：** 计算判别式 Δ = b² - 4ac，先判断根的情况。\n\n你想尝试哪种方法？如果你想继续下一步提示，我告诉你其中一个方向即可。",
+  "outcome": {
+    "gaps": [
+      "Goal acceptance has not been checked"
+    ],
+    "status": "partial",
+    "verification": "not_run",
+    "requestVersion": 1
+  },
+  "delivery": "observed",
+  "externalDelivery": "not_observed",
+  "executionDurationMs": 5459,
+  "modelCalls": [
+    {
+      "model": "Qwen/Qwen3.5-4B",
+      "usage": {
+        "available": true,
+        "inputTokens": 1241,
+        "outputTokens": 256
+      },
+      "diagnostics": {
+        "finishReasons": [
+          "stop"
+        ]
+      }
+    }
+  ],
+  "runtimeFailures": [],
+  "toolCalls": [],
+  "review": {
+    "kind": "model_review",
+    "calibration": "not_calibrated",
+    "inputSha256": "7c53ae56d3111eb0afbd34e7fdda9eebb5e515f2f8a11e75a18c39d7780c139d",
+    "model": "Qwen/Qwen3.5-4B",
+    "verdict": "does_not_meet",
+    "rationale": "The answer provides TWO method directions (factorization and quadratic formula) instead of the single hint required by both the original input ('只给一个下一步提示') and the rubric ('只给一个有用且数学正确的下一步提示'). While each hint is mathematically correct and doesn't list roots or complete solutions, violating the 'one hint only' constraint makes the answer non-compliant with rubric requirements.",
+    "usage": {
+      "available": true,
+      "inputTokens": 313,
+      "outputTokens": 555
+    },
+    "durationMs": 7457
+  },
+  "timedOut": false,
+  "durationMs": 12917
+}

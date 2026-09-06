@@ -1,0 +1,69 @@
+{
+  "caseId": "hint-only",
+  "repeat": 2,
+  "originalInputSha256": "27215f1bbd766dd539e8ebd52c331c9148cbb75ef12ed919697313eb92bb97e1",
+  "checks": [
+    {
+      "id": "committed_response",
+      "status": "pass"
+    },
+    {
+      "id": "goal_status",
+      "status": "pass"
+    }
+  ],
+  "failures": [],
+  "body": "试着因式分解：寻找两个数，使它们相乘等于常数项 6，相加等于一次项系数 -5。",
+  "outcome": {
+    "status": "satisfied",
+    "verification": "not_run",
+    "requestVersion": 1
+  },
+  "assessment": {
+    "gaps": [],
+    "checks": [
+      {
+        "basis": "回答仅给出因式分解的提示，未列出任何根或完整求解过程。",
+        "status": "met",
+        "requirement": "只给一个下一步提示，不要给出根或完整解"
+      }
+    ],
+    "status": "satisfied"
+  },
+  "delivery": "observed",
+  "externalDelivery": "not_observed",
+  "executionDurationMs": 2785,
+  "modelCalls": [
+    {
+      "model": "deepseek-ai/DeepSeek-V4-Flash",
+      "usage": {
+        "available": true,
+        "inputTokens": 1935,
+        "outputTokens": 274
+      },
+      "diagnostics": {
+        "finishReasons": [
+          "stop"
+        ]
+      }
+    }
+  ],
+  "runtimeFailures": [],
+  "toolCalls": [],
+  "review": {
+    "kind": "model_review",
+    "calibration": "not_calibrated",
+    "inputSha256": "ad41024e58512ba2379caf9982b5afd11c58a7ea82d87e74fb71deb66d69764a",
+    "model": "deepseek-ai/DeepSeek-V4-Flash",
+    "verdict": "meets_rubric",
+    "rationale": "该回答仅提供了一个下一步提示：尝试因式分解并寻找两个数相乘为 6、相加为 -5。这个提示是数学正确的（对应 (x-2)(x-3) 的因式分解思路），且没有列出两个根，也没有展示完整因式分解或完整解答，符合 rubric 的要求。",
+    "usage": {
+      "available": true,
+      "inputTokens": 386,
+      "outputTokens": 443
+    },
+    "durationMs": 3289
+  },
+  "timedOut": false,
+  "durationMs": 6080
+}

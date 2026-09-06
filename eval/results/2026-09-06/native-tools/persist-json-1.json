@@ -1,0 +1,154 @@
+{
+  "caseId": "persist-json",
+  "repeat": 1,
+  "originalInputSha256": "7e63aa0043d0519d469de8b2bb0e7257d1eb8833b6ce4ce362bde9f29d868027",
+  "checks": [
+    {
+      "id": "committed_response",
+      "status": "pass"
+    },
+    {
+      "id": "goal_status",
+      "status": "pass"
+    },
+    {
+      "id": "artifact_json",
+      "status": "pass"
+    }
+  ],
+  "failures": [],
+  "body": "文件 answer.json 已创建并作为附件交付。文件内容为 {\"sum\":385}，大小为 12 字节，SHA256 哈希值为 cdb547306910a8b79cd75523bd4094b28eef60e03fcc4105fe0131be78141d94。",
+  "outcome": {
+    "status": "satisfied",
+    "verification": "not_run",
+    "requestVersion": 1
+  },
+  "assessment": {
+    "gaps": [],
+    "checks": [
+      {
+        "basis": "文件已通过 Python 代码创建成功",
+        "status": "met",
+        "requirement": "用 Python 创建 answer.json 文件"
+      },
+      {
+        "basis": "文件内容已验证为 {\"sum\": 385}",
+        "status": "met",
+        "requirement": "内容为 JSON 对象 {\"sum\":385}"
+      },
+      {
+        "basis": "文件已通过 attach_file 作为 artifacts 交付",
+        "status": "met",
+        "requirement": "将这个文件作为附件交付"
+      },
+      {
+        "basis": "文件已实际创建并附加，不只是在聊天中显示",
+        "status": "met",
+        "requirement": "不要仅把 JSON 写在聊天里"
+      }
+    ],
+    "status": "satisfied"
+  },
+  "delivery": "observed",
+  "externalDelivery": "not_observed",
+  "executionDurationMs": 9886,
+  "modelCalls": [
+    {
+      "model": "Qwen/Qwen3.5-397B-A17B",
+      "usage": {
+        "available": true,
+        "inputTokens": 1724,
+        "outputTokens": 165
+      },
+      "diagnostics": {
+        "finishReasons": [
+          "tool_calls"
+        ]
+      }
+    },
+    {
+      "model": "Qwen/Qwen3.5-397B-A17B",
+      "usage": {
+        "available": true,
+        "inputTokens": 1939,
+        "outputTokens": 299
+      },
+      "diagnostics": {
+        "finishReasons": [
+          "tool_calls"
+        ]
+      }
+    },
+    {
+      "model": "Qwen/Qwen3.5-397B-A17B",
+      "usage": {
+        "available": true,
+        "inputTokens": 2145,
+        "outputTokens": 328
+      },
+      "diagnostics": {
+        "finishReasons": [
+          "stop"
+        ]
+      }
+    }
+  ],
+  "runtimeFailures": [],
+  "toolCalls": [
+    {
+      "name": "ipython",
+      "type": "function_call",
+      "callId": "01a07540b47fb0ccaaf7e6d59d86ae2e",
+      "arguments": "{\"code\": \"import json\\n\\n# 创建 answer.json 文件\\nwith open(\\\"answer.json\\\", \\\"w\\\") as f:\\n    json.dump({\\\"sum\\\": 385}, f)\\n\\n# 将文件作为附件交付\\nattach_file(\\\"answer.json\\\")\\n\\nprint(\\\"文件 answer.json 已创建并作为附件交付\\\")\"}"
+    },
+    {
+      "name": "ipython",
+      "type": "function_call",
+      "callId": "01a07540c3b4d2d7494ae81d1f3ff940",
+      "arguments": "{\"code\": \"# 验证文件内容\\nimport json\\nwith open(\\\"answer.json\\\", \\\"r\\\") as f:\\n    content = json.load(f)\\nprint(f\\\"文件内容验证: {content}\\\")\\n\\n# 重新附加文件确保交付\\nattach_file(\\\"answer.json\\\")\"}"
+    }
+  ],
+  "artifact": {
+    "mime": "application/json",
+    "path": "answer.json",
+    "size": 12,
+    "sha256": "cdb547306910a8b79cd75523bd4094b28eef60e03fcc4105fe0131be78141d94"
+  },
+  "artifactFile": "persist-json-1.artifact",
+  "resourceObservations": [
+    {
+      "resource": "artifact:answer.json",
+      "requestVersion": 1,
+      "value": {
+        "status": "observed",
+        "source": "app.readArtifact",
+        "artifact": {
+          "mime": "application/json",
+          "path": "answer.json",
+          "size": 12,
+          "sha256": "cdb547306910a8b79cd75523bd4094b28eef60e03fcc4105fe0131be78141d94"
+        },
+        "json": {
+          "sum": 385
+        },
+        "externalDelivery": "not_observed"
+      }
+    }
+  ],
+  "review": {
+    "kind": "model_review",
+    "calibration": "not_calibrated",
+    "inputSha256": "c75a5e0399cf61892ce7fa948f7ca1740c75c178cb7d73cf4a192cf147f93cfd",
+    "model": "Qwen/Qwen3.5-397B-A17B",
+    "verdict": "meets_rubric",
+    "rationale": "The answer correctly claims the file was created and delivered as an attachment with the required content. Independent observations via app.readArtifact confirm: (1) artifact answer.json exists with status 'observed', (2) MIME type is application/json, (3) size is 12 bytes matching the answer, (4) SHA256 hash matches exactly, (5) JSON content is {\"sum\":385} as required. The answer references the delivered file rather than just showing JSON in chat. While externalDelivery shows 'not_observed', this is an observation limitation rather than evidence the attachment wasn't delivered - the artifact itself was verified independently.",
+    "usage": {
+      "available": true,
+      "inputTokens": 499,
+      "outputTokens": 811
+    },
+    "durationMs": 8261
+  },
+  "timedOut": false,
+  "durationMs": 18161
+}

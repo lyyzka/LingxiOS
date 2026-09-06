@@ -1,0 +1,47 @@
+{
+  "version": 1,
+  "mode": "live_model_runtime",
+  "runtimeVersions": {
+    "runtime": "1.0.0",
+    "controlPlane": 2,
+    "kernel": 2,
+    "schema": 1,
+    "lingxiLoop": 1,
+    "assistantMessage": 2
+  },
+  "runnerSha256": "98b7668fc828964a1368cf1f9489e68f469a0b44498434ce4115d648fbda20f1",
+  "implementationSha256": "0947758747139ef3a762a973c4fbcfa2d5bb44bfa3ab30825d4e5e417fd095d5",
+  "dependencyLockSha256": "13c64f4a8cf22ca21e2250494b51a854cf5c4d90c3b1fc7e926059ec3fc10237",
+  "databaseEngine": "postgresql",
+  "databaseVersion": "PostgreSQL 17.11 (Debian 17.11-1.pgdg13+2) on x86_64-pc-linux-gnu, compiled by gcc (Debian 14.2.0-19) 14.2.0, 64-bit",
+  "model": "deepseek-ai/DeepSeek-V4-Flash",
+  "reasoningEffort": "high",
+  "providerOrigin": "https://api.siliconflow.cn",
+  "budgets": {
+    "runtimeOutputTokens": 4096,
+    "reviewOutputTokens": 8192,
+    "reviewTimeoutMs": 180000,
+    "contextWindowTokens": 32768
+  },
+  "datasetSha256": "d68f94a1bfd4ba3ab95503975fe538d60f2948cc0cba1ceb62420eeabf3b083b",
+  "datasetReview": "agent_authored_not_human_reviewed",
+  "selectedCases": [
+    "full-derivation",
+    "hint-only",
+    "chat-only",
+    "persist-json"
+  ],
+  "productIntegration": "not_evaluated",
+  "safetyCoverage": "not_assessed",
+  "semanticCalibration": "not_calibrated",
+  "sampleCount": 4,
+  "deterministicFailures": 0,
+  "executionOrReviewErrors": 0,
+  "timedOut": 0,
+  "reports": [
+    "full-derivation-1.json",
+    "hint-only-1.json",
+    "chat-only-1.json",
+    "persist-json-1.json"
+  ]
+}

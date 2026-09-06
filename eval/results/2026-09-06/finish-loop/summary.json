@@ -1,0 +1,46 @@
+{
+  "version": 1,
+  "mode": "live_model_runtime",
+  "runtimeVersions": {
+    "runtime": "1.0.0",
+    "controlPlane": 2,
+    "kernel": 2,
+    "schema": 1,
+    "lingxiLoop": 1,
+    "assistantMessage": 2
+  },
+  "runnerSha256": "38f26733cb4d4c18427b3b039b919a9eeca99c4e27a44d001c7d8ce722bf7e31",
+  "implementationSha256": "2adcf62357e74ad035fe6c643252f29e243e30a27f8976bc98328ae368e6f111",
+  "dependencyLockSha256": "13c64f4a8cf22ca21e2250494b51a854cf5c4d90c3b1fc7e926059ec3fc10237",
+  "databaseEngine": "postgresql",
+  "databaseVersion": "PostgreSQL 17.11 (Debian 17.11-1.pgdg13+2) on x86_64-pc-linux-gnu, compiled by gcc (Debian 14.2.0-19) 14.2.0, 64-bit",
+  "model": "Qwen/Qwen3.5-4B",
+  "providerOrigin": "https://api.siliconflow.cn",
+  "budgets": {
+    "runtimeOutputTokens": 4096,
+    "reviewOutputTokens": 4096,
+    "reviewTimeoutMs": 180000,
+    "contextWindowTokens": 32768
+  },
+  "datasetSha256": "d8a0d255b3632d0dac2be307c1c80d4001f71d020c93d193b3a1ce189772ef71",
+  "datasetReview": "agent_authored_not_human_reviewed",
+  "selectedCases": [
+    "full-derivation",
+    "hint-only",
+    "chat-only",
+    "persist-json"
+  ],
+  "productIntegration": "not_evaluated",
+  "safetyCoverage": "not_assessed",
+  "semanticCalibration": "not_calibrated",
+  "sampleCount": 4,
+  "deterministicFailures": 0,
+  "executionOrReviewErrors": 0,
+  "timedOut": 0,
+  "reports": [
+    "full-derivation-1.json",
+    "hint-only-1.json",
+    "chat-only-1.json",
+    "persist-json-1.json"
+  ]
+}

@@ -1,0 +1,45 @@
+{
+  "caseId": "hint-only",
+  "repeat": 1,
+  "originalInputSha256": "27215f1bbd766dd539e8ebd52c331c9148cbb75ef12ed919697313eb92bb97e1",
+  "checks": [
+    {
+      "id": "committed_response",
+      "status": "pass"
+    }
+  ],
+  "failures": [
+    "Semantic review unavailable: invalid semantic review result"
+  ],
+  "body": "对于方程 x² - 5x + 6 = 0 的下一步建议：\n\n**可以尝试因式分解**\n\n观察这个二次方程，看看能否写成两个一次因式的乘积形式，即找到两个数的乘积等于常数项 6，且和等于一次项系数 -5。\n\n（也就是说，将方程改写为 (x - a)(x - b) = 0 的形式）\n\n你想要深入这个因式分解的思路，还是想尝试其他方法？",
+  "outcome": {
+    "gaps": [
+      "Goal acceptance has not been checked"
+    ],
+    "status": "partial",
+    "verification": "not_run",
+    "requestVersion": 1
+  },
+  "delivery": "observed",
+  "externalDelivery": "not_observed",
+  "executionDurationMs": 4554,
+  "modelCalls": [
+    {
+      "model": "Qwen/Qwen3.5-4B",
+      "usage": {
+        "available": true,
+        "inputTokens": 1241,
+        "outputTokens": 265
+      },
+      "diagnostics": {
+        "finishReasons": [
+          "stop"
+        ]
+      }
+    }
+  ],
+  "runtimeFailures": [],
+  "toolCalls": [],
+  "timedOut": false,
+  "durationMs": 19728
+}

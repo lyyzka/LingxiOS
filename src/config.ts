@@ -3,6 +3,7 @@
  * eagerly so a misconfigured service fails at boot, not mid-run.
  */
 import { ConfigError } from './errors.js'
+import { DEFAULT_MODEL } from './model/openai.js'
 
 export function requiredEnv(name: string, env: NodeJS.ProcessEnv = process.env): string {
   const value = env[name]?.trim()
@@ -40,34 +41,26 @@ export interface WorkerConfig {
     id: string
     apiKey: string
     baseUrl: string
+    reasoningEffort: 'high' | 'max'
   }
 }
 
 export function loadWorkerConfig(env: NodeJS.ProcessEnv = process.env): WorkerConfig {
+  const reasoningEffort = env['AGENT_OS_REASONING_EFFORT']?.trim() || DEFAULT_MODEL.reasoningEffort
+  if (reasoningEffort !== 'high' && reasoningEffort !== 'max') throw new ConfigError('AGENT_OS_REASONING_EFFORT must be high or max')
   return {
     controlPlaneUrl: requiredEnv('AGENT_OS_CONTROL_PLANE_URL', env),
     serviceToken: requiredEnv('AGENT_OS_SERVICE_TOKEN', env),
     workerId: env['AGENT_OS_WORKER_ID']?.trim() || `agent-os-${process.pid}`,
     healthPort: intEnv('AGENT_OS_WORKER_PORT', 5190, { min: 0, max: 65_535 }, env),
-    maxConcurrentRuns: intEnv('AGENT_OS_MAX_CONCURRENT_RUNS', 8, { min: 1, max: 1_024 }, env),
+    maxConcurrentRuns: intEnv('AGENT_OS_MAX_CONCURRENT_RUNS', 2, { min: 1, max: 1_024 }, env),
     shutdownGraceMs: intEnv('AGENT_OS_SHUTDOWN_GRACE_MS', 20_000, { min: 1_000 }, env),
     pollIdleMs: intEnv('AGENT_OS_POLL_IDLE_MS', 750, { min: 50 }, env),
     model: {
-      id: requiredEnv('AGENT_OS_MODEL', env),
+      id: env['AGENT_OS_MODEL']?.trim() || DEFAULT_MODEL.id,
       apiKey: requiredEnv('AGENT_OS_MODEL_API_KEY', env),
-      baseUrl: env['AGENT_OS_MODEL_BASE_URL']?.trim() || 'https://api.openai.com/v1',
+      baseUrl: env['AGENT_OS_MODEL_BASE_URL']?.trim() || DEFAULT_MODEL.baseUrl,
+      reasoningEffort,
     },
-  }
-}
-
-export interface ControlPlaneConfig {
-  port: number
-  serviceToken: string
-}
-
-export function loadControlPlaneConfig(env: NodeJS.ProcessEnv = process.env): ControlPlaneConfig {
-  return {
-    port: intEnv('AGENT_OS_CONTROL_PLANE_PORT', 5180, { min: 0, max: 65_535 }, env),
-    serviceToken: requiredEnv('AGENT_OS_SERVICE_TOKEN', env),
   }
 }

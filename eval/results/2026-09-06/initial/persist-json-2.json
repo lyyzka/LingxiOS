@@ -1,0 +1,79 @@
+{
+  "caseId": "persist-json",
+  "repeat": 2,
+  "originalInputSha256": "7e63aa0043d0519d469de8b2bb0e7257d1eb8833b6ce4ce362bde9f29d868027",
+  "checks": [
+    {
+      "id": "committed_response",
+      "status": "pass"
+    },
+    {
+      "id": "artifact_json",
+      "status": "pass"
+    }
+  ],
+  "failures": [
+    "Semantic review unavailable"
+  ],
+  "body": "任务已完成。\n\n**创建的文件：**\n- 文件名：`answer.json`\n- 文件大小：12 字节\n- MIME 类型：`application/json`\n- 已作为附件交付\n\n**文件内容：**\n```json\n{\"sum\": 385}\n```\n\n**验证测试通过：** 读取文件内容确认与预期一致。",
+  "outcome": {
+    "gaps": [
+      "Goal acceptance has not been checked"
+    ],
+    "status": "partial",
+    "verification": "not_run",
+    "requestVersion": 1
+  },
+  "delivery": "observed",
+  "externalDelivery": "not_observed",
+  "executionDurationMs": 15450,
+  "modelCalls": [
+    {
+      "model": "Qwen/Qwen3.5-4B",
+      "usage": {
+        "available": true,
+        "inputTokens": 1257,
+        "outputTokens": 234
+      },
+      "diagnostics": {
+        "finishReasons": [
+          "tool_calls"
+        ]
+      }
+    },
+    {
+      "model": "Qwen/Qwen3.5-4B",
+      "usage": {
+        "available": true,
+        "inputTokens": 1463,
+        "outputTokens": 242
+      },
+      "diagnostics": {
+        "finishReasons": [
+          "tool_calls"
+        ]
+      }
+    },
+    {
+      "model": "Qwen/Qwen3.5-4B",
+      "usage": {
+        "available": true,
+        "inputTokens": 1718,
+        "outputTokens": 181
+      },
+      "diagnostics": {
+        "finishReasons": [
+          "stop"
+        ]
+      }
+    }
+  ],
+  "artifact": {
+    "mime": "application/json",
+    "path": "answer.json",
+    "size": 12,
+    "sha256": "cdb547306910a8b79cd75523bd4094b28eef60e03fcc4105fe0131be78141d94"
+  },
+  "timedOut": false,
+  "durationMs": 75466
+}

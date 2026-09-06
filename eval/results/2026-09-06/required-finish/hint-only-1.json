@@ -1,0 +1,53 @@
+{
+  "caseId": "hint-only",
+  "repeat": 1,
+  "originalInputSha256": "27215f1bbd766dd539e8ebd52c331c9148cbb75ef12ed919697313eb92bb97e1",
+  "checks": [
+    {
+      "id": "committed_response",
+      "status": "not_observed"
+    },
+    {
+      "id": "goal_status",
+      "status": "fail"
+    }
+  ],
+  "failures": [],
+  "body": null,
+  "outcome": {
+    "gaps": [
+      "Execution failed before verified delivery"
+    ],
+    "status": "blocked",
+    "verification": "inconclusive",
+    "requestVersion": 1
+  },
+  "assessment": null,
+  "delivery": "not_observed",
+  "externalDelivery": null,
+  "executionDurationMs": 83985,
+  "modelCalls": [
+    {
+      "model": "Qwen/Qwen3.5-4B",
+      "usage": {
+        "available": true,
+        "inputTokens": 1793,
+        "outputTokens": 4096
+      },
+      "diagnostics": {
+        "finishReasons": [
+          "tool_calls"
+        ]
+      }
+    }
+  ],
+  "runtimeFailures": [
+    {
+      "kind": "run.failed",
+      "error": "context compaction failed at the hard context limit"
+    }
+  ],
+  "toolCalls": [],
+  "timedOut": false,
+  "durationMs": 83990
+}

@@ -1,0 +1,31 @@
+{
+  "version": 1,
+  "mode": "live_model_runtime",
+  "runtimeVersions": {
+    "runtime": "1.0.0",
+    "schema": 1,
+    "lingxiLoop": 1,
+    "assistantMessage": 2
+  },
+  "model": "Qwen/Qwen3.5-4B",
+  "datasetSha256": "d8a0d255b3632d0dac2be307c1c80d4001f71d020c93d193b3a1ce189772ef71",
+  "datasetReview": "agent_authored_not_human_reviewed",
+  "productIntegration": "not_evaluated",
+  "safetyCoverage": "not_assessed",
+  "semanticCalibration": "not_calibrated",
+  "sampleCount": 8,
+  "deterministicFailures": 1,
+  "reports": [
+    "full-derivation-1.json",
+    "hint-only-1.json",
+    "chat-only-1.json",
+    "persist-json-1.json",
+    "full-derivation-2.json",
+    "hint-only-2.json",
+    "chat-only-2.json",
+    "persist-json-2.json"
+  ],
+  "executionOrReviewErrors": 4,
+  "timedOut": 0,
+  "summaryCorrection": "Separated review errors from deterministic checks using the unchanged per-case reports"
+}

@@ -122,8 +122,8 @@ export class HttpHostClient implements HostPort {
     await this.request('POST', `/v2/work/${encodeURIComponent(work.id)}/events`, { ...this.proof(work), event })
   }
 
-  async loadSession(_work: WorkItem, key: string): Promise<SessionRecord | null> {
-    const payload = await this.request<{ session: SessionRecord | null }>('GET', `/v2/sessions/${encodeURIComponent(key)}`)
+  async loadSession(work: WorkItem, key: string): Promise<SessionRecord | null> {
+    const payload = await this.request<{ session: SessionRecord | null }>('POST', `/v2/work/${encodeURIComponent(work.id)}/session`, { ...this.proof(work), key })
     return payload.session
   }
 

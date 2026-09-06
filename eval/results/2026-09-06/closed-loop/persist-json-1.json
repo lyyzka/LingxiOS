@@ -1,0 +1,87 @@
+{
+  "caseId": "persist-json",
+  "repeat": 1,
+  "originalInputSha256": "7e63aa0043d0519d469de8b2bb0e7257d1eb8833b6ce4ce362bde9f29d868027",
+  "checks": [
+    {
+      "id": "committed_response",
+      "status": "not_observed"
+    },
+    {
+      "id": "goal_status",
+      "status": "fail"
+    },
+    {
+      "id": "artifact_json",
+      "status": "not_observed"
+    }
+  ],
+  "failures": [],
+  "body": null,
+  "outcome": {
+    "gaps": [
+      "Execution failed before verified delivery"
+    ],
+    "status": "blocked",
+    "verification": "inconclusive",
+    "requestVersion": 1
+  },
+  "assessment": null,
+  "delivery": "not_observed",
+  "externalDelivery": null,
+  "executionDurationMs": 5330,
+  "modelCalls": [
+    {
+      "model": "Qwen/Qwen3.5-4B",
+      "usage": {
+        "available": true,
+        "inputTokens": 1640,
+        "outputTokens": 203
+      },
+      "diagnostics": {
+        "finishReasons": [
+          "stop"
+        ]
+      }
+    },
+    {
+      "model": "Qwen/Qwen3.5-4B",
+      "usage": {
+        "available": true,
+        "inputTokens": 1772,
+        "outputTokens": 132
+      },
+      "diagnostics": {
+        "finishReasons": [
+          "stop"
+        ]
+      }
+    }
+  ],
+  "runtimeFailures": [
+    {
+      "kind": "response.withheld",
+      "error": "invalid final candidate"
+    },
+    {
+      "kind": "response.withheld",
+      "error": "invalid final candidate"
+    },
+    {
+      "kind": "run.failed",
+      "error": "tool protocol correction exhausted: Correct the final JSON object against the original request. invalid final candidate"
+    }
+  ],
+  "toolCalls": [],
+  "resourceObservations": [
+    {
+      "resource": "artifact:answer.json",
+      "requestVersion": 1,
+      "value": {
+        "status": "not_observed"
+      }
+    }
+  ],
+  "timedOut": false,
+  "durationMs": 5336
+}

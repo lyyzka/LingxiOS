@@ -1,0 +1,69 @@
+{
+  "caseId": "hint-only",
+  "repeat": 1,
+  "originalInputSha256": "27215f1bbd766dd539e8ebd52c331c9148cbb75ef12ed919697313eb92bb97e1",
+  "checks": [
+    {
+      "id": "committed_response",
+      "status": "pass"
+    },
+    {
+      "id": "goal_status",
+      "status": "pass"
+    }
+  ],
+  "failures": [],
+  "body": "试试把二次三项式因式分解，寻找两个数，它们的乘积是常数项，和是一次项系数。",
+  "outcome": {
+    "status": "satisfied",
+    "verification": "not_run",
+    "requestVersion": 1
+  },
+  "assessment": {
+    "gaps": [],
+    "checks": [
+      {
+        "basis": "只提供了一个因式分解方向的提示，未透露根或完整解法",
+        "status": "met",
+        "requirement": "只给一个下一步提示，不要给出根或完整解"
+      }
+    ],
+    "status": "satisfied"
+  },
+  "delivery": "observed",
+  "externalDelivery": "not_observed",
+  "executionDurationMs": 3300,
+  "modelCalls": [
+    {
+      "model": "Qwen/Qwen3.5-397B-A17B",
+      "usage": {
+        "available": true,
+        "inputTokens": 1820,
+        "outputTokens": 246
+      },
+      "diagnostics": {
+        "finishReasons": [
+          "stop"
+        ]
+      }
+    }
+  ],
+  "runtimeFailures": [],
+  "toolCalls": [],
+  "review": {
+    "kind": "model_review",
+    "calibration": "not_calibrated",
+    "inputSha256": "1341f29b5bff2dfab110e5ee880337eb681b023a714e03b01a33ace714012ed3",
+    "model": "Qwen/Qwen3.5-397B-A17B",
+    "verdict": "meets_rubric",
+    "rationale": "The answer provides exactly one mathematical hint (factoring the quadratic trinomial) without revealing the specific roots (2 and 3) or the complete factorization. It correctly describes the method for finding the factors (product equals constant term, sum equals linear coefficient), which aligns with the user's request for a hint rather than a solution and satisfies all rubric constraints.",
+    "usage": {
+      "available": true,
+      "inputTokens": 314,
+      "outputTokens": 1797
+    },
+    "durationMs": 17426
+  },
+  "timedOut": false,
+  "durationMs": 20730
+}

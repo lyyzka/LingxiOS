@@ -1,0 +1,85 @@
+{
+  "caseId": "full-derivation",
+  "repeat": 1,
+  "originalInputSha256": "20824b22f385871fa3104a4e09520b31872c07744e440c2286ad03afa3621983",
+  "checks": [
+    {
+      "id": "committed_response",
+      "status": "pass"
+    },
+    {
+      "id": "goal_status",
+      "status": "fail"
+    }
+  ],
+  "failures": [],
+  "body": "候选答复仍存在未解决的内容验收问题，本轮修正次数已用尽。执行记录已保存，但请求要求和资源后置条件尚未全部验证；已发生的操作不会自动撤销。",
+  "outcome": {
+    "gaps": [
+      "Content acceptance correction budget exhausted; goal acceptance remains unchecked",
+      "Final assessment protocol correction exhausted: Each requirement must be copied verbatim from originalText or a revision, without paraphrasing or translating. Non-matching requirement: \"给出所有实数解\""
+    ],
+    "status": "partial",
+    "verification": "not_run",
+    "requestVersion": 1
+  },
+  "assessment": null,
+  "delivery": "observed",
+  "externalDelivery": "not_observed",
+  "executionDurationMs": 23575,
+  "modelCalls": [
+    {
+      "model": "deepseek-ai/DeepSeek-V4-Flash",
+      "usage": {
+        "available": true,
+        "inputTokens": 1883,
+        "outputTokens": 1480
+      },
+      "diagnostics": {
+        "finishReasons": [
+          "stop"
+        ]
+      }
+    },
+    {
+      "model": "deepseek-ai/DeepSeek-V4-Flash",
+      "usage": {
+        "available": true,
+        "inputTokens": 3009,
+        "outputTokens": 1516
+      },
+      "diagnostics": {
+        "finishReasons": [
+          "stop"
+        ]
+      }
+    }
+  ],
+  "runtimeFailures": [
+    {
+      "kind": "response.withheld",
+      "error": "Unexpected token '方', \"方程：x² − 5x\"... is not valid JSON"
+    },
+    {
+      "kind": "response.withheld",
+      "error": "Each requirement must be copied verbatim from originalText or a revision, without paraphrasing or translating. Non-matching requirement: \"给出所有实数解\""
+    }
+  ],
+  "toolCalls": [],
+  "review": {
+    "kind": "model_review",
+    "calibration": "not_calibrated",
+    "inputSha256": "62b8e56748cd993f3f6c42374767ff43780640b659f82200442675633835d854",
+    "model": "deepseek-ai/DeepSeek-V4-Flash",
+    "verdict": "does_not_meet",
+    "rationale": "候选答复未提供任何方程求解内容，而是给出类似“未解决内容验收问题、修正次数已用尽”的说明。它没有进行因式分解或求根公式推导，也没有明确给出实数解 2 和 3，因此完全不符合必须给出完整推导步骤和所有实数解的要求。",
+    "usage": {
+      "available": true,
+      "inputTokens": 396,
+      "outputTokens": 251
+    },
+    "durationMs": 1792
+  },
+  "timedOut": false,
+  "durationMs": 25370
+}

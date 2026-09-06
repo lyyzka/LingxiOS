@@ -69,6 +69,7 @@ export interface WorkItem {
 }
 
 export interface WorkCompletion {
+  goalOutcome?: import('./outcome.js').GoalOutcome
   status: 'completed' | 'failed' | 'cancelled'
   resultText?: string
   error?: string
@@ -98,9 +99,9 @@ export interface CapabilityGrant {
  * One product side effect requested by kernel code via
  * `host.<namespace>.<method>(...)`.
  *
- * `idempotencyKey` is derived as `runId:cellId:callIndex` — deterministic
+ * `idempotencyKey` is the JSON tuple `[runId, cellId, callIndex]` — deterministic
  * across kernel restarts replaying the same cell — so the control-plane
- * action ledger can collapse at-least-once delivery into exactly-once effects.
+ * action ledger can reject changed intents and avoid blindly replaying effects.
  */
 export interface HostAction {
   runId: string
@@ -112,8 +113,13 @@ export interface HostAction {
   idempotencyKey: string
 }
 
+export function actionKeyOf(action: Pick<HostAction, 'runId' | 'cellId' | 'callIndex'>): string {
+  return JSON.stringify([action.runId, action.cellId, action.callIndex])
+}
+
 export interface HostActionResult {
   ok: boolean
+  executionState?: 'unknown'
   value?: unknown
   error?: string
   /** Present when the action suspended into a human approval. */
@@ -129,7 +135,7 @@ export interface HostActionResult {
  * without a final assistant message.
  */
 export interface HostDirective {
-  type: 'defer'
+  type: 'defer' | 'task_contract'
   reason?: string
   data?: Record<string, unknown>
 }
@@ -198,6 +204,7 @@ export type ModelItem =
  * concurrency (`revision`).
  */
 export interface SessionRecord {
+  request?: import('../context/request.js').RequestSnapshot
   key: string
   tenantId: string
   agentId: string
@@ -215,7 +222,7 @@ export interface SessionRecord {
 
 /** Composite key shared by sessions, kernel affinity, and lease exclusivity. */
 export function sessionKeyOf(work: Pick<WorkItem, 'tenantId' | 'agentId' | 'sessionId' | 'threadId'>): string {
-  return [work.tenantId, work.agentId, work.sessionId, work.threadId ?? '-'].join(':')
+  return JSON.stringify([work.tenantId, work.agentId, work.sessionId, work.threadId ?? null])
 }
 
 /**
@@ -254,6 +261,10 @@ export interface ContextMessage {
  * into the session.
  */
 export interface TurnContext {
+  memory?: import('../memory/store.js').MemorySnapshot
+  /** Prior attempt records only; files must be rechecked before current delivery. */
+  priorArtifacts?: KernelArtifact[]
+  evidence?: import('../context/evidence.js').EvidenceItem[]
   work: WorkItem
   persona: { name: string; role: string; instructions: string }
   capabilities: string[]
@@ -275,6 +286,7 @@ export interface SteerInput {
   id: string
   text: string
   createdAt: string
+  attachments?: import('../context/attachments.js').RequestAttachment[]
 }
 
 export interface HeartbeatResult {
@@ -294,11 +306,11 @@ export interface HeartbeatResult {
  * same attempt before delivering it.
  */
 export interface AssistantMessage {
+  envelope: import('../outcome/envelope.js').ResponseEnvelope
   version: 2
   runId: string
   agentId: string
   sessionId: string
   threadId?: string
   body: string
-  data?: Record<string, unknown>
 }

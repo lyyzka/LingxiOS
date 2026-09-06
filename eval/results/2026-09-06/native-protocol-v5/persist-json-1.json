@@ -1,0 +1,126 @@
+{
+  "caseId": "persist-json",
+  "repeat": 1,
+  "originalInputSha256": "7e63aa0043d0519d469de8b2bb0e7257d1eb8833b6ce4ce362bde9f29d868027",
+  "checks": [
+    {
+      "id": "committed_response",
+      "status": "not_observed"
+    },
+    {
+      "id": "goal_status",
+      "status": "fail"
+    },
+    {
+      "id": "artifact_json",
+      "status": "not_observed"
+    }
+  ],
+  "failures": [],
+  "body": null,
+  "outcome": {
+    "gaps": [
+      "Execution failed before verified delivery"
+    ],
+    "status": "blocked",
+    "verification": "inconclusive",
+    "requestVersion": 1
+  },
+  "assessment": null,
+  "delivery": "not_observed",
+  "externalDelivery": null,
+  "executionDurationMs": 16091,
+  "modelCalls": [
+    {
+      "model": "Qwen/Qwen3.5-397B-A17B",
+      "usage": {
+        "available": true,
+        "inputTokens": 1836,
+        "outputTokens": 178
+      },
+      "diagnostics": {
+        "finishReasons": [
+          "tool_calls"
+        ]
+      }
+    },
+    {
+      "model": "Qwen/Qwen3.5-397B-A17B",
+      "usage": {
+        "available": true,
+        "inputTokens": 2044,
+        "outputTokens": 467
+      },
+      "diagnostics": {
+        "finishReasons": [
+          "stop"
+        ]
+      }
+    },
+    {
+      "model": "Qwen/Qwen3.5-397B-A17B",
+      "usage": {
+        "available": true,
+        "inputTokens": 2339,
+        "outputTokens": 226
+      },
+      "diagnostics": {
+        "finishReasons": [
+          "tool_calls"
+        ]
+      }
+    },
+    {
+      "model": "Qwen/Qwen3.5-397B-A17B",
+      "usage": {
+        "available": true,
+        "inputTokens": 2515,
+        "outputTokens": 503
+      },
+      "diagnostics": {
+        "finishReasons": [
+          "stop"
+        ]
+      }
+    }
+  ],
+  "runtimeFailures": [
+    {
+      "kind": "response.withheld",
+      "error": "final checks must refer to the original request or revisions"
+    },
+    {
+      "kind": "response.withheld",
+      "error": "final checks must refer to the original request or revisions"
+    },
+    {
+      "kind": "run.failed",
+      "error": "tool protocol correction exhausted: Correct the final JSON object against the original request. final checks must refer to the original request or revisions"
+    }
+  ],
+  "toolCalls": [
+    {
+      "name": "ipython",
+      "type": "function_call",
+      "callId": "01a0754936f15c4e46d5646a3991c5ee",
+      "arguments": "{\"code\": \"import json\\n\\n# Create the JSON file\\ndata = {\\\"sum\\\": 385}\\nwith open(\\\"answer.json\\\", \\\"w\\\") as f:\\n    json.dump(data, f)\\n\\n# Attach the file as an artifact\\nattach_file(\\\"answer.json\\\")\\n\\nprint(\\\"Created and attached answer.json\\\")\"}"
+    },
+    {
+      "name": "ipython",
+      "type": "function_call",
+      "callId": "01a0754955ea5d59f09356e33dd6cea2",
+      "arguments": "{\"code\": \"import json\\n\\n# Verify the file exists and has correct content\\nwith open(\\\"answer.json\\\", \\\"r\\\") as f:\\n    content = json.load(f)\\n    \\nprint(f\\\"File content: {content}\\\")\\nattach_file(\\\"answer.json\\\")\"}"
+    }
+  ],
+  "resourceObservations": [
+    {
+      "resource": "artifact:answer.json",
+      "requestVersion": 1,
+      "value": {
+        "status": "not_observed"
+      }
+    }
+  ],
+  "timedOut": false,
+  "durationMs": 16099
+}

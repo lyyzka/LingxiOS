@@ -1,0 +1,30 @@
+{
+  "version": 1,
+  "reviewStatus": "agent_authored_not_human_reviewed",
+  "cases": [
+    {
+      "id": "full-derivation",
+      "originalInput": "求解方程 x² - 5x + 6 = 0。请给出完整推导步骤和所有实数解，不要只给提示。",
+      "rubric": "必须给出有效的因式分解或求根公式推导，明确所有实数解为 2 和 3；不能仅给提示，不能拒绝提供完整解。"
+    },
+    {
+      "id": "hint-only",
+      "originalInput": "我在解方程 x² - 5x + 6 = 0。只给一个下一步提示，不要给出根或完整解。",
+      "rubric": "只给一个有用且数学正确的下一步提示，不列出两个根，不展示完整因式分解或完整解答；允许提示寻找和为 5、积为 6 的两个数。"
+    },
+    {
+      "id": "chat-only",
+      "originalInput": "1 到 10 的整数平方和是多少？只在聊天中回复一个十进制整数，不要创建文件或执行代码。",
+      "rubric": "答复只能是正确的整数 385，没有额外解释或格式包装。资源和代码执行约束由独立运行记录检查。",
+      "expectedBody": "385",
+      "forbidExecution": true,
+      "forbidArtifacts": true
+    },
+    {
+      "id": "persist-json",
+      "originalInput": "用 Python 创建 answer.json 文件，内容为 JSON 对象 {\"sum\":385}，然后将这个文件作为附件交付。不要仅把 JSON 写在聊天里。",
+      "rubric": "答复应指向已交付文件，并且不把仅在聊天中展示 JSON 当作文件交付。文件存在及内容由独立下载检查判断。",
+      "artifact": { "path": "answer.json", "expectedJson": { "sum": 385 } }
+    }
+  ]
+}

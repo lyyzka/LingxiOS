@@ -27,9 +27,10 @@ export const DEFAULT_COMPACTION: CompactionOptions = {
   maxSummaryChars: 24_000,
 }
 
-/** Cheap, provider-independent token estimate (chars / 4). */
+/** Conservative byte bound for byte-based tokenizers, including multilingual input. */
 export function estimateTokens(items: readonly ModelItem[]): number {
-  return Math.ceil(JSON.stringify(items).length / 4)
+  // ponytail: byte bound underuses context; use a model tokenizer when utilization matters.
+  return new TextEncoder().encode(JSON.stringify(items)).length
 }
 
 export interface CompactionOutcome {
@@ -63,19 +64,36 @@ export async function compactIfNeeded(
   model: ModelDriver,
   options: CompactionOptions,
   signal?: AbortSignal,
+  overheadTokens = 0,
 ): Promise<CompactionOutcome> {
-  const estimated = estimateTokens(session.history)
+  const estimated = estimateTokens(session.history) + overheadTokens
   const softLimit = Math.floor(options.contextWindowTokens * options.softRatio)
   if (estimated < softLimit) return { compacted: false }
   // Nothing to fold: the tail alone exceeds the limit. Let the model turn
   // fail naturally rather than summarizing an empty prefix.
   if (session.history.length <= options.keepTailItems) return { compacted: false }
 
-  const keep = session.history.slice(-options.keepTailItems)
-  const summarize = session.history.slice(0, -options.keepTailItems)
+  let boundary = session.history.length - options.keepTailItems
+  // Keep every call with its output, including cells adjacent to the cut.
+  for (let index = boundary; index < session.history.length; index++) {
+    const item = session.history[index]!
+    if ('type' in item && item.type === 'function_call_output') {
+      const callIndex = session.history.findIndex((candidate) =>
+        'type' in candidate && candidate.type === 'function_call' && candidate.callId === item.callId)
+      if (callIndex >= 0) boundary = Math.min(boundary, callIndex)
+    }
+  }
+  if (boundary === 0) return { compacted: false }
+  const keep = session.history.slice(boundary)
+  const summarize = session.history.slice(0, boundary)
+  const priorSummary = session.summary
+  if (priorSummary && !summarize.some((item) =>
+    'role' in item && item.content === `${SUMMARY_PREFIX}${priorSummary}`)) {
+    summarize.unshift(summaryItem(priorSummary))
+  }
   try {
     const call = await model.compact({ instructions, items: summarize, signal })
-    let combined = [session.summary, call.value].filter(Boolean).join('\n\n')
+    let combined = call.value
     let usage = { model: call.model, ...call.usage }
     if (combined.length > options.maxSummaryChars) {
       const recompacted = await model.compact({

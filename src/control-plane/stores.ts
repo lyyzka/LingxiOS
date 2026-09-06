@@ -8,7 +8,7 @@
  * - a session is routed to one worker; re-routing to a different live worker
  *   is forbidden, and taking over a dead worker's session bumps `homeEpoch`;
  * - events are deduplicated on `(runId, seq)`;
- * - host actions are executed at most once per idempotency key.
+ * - intents precede execution; a missing receipt requires reconciliation.
  */
 import type {
   HostActionResult, ModelItem, RunEvent, SessionRecord,
@@ -66,6 +66,7 @@ export interface WorkStoreOptions {
 }
 
 export interface WorkStore {
+  hasPendingChild(parent: Omit<WorkItem, 'leaseToken'>, childId: string, requestVersion: number): Promise<boolean>
   enqueue(input: EnqueueWorkInput): Promise<EnqueueResult>
 
   /**
@@ -130,7 +131,24 @@ export interface EventStore {
 // Action ledger
 // ---------------------------------------------------------------------------
 
+export interface ActionIntent {
+  workId: string
+  tenantId: string
+  principalId: string | null
+  agentId: string
+  sessionId: string
+  threadId: string | null
+  requestVersion: number | null
+  action: import('../protocol/types.js').HostAction
+}
+
 export interface ActionLedgerStore {
+  hasWait(workId: string, requestVersion: number, wait: { approvalId: string } | { question: string }): Promise<boolean>
+  /** At most 65 unresolved business actions; callers report truncation above 64. */
+  unsettled(workId: string): Promise<Array<{ actionKey: string; action: string; state: 'unknown' | 'awaiting_approval' }>>
+  /** Persist intent before execution; mismatched reuse must throw. */
+  reserve(idempotencyKey: string, fingerprint: string, intent: ActionIntent): Promise<'started' | 'existing'>
+  findIntent(idempotencyKey: string): Promise<ActionIntent | null>
   /** The recorded result for this idempotency key, if the action already ran. */
   find(idempotencyKey: string): Promise<HostActionResult | null>
   /**
@@ -147,6 +165,8 @@ export interface ActionLedgerStore {
 /** Assembles everything but `work` in a TurnContext. */
 export interface ContextProvider {
   loadContext(work: Omit<WorkItem, 'leaseToken'>): Promise<{
+    memory?: import('../memory/store.js').MemorySnapshot
+    evidence?: import('../context/evidence.js').EvidenceItem[]
     persona: { name: string; role: string; instructions: string }
     capabilities: string[]
     messages: Array<{
@@ -162,6 +182,8 @@ export interface ContextProvider {
 /** Executes one granted host action against the product. */
 export interface ActionExecutor {
   execute(work: Omit<WorkItem, 'leaseToken'>, action: import('../protocol/types.js').HostAction): Promise<HostActionResult>
+  /** Package-owned, explicit read-only allowlist; never route unknown methods to execute. */
+  readResource?(work: Omit<WorkItem, 'leaseToken'>, action: import('../protocol/types.js').HostAction): Promise<unknown>
 }
 
 /**
@@ -174,6 +196,8 @@ export interface CapabilityResolver {
 
 /** Streams events and delivers final messages to product surfaces. */
 export interface DeliveryPort {
+  /** Durable final response, used to validate completion and restart recovery. */
+  getMessage?(work: Omit<WorkItem, 'leaseToken'>): Promise<import('../protocol/types.js').AssistantMessage | null>
   onEvent(work: Omit<WorkItem, 'leaseToken'>, event: RunEvent): Promise<void>
   deliverMessage(work: Omit<WorkItem, 'leaseToken'>, message: import('../protocol/types.js').AssistantMessage): Promise<void>
 }

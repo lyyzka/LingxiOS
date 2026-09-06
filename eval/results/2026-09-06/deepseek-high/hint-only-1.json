@@ -1,0 +1,69 @@
+{
+  "caseId": "hint-only",
+  "repeat": 1,
+  "originalInputSha256": "27215f1bbd766dd539e8ebd52c331c9148cbb75ef12ed919697313eb92bb97e1",
+  "checks": [
+    {
+      "id": "committed_response",
+      "status": "pass"
+    },
+    {
+      "id": "goal_status",
+      "status": "pass"
+    }
+  ],
+  "failures": [],
+  "body": "下一步提示：尝试把左边因式分解成两个一次因式的乘积——即找两个数，使它们的乘积等于常数项 6，且这两个数的和等于一次项系数 -5（注意符号）。",
+  "outcome": {
+    "status": "satisfied",
+    "verification": "not_run",
+    "requestVersion": 1
+  },
+  "assessment": {
+    "gaps": [],
+    "checks": [
+      {
+        "basis": "回复只给出因式分解这一条提示，并指出所需的两个数的条件（积为6、和为-5），没有写出根或完整解法。",
+        "status": "met",
+        "requirement": "只给一个下一步提示，不要给出根或完整解"
+      }
+    ],
+    "status": "satisfied"
+  },
+  "delivery": "observed",
+  "externalDelivery": "not_observed",
+  "executionDurationMs": 3491,
+  "modelCalls": [
+    {
+      "model": "deepseek-ai/DeepSeek-V4-Flash",
+      "usage": {
+        "available": true,
+        "inputTokens": 1881,
+        "outputTokens": 415
+      },
+      "diagnostics": {
+        "finishReasons": [
+          "stop"
+        ]
+      }
+    }
+  ],
+  "runtimeFailures": [],
+  "toolCalls": [],
+  "review": {
+    "kind": "model_review",
+    "calibration": "not_calibrated",
+    "inputSha256": "d4f7c86f77c0a4d6af6d630bda6a2bd72127ec2ec2c4c7c9543e9b39f06b45a4",
+    "model": "deepseek-ai/DeepSeek-V4-Flash",
+    "verdict": "meets_rubric",
+    "rationale": "答案只提供了一个下一步提示：建议将左边因式分解成两个一次因式的乘积，并寻找乘积为常数项6、和为一次项系数-5的两个数。该提示数学上正确，且没有列出两个根、没有展示完整因式分解或完整解答，符合用户“只给一个下一步提示”的要求。",
+    "usage": {
+      "available": true,
+      "inputTokens": 404,
+      "outputTokens": 306
+    },
+    "durationMs": 2739
+  },
+  "timedOut": false,
+  "durationMs": 6239
+}

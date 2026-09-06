@@ -1,0 +1,67 @@
+{
+  "caseId": "hint-only",
+  "repeat": 1,
+  "originalInputSha256": "27215f1bbd766dd539e8ebd52c331c9148cbb75ef12ed919697313eb92bb97e1",
+  "checks": [
+    {
+      "id": "committed_response",
+      "status": "pass"
+    },
+    {
+      "id": "goal_status",
+      "status": "pass"
+    }
+  ],
+  "failures": [
+    "Semantic review unavailable: model response did not finish normally"
+  ],
+  "body": "一个可能的下一步是：尝试寻找两个数，它们的乘积是6，和是-5（因为常数项+6=6，一次项系数-5等于这两个数的和）。",
+  "outcome": {
+    "status": "satisfied",
+    "verification": "not_run",
+    "requestVersion": 1
+  },
+  "assessment": {
+    "gaps": [],
+    "checks": [
+      {
+        "basis": "提供了一个关于因式分解的提示",
+        "status": "met",
+        "requirement": "只给一个下一步提示"
+      },
+      {
+        "basis": "没有给出x=2或x=3的答案",
+        "status": "met",
+        "requirement": "不要给出根或完整解"
+      }
+    ],
+    "status": "satisfied"
+  },
+  "delivery": "observed",
+  "externalDelivery": "not_observed",
+  "executionDurationMs": 6482,
+  "modelCalls": [
+    {
+      "model": "Qwen/Qwen3.5-4B",
+      "usage": {
+        "available": true,
+        "inputTokens": 1624,
+        "outputTokens": 367
+      },
+      "diagnostics": {
+        "finishReasons": [
+          "stop"
+        ]
+      }
+    }
+  ],
+  "runtimeFailures": [],
+  "toolCalls": [],
+  "reviewFailureDiagnostics": {
+    "finishReasons": [
+      "length"
+    ]
+  },
+  "timedOut": false,
+  "durationMs": 37907
+}

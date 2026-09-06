@@ -95,8 +95,24 @@ def kernel_audit(event: str, args: tuple[Any, ...]) -> None:
         mode = str(args[1]) if len(args) > 1 else "r"
         if is_within(path, HOMES_ROOT) and not is_within(path, ROOT):
             raise PermissionError("cross-session file access is disabled")
-        if any(flag in mode for flag in ("w", "a", "x", "+")) and not is_within(path, ROOT):
+        flags = args[2] if len(args) > 2 and isinstance(args[2], int) else 0
+        writing = any(flag in mode for flag in ("w", "a", "x", "+")) or flags & (os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_APPEND)
+        if writing and not is_within(path, ROOT):
             raise PermissionError("files may only be written inside this agent home")
+    if event in {"os.link", "os.symlink"}:
+        raise PermissionError("creating filesystem links is disabled in this kernel")
+    mutations = {
+        "os.remove": (1, (1,)), "os.rmdir": (1, (1,)), "os.mkdir": (1, (2,)),
+        "os.rename": (2, (2, 3)), "os.chmod": (1, (2,)), "os.chown": (1, (3,)),
+        "os.utime": (1, (3,)), "os.truncate": (1, ()),
+    }
+    if event in mutations:
+        count, descriptor_indices = mutations[event]
+        if any(len(args) > index and args[index] not in (-1, None) for index in descriptor_indices):
+            raise PermissionError("descriptor-relative filesystem mutations are disabled")
+        for target in args[:count]:
+            if not isinstance(target, (str, bytes, os.PathLike)) or not is_within(pathlib.Path(os.fsdecode(target)).resolve(), ROOT):
+                raise PermissionError("filesystem mutations must stay inside this agent home")
     if event in {"os.system", "subprocess.Popen"}:
         # A child process would escape the in-process audit fences, so shell
         # effects must go through a typed host capability instead.
@@ -111,6 +127,10 @@ sys.addaudithook(kernel_audit)
 # ---------------------------------------------------------------------------
 # Host bridge
 # ---------------------------------------------------------------------------
+
+class TurnDeferred(BaseException):
+    """Stop this cell after a host requests a human or delegated wait."""
+
 
 class ApprovalPending(RuntimeError):
     """Raised when a host action suspended into a human approval."""
@@ -155,6 +175,8 @@ class HostBridge:
         return allowed is None or method in allowed
 
     def call(self, action: str, args: dict[str, Any]) -> Any:
+        if any(directive.get("type") == "defer" for directive in self.directives):
+            raise TurnDeferred()
         index = self.call_index
         self.call_index += 1
         request_id = str(uuid.uuid4())
@@ -176,6 +198,8 @@ class HostBridge:
             raise RuntimeError(str(response.get("error") or "host action failed"))
         if isinstance(response.get("directive"), dict):
             self.directives.append(response["directive"])
+            if response["directive"].get("type") == "defer":
+                raise TurnDeferred()
         return response.get("value")
 
 
@@ -332,7 +356,7 @@ def file_snapshot() -> dict[str, tuple[int, int]]:
     found: dict[str, tuple[int, int]] = {}
     for path in ROOT.rglob("*"):
         try:
-            if path.is_file() and not path.is_symlink():
+            if is_within(path.resolve(), ROOT) and path.is_file() and not path.is_symlink():
                 stat = path.stat()
                 found[path.relative_to(ROOT).as_posix()] = (stat.st_size, stat.st_mtime_ns)
         except OSError:
@@ -340,21 +364,56 @@ def file_snapshot() -> dict[str, tuple[int, int]]:
     return found
 
 
+attached_files: set[str] = set()
+
+
+def attach_file(path: str) -> None:
+    """Include an existing home file in this cell's checked artifact output."""
+    if not isinstance(path, str) or not path or len(path) > 4096:
+        raise ValueError('attach_file requires a file path')
+    target = (ROOT / path).resolve()
+    if not is_within(target, ROOT) or not target.is_file():
+        raise ValueError('attached file must exist inside this agent home')
+    relative = target.relative_to(ROOT).as_posix()
+    if relative not in attached_files and len(attached_files) >= MAX_ARTIFACTS:
+        raise ValueError('too many attached files')
+    attached_files.add(relative)
+
+
+engine.user_ns['attach_file'] = attach_file
+
+
 def changed_artifacts(before: dict[str, tuple[int, int]]) -> list[dict[str, Any]]:
     artifacts: list[dict[str, Any]] = []
-    for relative, state in file_snapshot().items():
-        if before.get(relative) == state:
+    current = file_snapshot()
+    if attached_files - current.keys():
+        raise ValueError('an attached file is no longer available inside this agent home')
+    for relative in sorted(current, key=lambda path: path not in attached_files):
+        state = current[relative]
+        if before.get(relative) == state and relative not in attached_files:
             continue
         path = ROOT / relative
         try:
-            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+            if not is_within(path.resolve(), ROOT) or path.is_symlink():
+                continue
+            digest = hashlib.sha256()
+            bytes_read = 0
+            with path.open('rb') as stream:
+                for chunk in iter(lambda: stream.read(1024 * 1024), b''):
+                    digest.update(chunk)
+                    bytes_read += len(chunk)
+                final_stat = os.fstat(stream.fileno())
+            if bytes_read != state[0] or (final_stat.st_size, final_stat.st_mtime_ns) != state:
+                raise OSError('artifact changed while being hashed')
         except OSError:
+            if relative in attached_files:
+                raise
             continue
         artifacts.append({
             "path": relative,
             "size": state[0],
             "mime": mimetypes.guess_type(relative)[0] or "application/octet-stream",
-            "sha256": digest,
+            "sha256": digest.hexdigest(),
         })
         if len(artifacts) >= MAX_ARTIFACTS:
             break
@@ -369,6 +428,7 @@ def execute(message: dict[str, Any]) -> None:
     execution_id = str(message["id"])
     code = str(message["code"])
     bridge.begin(execution_id, message.get("context") or {})
+    attached_files.clear()
     stdout = io.StringIO()
     stderr = io.StringIO()
     started = time.monotonic()
@@ -384,6 +444,8 @@ def execute(message: dict[str, Any]) -> None:
             result_value = safe_result(outcome.result)
     except ApprovalPending as pending:
         approval_id = pending.approval_id
+    except TurnDeferred:
+        pass
     except BaseException as exc:
         error = "".join(traceback.format_exception_only(type(exc), exc)).strip()
 
@@ -395,6 +457,11 @@ def execute(message: dict[str, Any]) -> None:
         out = out[:remaining]
         remaining -= len(out)
         err = err[: max(0, remaining)]
+    try:
+        artifacts = changed_artifacts(files_before)
+    except (OSError, ValueError) as exc:
+        artifacts = []
+        error = str(exc)
     emit({
         "type": "execution_result",
         "id": execution_id,
@@ -406,7 +473,7 @@ def execute(message: dict[str, Any]) -> None:
         "approvalId": approval_id,
         "truncated": truncated,
         "durationMs": round((time.monotonic() - started) * 1000),
-        "artifacts": changed_artifacts(files_before),
+        "artifacts": artifacts,
         "directives": bridge.directives,
     })
 
