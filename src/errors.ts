@@ -12,6 +12,10 @@ export class AgentOSError extends Error {
   }
 }
 
+export class ModelBudgetExceededError extends AgentOSError {
+  constructor(message: string) { super('model_budget_exhausted', message) }
+}
+
 // Lease / work lifecycle ----------------------------------------------------
 
 /** The control plane no longer recognizes this (id, fence, token) lease. */

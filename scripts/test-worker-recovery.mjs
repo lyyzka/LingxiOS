@@ -4,7 +4,7 @@ import { randomUUID } from 'node:crypto'
 import { once } from 'node:events'
 import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import { createServer } from 'node:http'
-import { createRequire } from 'node:module'
+import { Pool } from 'pg'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
@@ -14,7 +14,6 @@ import { createLingxiOS, packageResources } from 'lingxios'
 const connectionString = process.env.LINGXIOS_WORKER_TEST_DATABASE_URL
 assert.ok(connectionString, 'configure a fresh disposable PostgreSQL database for worker recovery')
 const source = resolve(process.env.LINGXILOOP_SOURCE ?? fileURLToPath(new URL('../../LingxiLoop/server/src', import.meta.url)))
-const { Pool } = createRequire(resolve(source, '../package.json'))('pg')
 const pool = new Pool({ connectionString, max: 4, connectionTimeoutMillis: 5000 })
 const directory = await mkdtemp(join(tmpdir(), 'lingxios-worker-recovery-'))
 const homesRoot = join(directory, 'homes')

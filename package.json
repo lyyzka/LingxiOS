@@ -53,7 +53,7 @@
     "build": "node scripts/build.mjs",
     "prepack": "npm run build",
     "prepublishOnly": "npm run check:release",
-    "check:release": "npm test && npm run test:contracts && npm run test:postgres-stores && npm run test:worker-recovery && npm run test:native-calendar && npm run test:native-documents && npm run test:native-document-content && npm run test:native-polls && npm run test:native-presentations && npm run test:native-teacher && npm run test:native-missions && npm run test:native-evidence && npm run test:native-canvas && npm run test:native-canvas-work && npm run test:native-learning",
+    "check:release": "node scripts/check-release.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "npm run build && node --test --test-concurrency=1 \"dist/test/**/*.test.js\"",
     "test:only": "node --test --test-concurrency=1 \"dist/test/**/*.test.js\"",
@@ -78,6 +78,7 @@
   "devDependencies": {
     "@electric-sql/pglite": "0.5.8",
     "@types/node": "^20.17.0",
+    "pg": "8.20.0",
     "typescript": "^5.7.0"
   },
   "dependencies": {

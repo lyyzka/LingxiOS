@@ -1,18 +1,18 @@
--- LingxiOS Agent OS — control-plane schema (protocol v2)
+-- LingxiOS Agent OS — control-plane schema (protocol v3)
 --
 -- Apply with: psql -f db/schema.sql
 -- All tables are owned by the control plane; workers never touch the database.
 
-CREATE SCHEMA IF NOT EXISTS lingxios;
+BEGIN;
+CREATE SCHEMA lingxios;
 
-CREATE TABLE IF NOT EXISTS lingxios.schema_version (
+CREATE TABLE lingxios.schema_version (
   singleton BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
   version INT NOT NULL
 );
-INSERT INTO lingxios.schema_version(singleton, version) VALUES(TRUE, 4)
-ON CONFLICT (singleton) DO UPDATE SET version=GREATEST(lingxios.schema_version.version, EXCLUDED.version);
 
-CREATE TABLE IF NOT EXISTS lingxios.agent_work_items (
+
+CREATE TABLE lingxios.agent_work_items (
   id                   TEXT PRIMARY KEY,
   fence                BIGINT NOT NULL DEFAULT 0,
   tenant_id            TEXT NOT NULL,
@@ -44,11 +44,11 @@ CREATE TABLE IF NOT EXISTS lingxios.agent_work_items (
   updated_at           TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX IF NOT EXISTS agent_work_items_claim_idx
+CREATE INDEX agent_work_items_claim_idx
   ON lingxios.agent_work_items (status, available_at)
   WHERE status IN ('queued','leased');
 
-CREATE TABLE IF NOT EXISTS lingxios.agent_model_budgets (
+CREATE TABLE lingxios.agent_model_budgets (
   root_work_id       TEXT PRIMARY KEY REFERENCES lingxios.agent_work_items(id),
   max_model_calls    INT NOT NULL CHECK (max_model_calls > 0),
   max_tokens         BIGINT NOT NULL CHECK (max_tokens > 0),
@@ -60,9 +60,11 @@ CREATE TABLE IF NOT EXISTS lingxios.agent_model_budgets (
   updated_at         TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-CREATE TABLE IF NOT EXISTS lingxios.agent_model_budget_calls (
+CREATE TABLE lingxios.agent_model_budget_calls (
   root_work_id TEXT NOT NULL REFERENCES lingxios.agent_model_budgets(root_work_id) ON DELETE CASCADE,
   call_id      TEXT NOT NULL,
+  reserved_tokens BIGINT NOT NULL DEFAULT 0 CHECK (reserved_tokens >= 0),
+  reserved_cost_micros BIGINT NOT NULL DEFAULT 0 CHECK (reserved_cost_micros >= 0),
   input_tokens BIGINT,
   output_tokens BIGINT,
   cost_micros  BIGINT,
@@ -71,20 +73,20 @@ CREATE TABLE IF NOT EXISTS lingxios.agent_model_budget_calls (
 
 -- Native professional HTML lecture decks. The record is versioned as one
 -- immutable JSON document; checkpoints make long generation resumable.
-CREATE TABLE IF NOT EXISTS lingxios.lecture_decks (
+CREATE TABLE lingxios.lecture_decks (
   id           TEXT PRIMARY KEY,
   tenant_id    TEXT NOT NULL,
   principal_id TEXT NOT NULL,
   revision     INT NOT NULL CHECK (revision > 0),
-  status       TEXT NOT NULL CHECK (status IN ('planning','generating','validating','publishing','ready','failed','cancelled')),
+  status       TEXT NOT NULL CHECK (status IN ('planning','awaiting_outline_approval','generating','validating','publishing','ready','failed','cancelled')),
   record       JSONB NOT NULL CHECK (jsonb_typeof(record) = 'object'),
   created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   UNIQUE (tenant_id, id)
 );
-CREATE INDEX IF NOT EXISTS lecture_decks_owner_idx ON lingxios.lecture_decks(tenant_id,principal_id,updated_at DESC);
+CREATE INDEX lecture_decks_owner_idx ON lingxios.lecture_decks(tenant_id,principal_id,updated_at DESC);
 
-CREATE TABLE IF NOT EXISTS lingxios.lecture_checkpoints (
+CREATE TABLE lingxios.lecture_checkpoints (
   deck_id      TEXT NOT NULL REFERENCES lingxios.lecture_decks(id) ON DELETE CASCADE,
   revision     INT NOT NULL CHECK (revision > 0),
   stage        TEXT NOT NULL CHECK (stage IN ('plan-course','plan-chapter','author-slide','validate-slide','repair-slide','validate-deck','publish-deck')),
@@ -99,18 +101,19 @@ CREATE TABLE IF NOT EXISTS lingxios.lecture_checkpoints (
 
 -- A retried claim returns the original answer, including null, instead of
 -- leasing another work item after the first response was lost.
-CREATE TABLE IF NOT EXISTS lingxios.agent_claim_requests (
+CREATE TABLE lingxios.agent_claim_requests (
   request_id TEXT PRIMARY KEY,
   worker_id TEXT NOT NULL,
+  work_kinds JSONB NOT NULL,
   completed BOOLEAN NOT NULL DEFAULT FALSE,
   response JSONB,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
-CREATE INDEX IF NOT EXISTS agent_claim_requests_created_idx
+CREATE INDEX agent_claim_requests_created_idx
   ON lingxios.agent_claim_requests(created_at) WHERE completed=TRUE;
 
 -- Package-owned schedules; no dependency on the retired product agent runtime.
-CREATE TABLE IF NOT EXISTS lingxios.agent_routines (
+CREATE TABLE lingxios.agent_routines (
   id TEXT PRIMARY KEY,
   tenant_id TEXT NOT NULL,
   agent_id TEXT NOT NULL,
@@ -134,9 +137,9 @@ CREATE TABLE IF NOT EXISTS lingxios.agent_routines (
   CHECK (kind='teacher_digest' OR (title IS NOT NULL AND instructions IS NOT NULL AND course_id IS NULL)),
   CHECK ((status='active' AND next_run_at IS NOT NULL) OR (status='paused' AND next_run_at IS NULL))
 );
-CREATE UNIQUE INDEX IF NOT EXISTS agent_teacher_digest_scope_idx ON lingxios.agent_routines(tenant_id,agent_id,session_id,kind) WHERE kind='teacher_digest';
-CREATE INDEX IF NOT EXISTS agent_routines_due_idx ON lingxios.agent_routines(next_run_at) WHERE status='active';
-CREATE TABLE IF NOT EXISTS lingxios.agent_routine_runs (
+CREATE UNIQUE INDEX agent_teacher_digest_scope_idx ON lingxios.agent_routines(tenant_id,agent_id,session_id,kind) WHERE kind='teacher_digest';
+CREATE INDEX agent_routines_due_idx ON lingxios.agent_routines(next_run_at) WHERE status='active';
+CREATE TABLE lingxios.agent_routine_runs (
   routine_id TEXT NOT NULL REFERENCES lingxios.agent_routines(id) ON DELETE CASCADE,
   routine_version INT NOT NULL,
   scheduled_at TIMESTAMPTZ NOT NULL,
@@ -145,7 +148,7 @@ CREATE TABLE IF NOT EXISTS lingxios.agent_routine_runs (
 );
 
 -- One live lease per session key.
-CREATE TABLE IF NOT EXISTS lingxios.agent_os_session_leases (
+CREATE TABLE lingxios.agent_os_session_leases (
   session_key TEXT PRIMARY KEY,
   work_id     TEXT NOT NULL,
   fence       BIGINT NOT NULL,
@@ -154,7 +157,7 @@ CREATE TABLE IF NOT EXISTS lingxios.agent_os_session_leases (
 );
 
 -- Session -> worker routing with home epochs.
-CREATE TABLE IF NOT EXISTS lingxios.agent_os_session_routes (
+CREATE TABLE lingxios.agent_os_session_routes (
   session_key TEXT PRIMARY KEY,
   worker_id   TEXT NOT NULL,
   home_epoch  BIGINT NOT NULL DEFAULT 1,
@@ -162,14 +165,14 @@ CREATE TABLE IF NOT EXISTS lingxios.agent_os_session_routes (
 );
 
 -- Worker liveness.
-CREATE TABLE IF NOT EXISTS lingxios.agent_os_workers (
+CREATE TABLE lingxios.agent_os_workers (
   worker_id    TEXT PRIMARY KEY,
   last_seen_at TIMESTAMPTZ NOT NULL,
   updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 -- Durable conversational sessions (optimistic concurrency via revision).
-CREATE TABLE IF NOT EXISTS lingxios.agent_os_sessions (
+CREATE TABLE lingxios.agent_os_sessions (
   session_key      TEXT PRIMARY KEY,
   tenant_id        TEXT NOT NULL,
   agent_id         TEXT NOT NULL,
@@ -187,7 +190,7 @@ CREATE TABLE IF NOT EXISTS lingxios.agent_os_sessions (
 
 -- Run event ledger: dedupe on (run_id, seq); the attempt range is enforced by
 -- the control plane before insert.
-CREATE TABLE IF NOT EXISTS lingxios.agent_run_events (
+CREATE TABLE lingxios.agent_run_events (
   run_id      TEXT NOT NULL,
   seq         BIGINT NOT NULL,
   tenant_id   TEXT NOT NULL,
@@ -200,11 +203,10 @@ CREATE TABLE IF NOT EXISTS lingxios.agent_run_events (
   expires_at  TIMESTAMPTZ,
   PRIMARY KEY (run_id, seq)
 );
-ALTER TABLE lingxios.agent_run_events ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ;
-CREATE INDEX IF NOT EXISTS agent_run_events_expiry_idx ON lingxios.agent_run_events(expires_at) WHERE expires_at IS NOT NULL;
+CREATE INDEX agent_run_events_expiry_idx ON lingxios.agent_run_events(expires_at) WHERE expires_at IS NOT NULL;
 
 -- An intent without a receipt is uncertain, never automatically re-executed.
-CREATE TABLE IF NOT EXISTS lingxios.agent_action_intents (
+CREATE TABLE lingxios.agent_action_intents (
   idempotency_key TEXT PRIMARY KEY,
   fingerprint TEXT NOT NULL,
   intent JSONB NOT NULL CHECK (jsonb_typeof(intent) = 'object'),
@@ -212,13 +214,13 @@ CREATE TABLE IF NOT EXISTS lingxios.agent_action_intents (
 );
 
 -- Receipts complement pre-execution intents; missing receipts require reconciliation.
-CREATE TABLE IF NOT EXISTS lingxios.agent_action_ledger (
+CREATE TABLE lingxios.agent_action_ledger (
   idempotency_key TEXT PRIMARY KEY REFERENCES lingxios.agent_action_intents(idempotency_key),
   result          JSONB NOT NULL,
   recorded_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-CREATE TABLE IF NOT EXISTS lingxios.agent_messages (
+CREATE TABLE lingxios.agent_messages (
   run_id TEXT PRIMARY KEY,
   tenant_id TEXT NOT NULL,
   agent_id TEXT NOT NULL,
@@ -228,7 +230,7 @@ CREATE TABLE IF NOT EXISTS lingxios.agent_messages (
   committed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-CREATE TABLE IF NOT EXISTS lingxios.agent_delivery_outbox (
+CREATE TABLE lingxios.agent_delivery_outbox (
   run_id TEXT PRIMARY KEY REFERENCES lingxios.agent_messages(run_id),
   work JSONB NOT NULL,
   delivered_at TIMESTAMPTZ,
@@ -239,22 +241,22 @@ CREATE TABLE IF NOT EXISTS lingxios.agent_delivery_outbox (
 
 -- Each unfinished request owns its snapshot; the session row only keeps the
 -- active pointer for backward-compatible readers.
-CREATE TABLE IF NOT EXISTS lingxios.agent_request_snapshots (
+CREATE TABLE lingxios.agent_request_snapshots (
   work_id          TEXT PRIMARY KEY REFERENCES lingxios.agent_work_items(id) ON DELETE CASCADE,
   session_key      TEXT NOT NULL REFERENCES lingxios.agent_os_sessions(session_key) ON DELETE CASCADE,
   request_snapshot JSONB NOT NULL CHECK (jsonb_typeof(request_snapshot)='object'),
   updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
-CREATE INDEX IF NOT EXISTS agent_request_snapshots_session_idx
+CREATE INDEX agent_request_snapshots_session_idx
   ON lingxios.agent_request_snapshots(session_key);
 
-CREATE TABLE IF NOT EXISTS lingxios.agent_inbox_events (
+CREATE TABLE lingxios.agent_inbox_events (
   event_id    TEXT PRIMARY KEY,
   work_input  JSONB NOT NULL CHECK (jsonb_typeof(work_input)='object'),
   recorded_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-CREATE OR REPLACE FUNCTION lingxios.sync_agent_request_snapshot() RETURNS trigger AS $$
+CREATE FUNCTION lingxios.sync_agent_request_snapshot() RETURNS trigger AS $$
 BEGIN
   IF NEW.request_snapshot IS NOT NULL AND NEW.request_snapshot->>'workId' IS NOT NULL THEN
     INSERT INTO lingxios.agent_request_snapshots(work_id,session_key,request_snapshot)
@@ -265,7 +267,6 @@ BEGIN
   RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
-DROP TRIGGER IF EXISTS agent_session_request_snapshot ON lingxios.agent_os_sessions;
 CREATE TRIGGER agent_session_request_snapshot AFTER INSERT OR UPDATE OF request_snapshot ON lingxios.agent_os_sessions
 FOR EACH ROW EXECUTE FUNCTION lingxios.sync_agent_request_snapshot();
 
@@ -276,20 +277,19 @@ ON CONFLICT(work_id) DO NOTHING;
 
 -- Reconciliation is append-only: it settles an uncertain action without
 -- overwriting either the pre-execution intent or its original receipt.
-CREATE TABLE IF NOT EXISTS lingxios.agent_action_resolutions (
+CREATE TABLE lingxios.agent_action_resolutions (
   resolution_id TEXT PRIMARY KEY,
   resolution_seq BIGSERIAL,
   idempotency_key TEXT NOT NULL REFERENCES lingxios.agent_action_intents(idempotency_key),
   resolution JSONB NOT NULL CHECK (jsonb_typeof(resolution) = 'object'),
   recorded_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
-ALTER TABLE lingxios.agent_action_resolutions ADD COLUMN IF NOT EXISTS resolution_seq BIGSERIAL;
-CREATE UNIQUE INDEX IF NOT EXISTS agent_action_resolutions_seq_idx
+CREATE UNIQUE INDEX agent_action_resolutions_seq_idx
   ON lingxios.agent_action_resolutions(resolution_seq);
-CREATE INDEX IF NOT EXISTS agent_action_resolutions_action_idx
+CREATE INDEX agent_action_resolutions_action_idx
   ON lingxios.agent_action_resolutions(idempotency_key, resolution_seq DESC);
 
-CREATE TABLE IF NOT EXISTS lingxios.agent_calendar_outbox (
+CREATE TABLE lingxios.agent_calendar_outbox (
   id TEXT PRIMARY KEY REFERENCES lingxios.agent_action_intents(idempotency_key),
   work_id TEXT NOT NULL REFERENCES lingxios.agent_work_items(id),
   event JSONB NOT NULL CHECK (jsonb_typeof(event)='object' AND event->>'type'='calendar.changed'),
@@ -298,10 +298,10 @@ CREATE TABLE IF NOT EXISTS lingxios.agent_calendar_outbox (
   claim_token TEXT,
   attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts BETWEEN 0 AND 30)
 );
-CREATE INDEX IF NOT EXISTS agent_calendar_outbox_pending
+CREATE INDEX agent_calendar_outbox_pending
   ON lingxios.agent_calendar_outbox(available_at,id) WHERE delivered_at IS NULL;
 
-CREATE TABLE IF NOT EXISTS lingxios.agent_canvas_outbox (
+CREATE TABLE lingxios.agent_canvas_outbox (
   id TEXT PRIMARY KEY,
   event JSONB NOT NULL CHECK (jsonb_typeof(event)='object' AND event->>'type'='canvas.changed'),
   delivered_at TIMESTAMPTZ,
@@ -309,10 +309,10 @@ CREATE TABLE IF NOT EXISTS lingxios.agent_canvas_outbox (
   claim_token TEXT,
   attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts BETWEEN 0 AND 30)
 );
-CREATE INDEX IF NOT EXISTS agent_canvas_outbox_pending
+CREATE INDEX agent_canvas_outbox_pending
   ON lingxios.agent_canvas_outbox(available_at,id) WHERE delivered_at IS NULL;
 
-CREATE TABLE IF NOT EXISTS lingxios.agent_document_outbox (
+CREATE TABLE lingxios.agent_document_outbox (
   id TEXT PRIMARY KEY,
   event JSONB NOT NULL CHECK (jsonb_typeof(event)='object' AND event->>'type' IN ('doc.changed','doc.update')),
   delivered_at TIMESTAMPTZ,
@@ -320,10 +320,10 @@ CREATE TABLE IF NOT EXISTS lingxios.agent_document_outbox (
   claim_token TEXT,
   attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts BETWEEN 0 AND 30)
 );
-CREATE INDEX IF NOT EXISTS agent_document_outbox_pending
+CREATE INDEX agent_document_outbox_pending
   ON lingxios.agent_document_outbox(available_at,id) WHERE delivered_at IS NULL;
 
-CREATE TABLE IF NOT EXISTS lingxios.agent_memories (
+CREATE TABLE lingxios.agent_memories (
   tenant_id TEXT NOT NULL,
   id TEXT NOT NULL,
   scope_type TEXT NOT NULL CHECK (scope_type IN ('learner','course','agent_role')),
@@ -339,9 +339,9 @@ CREATE TABLE IF NOT EXISTS lingxios.agent_memories (
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   PRIMARY KEY (tenant_id,id)
 );
-CREATE INDEX IF NOT EXISTS agent_memories_scope ON lingxios.agent_memories(tenant_id,scope_type,scope_id,updated_at DESC);
+CREATE INDEX agent_memories_scope ON lingxios.agent_memories(tenant_id,scope_type,scope_id,updated_at DESC);
 
-CREATE TABLE IF NOT EXISTS lingxios.agent_memory_embeddings (
+CREATE TABLE lingxios.agent_memory_embeddings (
   tenant_id TEXT NOT NULL,
   memory_id TEXT NOT NULL,
   version INTEGER NOT NULL CHECK (version > 0),
@@ -352,7 +352,7 @@ CREATE TABLE IF NOT EXISTS lingxios.agent_memory_embeddings (
   FOREIGN KEY (tenant_id,memory_id) REFERENCES lingxios.agent_memories(tenant_id,id) ON DELETE CASCADE
 );
 
-CREATE TABLE IF NOT EXISTS lingxios.agent_memory_versions (
+CREATE TABLE lingxios.agent_memory_versions (
   tenant_id TEXT NOT NULL,
   memory_id TEXT NOT NULL,
   version INTEGER NOT NULL CHECK (version > 0),
@@ -364,7 +364,7 @@ CREATE TABLE IF NOT EXISTS lingxios.agent_memory_versions (
 
 -- Archive the replaced version in the mutation transaction. Explicit forgetting
 -- deletes its history through the foreign key instead of retaining forgotten text.
-CREATE OR REPLACE FUNCTION lingxios.archive_memory_version() RETURNS trigger
+CREATE FUNCTION lingxios.archive_memory_version() RETURNS trigger
 LANGUAGE plpgsql AS $$
 BEGIN
   IF NEW.version <= OLD.version THEN
@@ -375,12 +375,12 @@ BEGIN
   RETURN NEW;
 END;
 $$;
-CREATE OR REPLACE TRIGGER agent_memory_version_history
+CREATE TRIGGER agent_memory_version_history
   BEFORE UPDATE OF version ON lingxios.agent_memories
   FOR EACH ROW WHEN (OLD.version IS DISTINCT FROM NEW.version)
   EXECUTE FUNCTION lingxios.archive_memory_version();
 
-CREATE TABLE IF NOT EXISTS lingxios.agent_memory_evidence (
+CREATE TABLE lingxios.agent_memory_evidence (
   source_run_id TEXT PRIMARY KEY REFERENCES lingxios.agent_messages(run_id),
   tenant_id TEXT NOT NULL,
   agent_id TEXT NOT NULL,
@@ -399,7 +399,7 @@ CREATE TABLE IF NOT EXISTS lingxios.agent_memory_evidence (
 
 -- Invalidate sources atomically on every cancellation/continuation path, including
 -- server-side ingress that does not call the worker's control-plane methods.
-CREATE OR REPLACE FUNCTION lingxios.supersede_memory_evidence() RETURNS trigger
+CREATE FUNCTION lingxios.supersede_memory_evidence() RETURNS trigger
 LANGUAGE plpgsql AS $$
 BEGIN
   WITH superseded AS (
@@ -415,9 +415,12 @@ BEGIN
   RETURN NEW;
 END;
 $$;
-CREATE OR REPLACE TRIGGER agent_work_memory_evidence
+CREATE TRIGGER agent_work_memory_evidence
   AFTER UPDATE OF cancel_requested_at,status,steer_inputs ON lingxios.agent_work_items
   FOR EACH ROW
   WHEN (OLD.cancel_requested_at IS DISTINCT FROM NEW.cancel_requested_at
     OR OLD.status IS DISTINCT FROM NEW.status OR OLD.steer_inputs IS DISTINCT FROM NEW.steer_inputs)
   EXECUTE FUNCTION lingxios.supersede_memory_evidence();
+
+INSERT INTO lingxios.schema_version(singleton, version) VALUES(TRUE, 5);
+COMMIT;

@@ -17,6 +17,7 @@ import { lstat, mkdir, readFile, stat } from 'node:fs/promises'
 import { isAbsolute, relative, resolve } from 'node:path'
 import { createInterface, type Interface as ReadlineInterface } from 'node:readline'
 import { fileURLToPath } from 'node:url'
+import { sandboxCommand, checkKernelIsolation, kernelIsolation, type KernelLimits } from './isolation.js'
 import {
   KernelCancelledError, KernelExecutionError, KernelProtocolError, KernelTimeoutError,
   ApprovalPendingError, asError,
@@ -50,10 +51,11 @@ export interface KernelExecutor {
 
 export interface ManagedKernelExecutor extends KernelExecutor {
   readonly size: number
+  check?(): Promise<void>
   close(): void
 }
 
-export interface KernelManagerOptions {
+export interface KernelManagerOptions extends Partial<KernelLimits> {
   pythonCommand?: string
   runnerPath?: string
   homesRoot?: string
@@ -118,13 +120,9 @@ class PersistentKernel {
       this.readyReject = rejectReady
     })
     const isolated = this.options.isolation === 'bubblewrap'
-    const child = spawn(isolated ? 'bwrap' : this.options.pythonCommand, isolated ? [
-      '--die-with-parent', '--unshare-all', '--new-session',
-      ...(this.options.allowNetwork ? ['--share-net'] : []),
-      '--ro-bind', '/', '/', '--bind', this.home, this.home,
-      '--proc', '/proc', '--dev', '/dev', '--tmpfs', '/tmp', '--chdir', this.home,
-      '--', this.options.pythonCommand, '-I', this.options.runnerPath,
-    ] : ['-I', this.options.runnerPath], {
+    const launch = isolated ? sandboxCommand(this.home, this.options.runnerPath, this.options.pythonCommand, this.options, this.options.allowNetwork)
+      : { command: this.options.pythonCommand, args: ['-I', this.options.runnerPath] }
+    const child = spawn(launch.command, launch.args, {
       cwd: this.home,
       stdio: ['pipe', 'pipe', 'pipe'],
       env: {
@@ -396,7 +394,11 @@ export class KernelManager implements ManagedKernelExecutor {
       hostActionTimeoutMs: options.hostActionTimeoutMs ?? 30_000,
       maxOutputChars: options.maxOutputChars ?? 8_000,
       allowNetwork: options.allowNetwork ?? false,
-      isolation: options.isolation ?? 'process',
+      isolation: kernelIsolation(options.isolation ?? env['AGENT_OS_KERNEL_ISOLATION'], false),
+      memoryBytes: positiveInteger(options.memoryBytes ?? env['AGENT_OS_KERNEL_MEMORY_BYTES'] ?? 1024 * 1024 * 1024, 'kernel memoryBytes'),
+      cpuSeconds: positiveInteger(options.cpuSeconds ?? env['AGENT_OS_KERNEL_CPU_SECONDS'] ?? 600, 'kernel cpuSeconds'),
+      maxProcesses: positiveInteger(options.maxProcesses ?? env['AGENT_OS_KERNEL_MAX_PROCESSES'] ?? 512, 'kernel maxProcesses'),
+      tmpBytes: positiveInteger(options.tmpBytes ?? env['AGENT_OS_KERNEL_TMP_BYTES'] ?? 64 * 1024 * 1024, 'kernel tmpBytes'),
     }
     if (this.options.isolation === 'bubblewrap' && process.platform !== 'linux') throw new Error('bubblewrap kernel isolation requires Linux')
     this.sweepTimer = setInterval(() => this.sweepIdle(), Math.min(60_000, this.options.idleMs))
@@ -428,6 +430,10 @@ export class KernelManager implements ManagedKernelExecutor {
       throw new Error('artifact changed during transfer')
     }
     return bytes
+  }
+
+  async check(): Promise<void> {
+    if (this.options.isolation === 'bubblewrap') await checkKernelIsolation(this.options.runnerPath, this.options.pythonCommand, this.options)
   }
 
   private evictLeastRecentlyUsedIdle(): boolean {

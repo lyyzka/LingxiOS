@@ -213,9 +213,9 @@ export const COURSE_PLAN_OUTPUT = `{"title":"string","audience":"string","prereq
 export const SLIDE_OUTPUT = `{"id":"pg_id","order":0,"chapterId":"chapter id","role":"cover|content|section|summary|ending","purpose":"explain|example|counterexample|practice|review|assessment","title":"string","conclusion":"string","visualKind":"diagram|process|chart|comparison|formula|exercise|source-image","bodyHtml":"inline HTML with accessible SVG and data-anchor-id attributes","anchors":[{"id":"string","x":0,"y":0,"width":1,"height":1}],"steps":[{"id":"string","title":"string","explanation":"string","anchorIds":["anchor id"],"claimIds":["claim id"]}],"bindings":[{"claimId":"string","snapshotId":"provided snapshot id","evidenceMarkers":["S1"],"kind":"source|derived|teaching-example","statement":"string"}]}`
 
 export function newPageId(): string { return `pg_${randomUUID().replaceAll('-', '')}` }
-const canonical = (value: unknown): unknown => Array.isArray(value) ? value.map(canonical) : value && typeof value === 'object'
-  ? Object.fromEntries(Object.entries(value as Record<string, unknown>).sort(([left], [right]) => left.localeCompare(right)).map(([key, item]) => [key, canonical(item)])) : value
-export function contentHash(value: unknown): string { return createHash('sha256').update(JSON.stringify(canonical(value))).digest('hex') }
+export const canonicalLectureValue = (value: unknown): unknown => Array.isArray(value) ? value.map(canonicalLectureValue) : value && typeof value === 'object'
+  ? Object.fromEntries(Object.entries(value as Record<string, unknown>).sort(([left], [right]) => left.localeCompare(right)).map(([key, item]) => [key, canonicalLectureValue(item)])) : value
+export function contentHash(value: unknown): string { return createHash('sha256').update(JSON.stringify(canonicalLectureValue(value))).digest('hex') }
 
 export function evidenceFor(snapshot: EvidenceSnapshot, markers: readonly string[]): EvidenceItem[] {
   const wanted = new Set(markers)

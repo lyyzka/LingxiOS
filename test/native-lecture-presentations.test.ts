@@ -6,6 +6,7 @@ import type { LectureDeckService } from '../src/lecture-deck/service.js'
 test('LingxiLoop presentation actions use the package-owned lecture queue when no legacy service exists', async () => {
   const queued: unknown[] = [], operations: unknown[] = []
   const app = {
+    async cancelLecture() { return { status: 'cancelled' } },
     async enqueueLecture(input: unknown) { queued.push(input); return { id: 'work', deckId: 'deck', revision: 1, status: 'planning' } },
     async enqueueLectureOperation(input: unknown) { operations.push(input); return { id: 'revision-work', deckId: 'deck', revision: 1, status: 'ready' } },
   }

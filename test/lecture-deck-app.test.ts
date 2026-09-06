@@ -24,13 +24,15 @@ test('public app entry queues, runs, resumes idempotently and reads committed le
   const app = await createLingxiOS({ database: pool, lectureDeck, model: { id: 'unused', apiKey: 'unused' }, kernel: { homesRoot: join(directory, 'homes') } })
   try {
     const input = { id: 'request-1', tenantId: 'tenant', agentId: 'agent', sessionId: 'session', principalId: 'teacher', request: { requirements: 'Teach', targetSlideCount: 3 } }
-    const queued = await app.enqueueLecture(input)
+    const queued = await app.lectures!.enqueueLecture(input)
     assert.deepEqual((await lectureDeck.get({ tenantId: 'tenant', principalId: 'teacher' }, queued.deckId)).request,
       { requirements: 'Teach', targetSlideCount: 3, durationMinutes: 10 })
-    assert.equal((await app.enqueueLecture(input)).deduplicated, true)
+    assert.equal((await app.lectures!.enqueueLecture(input)).deduplicated, true)
     assert.equal(await app.runNext(), true)
-    assert.equal((await app.readLecture({ tenantId: 'tenant', principalId: 'teacher', deckId: queued.deckId })).status, 'ready')
-    const html = await app.readLectureHtml({ tenantId: 'tenant', principalId: 'teacher', deckId: queued.deckId })
+    await app.lectures!.enqueueLectureOperation({ ...input, deckId: queued.deckId, operation: 'approve_outline', idempotencyKey: 'approve-1', request: { expectedRevision: 1 } })
+    assert.equal(await app.runNext(), true)
+    assert.equal((await app.lectures!.readLecture({ tenantId: 'tenant', principalId: 'teacher', deckId: queued.deckId })).status, 'ready')
+    const html = await app.lectures!.readLectureHtml({ tenantId: 'tenant', principalId: 'teacher', deckId: queued.deckId })
     assert.match(new TextDecoder().decode(html!), /Content-Security-Policy/)
   } finally {
     await app.stop(); await database.close(); await rm(directory, { recursive: true, force: true })

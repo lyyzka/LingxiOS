@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
 import { readFile } from 'node:fs/promises'
-import { createRequire } from 'node:module'
+import { Pool } from 'pg'
 import { resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { PgActionLedger, PgSessionStore, PgWorkStore } from '../dist/src/control-plane/pg-store.js'
@@ -10,7 +10,6 @@ import { hashToken } from '../dist/src/control-plane/memory-store.js'
 const connectionString = process.env.LINGXIOS_TEST_DATABASE_URL
 if (!connectionString) throw new Error('LINGXIOS_TEST_DATABASE_URL must name an empty disposable PostgreSQL database')
 const source = resolve(process.argv[2] ?? process.env.LINGXILOOP_SOURCE ?? fileURLToPath(new URL('../../LingxiLoop/server/src', import.meta.url)))
-const { Pool } = createRequire(resolve(source, '../package.json'))('pg')
 let pool = new Pool({ connectionString, max: 8, connectionTimeoutMillis: 5000 })
 try {
   const existing = await pool.query("SELECT tablename FROM pg_tables WHERE schemaname NOT IN ('pg_catalog','information_schema')")
@@ -49,9 +48,8 @@ try {
     encoding: 'utf8', timeout: 15_000,
     input: `
       import assert from 'node:assert/strict'
-      import { createRequire } from 'node:module'
+      import { Pool } from 'pg'
       import { PgActionLedger, PgSessionStore, PgWorkStore } from ${JSON.stringify(new URL('../dist/src/control-plane/pg-store.js', import.meta.url).href)}
-      const { Pool } = createRequire(${JSON.stringify(resolve(source, '../package.json'))})('pg')
       const pool = new Pool({ connectionString: process.env.LINGXIOS_TEST_DATABASE_URL, max: 2, connectionTimeoutMillis: 5000 })
       try {
         const recovered = await new PgWorkStore(pool).claim('replacement')

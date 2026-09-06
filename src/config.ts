@@ -4,6 +4,18 @@
  */
 import { ConfigError } from './errors.js'
 import { DEFAULT_MODEL } from './model/openai.js'
+import type { RootModelBudgetOptions } from './runtime/runtime.js'
+
+export function loadModelBudget(env: NodeJS.ProcessEnv = process.env): RootModelBudgetOptions {
+  return {
+    maxModelCalls: intEnv('AGENT_OS_MAX_MODEL_CALLS', 512, { min: 1 }, env),
+    maxTokens: intEnv('AGENT_OS_MAX_MODEL_TOKENS', 10_000_000, { min: 1 }, env),
+    maxCostMicros: intEnv('AGENT_OS_MAX_COST_MICROS', 10_000_000, { min: 1 }, env),
+    wallClockMs: intEnv('AGENT_OS_MODEL_DEADLINE_MS', 7_200_000, { min: 1000 }, env),
+    inputCostMicrosPerMillion: intEnv('AGENT_OS_INPUT_PRICE_MICROS_PER_MILLION', 0, { min: 0 }, env),
+    outputCostMicrosPerMillion: intEnv('AGENT_OS_OUTPUT_PRICE_MICROS_PER_MILLION', 0, { min: 0 }, env),
+  }
+}
 
 export function requiredEnv(name: string, env: NodeJS.ProcessEnv = process.env): string {
   const value = env[name]?.trim()

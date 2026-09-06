@@ -1,11 +1,11 @@
 import { createHash } from 'node:crypto'
-import type { DeckManifest, EvidenceBinding, LectureAnchor } from './contracts.js'
+import { canonicalLectureValue, type DeckManifest, type EvidenceBinding, type LectureAnchor } from './contracts.js'
 import { assertValidDeck } from './validation.js'
 
 export interface LectureArtifact { filename: 'lecture.html'; mime: 'text/html'; size: number; sha256: string; bytes: Uint8Array }
 
 const escapeHtml = (value: string) => value.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('"', '&quot;').replaceAll("'", '&#39;')
-const safeJson = (value: unknown) => JSON.stringify(value).replaceAll('<', '\\u003c').replaceAll('\u2028', '\\u2028').replaceAll('\u2029', '\\u2029')
+const safeJson = (value: unknown) => JSON.stringify(canonicalLectureValue(value)).replaceAll('<', '\\u003c').replaceAll('\u2028', '\\u2028').replaceAll('\u2029', '\\u2029')
 
 export function buildStandaloneLecture(input: DeckManifest, maxBytes = 16 * 1024 * 1024): LectureArtifact {
   const deck = assertValidDeck(structuredClone(input))

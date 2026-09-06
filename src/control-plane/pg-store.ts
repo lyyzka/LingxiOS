@@ -127,20 +127,22 @@ export class PgWorkStore implements WorkStore {
     return { id, deduplicated: rows.length === 0 }
   }
 
-  async claim(workerId: string, requestId?: string): Promise<WorkItem | null> {
+  async claim(workerId: string, requestId?: string, workKinds?: readonly string[]): Promise<WorkItem | null> {
+    const kinds = workKinds ? [...new Set(workKinds)].sort() : null
     return withTransaction(this.pool, async (client) => {
       if (requestId) {
         // ponytail: seven-day dedupe window bounds storage; use partitioned retention if claim volume demands it.
         await client.query(`DELETE FROM lingxios.agent_claim_requests
           WHERE completed=TRUE AND created_at<NOW()-INTERVAL '7 days'`)
         const inserted = await client.query(
-          `INSERT INTO lingxios.agent_claim_requests (request_id, worker_id)
-           VALUES ($1,$2) ON CONFLICT (request_id) DO NOTHING RETURNING request_id`, [requestId, workerId])
+          `INSERT INTO lingxios.agent_claim_requests (request_id, worker_id, work_kinds)
+           VALUES ($1,$2,$3::jsonb) ON CONFLICT (request_id) DO NOTHING RETURNING request_id`, [requestId, workerId, JSON.stringify(kinds)])
         if (!inserted.rows[0]) {
           const prior = await client.query(
-            `SELECT worker_id, completed, response FROM lingxios.agent_claim_requests
+            `SELECT worker_id, work_kinds, completed, response FROM lingxios.agent_claim_requests
               WHERE request_id=$1 FOR UPDATE`, [requestId])
           if (prior.rows[0]?.['worker_id'] !== workerId) throw new Error('claim request identity reused by another worker')
+          if (!isDeepStrictEqual(prior.rows[0]?.['work_kinds'], kinds)) throw new Error('claim request task types changed')
           if (prior.rows[0]?.['completed']) return prior.rows[0]['response'] as WorkItem | null
         }
       }
@@ -163,6 +165,7 @@ export class PgWorkStore implements WorkStore {
              ON route.session_key = ${WORK_SESSION_KEY_SQL}
            LEFT JOIN lingxios.agent_os_workers route_worker ON route_worker.worker_id = route.worker_id
           WHERE (work.status = 'queued' OR (work.status = 'leased' AND work.lease_expires_at <= NOW()))
+            AND ($3::text[] IS NULL OR work.kind=ANY($3::text[]))
             AND (work.kind NOT IN ('memory_synthesis','memory_index') OR work.attempts < 3)
             AND work.cancel_requested_at IS NULL
             AND work.available_at <= NOW()
@@ -179,7 +182,7 @@ export class PgWorkStore implements WorkStore {
                    work.priority DESC, work.created_at ASC
           FOR UPDATE OF work SKIP LOCKED
           LIMIT 1`,
-        [workerId, this.workerTimeoutSeconds],
+        [workerId, this.workerTimeoutSeconds, kinds],
       )
       const row = rows[0]
       if (!row) return finish(null)
@@ -577,12 +580,12 @@ export class PgModelBudgetStore implements ModelBudgetStore {
       const prior = await client.query(`SELECT 1 FROM lingxios.agent_model_budget_calls
         WHERE root_work_id=$1 AND call_id=$2`, [rootWorkId, callId])
       if (!prior.rows.length) {
-        const inserted = await client.query(`INSERT INTO lingxios.agent_model_budget_calls(root_work_id,call_id)
-          SELECT root_work_id,$2 FROM lingxios.agent_model_budgets WHERE root_work_id=$1
-            AND NOW()<deadline_at AND model_calls<max_model_calls AND tokens<max_tokens AND cost_micros<max_cost_micros
-          ON CONFLICT DO NOTHING RETURNING call_id`, [rootWorkId, callId])
+        const inserted = await client.query(`INSERT INTO lingxios.agent_model_budget_calls(root_work_id,call_id,reserved_tokens,reserved_cost_micros)
+          SELECT root_work_id,$2,$3,$4 FROM lingxios.agent_model_budgets WHERE root_work_id=$1
+            AND NOW()<deadline_at AND model_calls<max_model_calls AND tokens+$3<=max_tokens AND cost_micros+$4<=max_cost_micros
+          ON CONFLICT DO NOTHING RETURNING call_id`, [rootWorkId, callId, limits.reservedTokens ?? 0, limits.reservedCostMicros ?? 0])
         if (inserted.rows.length) await client.query(`UPDATE lingxios.agent_model_budgets
-          SET model_calls=model_calls+1,updated_at=NOW() WHERE root_work_id=$1`, [rootWorkId])
+          SET model_calls=model_calls+1,tokens=tokens+$2,cost_micros=cost_micros+$3,updated_at=NOW() WHERE root_work_id=$1`, [rootWorkId, limits.reservedTokens ?? 0, limits.reservedCostMicros ?? 0])
       }
       const { rows } = await client.query(`SELECT b.*,EXISTS(SELECT 1 FROM lingxios.agent_model_budget_calls c
         WHERE c.root_work_id=b.root_work_id AND c.call_id=$2) AS allowed
@@ -598,10 +601,10 @@ export class PgModelBudgetStore implements ModelBudgetStore {
   async record(rootWorkId: string, callId: string, inputTokens: number, outputTokens: number, costMicros: number): Promise<void> {
     await withTransaction(this.pool, async client => {
       const { rows } = await client.query(`UPDATE lingxios.agent_model_budget_calls SET input_tokens=$3,output_tokens=$4,cost_micros=$5
-        WHERE root_work_id=$1 AND call_id=$2 AND input_tokens IS NULL RETURNING call_id`,
+        WHERE root_work_id=$1 AND call_id=$2 AND input_tokens IS NULL RETURNING call_id,reserved_tokens,reserved_cost_micros`,
       [rootWorkId, callId, inputTokens, outputTokens, costMicros])
       if (rows.length) await client.query(`UPDATE lingxios.agent_model_budgets SET tokens=tokens+$2+$3,
-        cost_micros=cost_micros+$4,updated_at=NOW() WHERE root_work_id=$1`, [rootWorkId, inputTokens, outputTokens, costMicros])
+        cost_micros=cost_micros+$4,updated_at=NOW() WHERE root_work_id=$1`, [rootWorkId, inputTokens - Number(rows[0]!['reserved_tokens']), outputTokens, costMicros - Number(rows[0]!['reserved_cost_micros'])])
     })
   }
 }

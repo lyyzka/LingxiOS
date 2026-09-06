@@ -10,7 +10,7 @@ RUN npm run build && npm prune --omit=dev --ignore-scripts --no-audit --no-fund
 
 FROM node:22-bookworm-slim AS worker
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends python3 ca-certificates \
+    && apt-get install -y --no-install-recommends python3 ca-certificates bubblewrap util-linux \
     && rm -rf /var/lib/apt/lists/* \
     && mkdir -p /data/homes \
     && chown node:node /data/homes
@@ -18,6 +18,7 @@ WORKDIR /app
 ENV NODE_ENV=production \
     AGENT_OS_PYTHON=python3 \
     AGENT_OS_HOMES_ROOT=/data/homes \
+    AGENT_OS_KERNEL_ISOLATION=bubblewrap \
     AGENT_OS_WORKER_PORT=5190
 COPY --from=build /app/package.json ./
 COPY --from=build /app/node_modules node_modules

@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os'
 import { resolve, join, dirname } from 'node:path'
 import { createHash, randomUUID } from 'node:crypto'
 import { isDeepStrictEqual } from 'node:util'
-import { createRequire } from 'node:module'
+import { Pool } from 'pg'
 import { fileURLToPath } from 'node:url'
 import { PGlite } from '@electric-sql/pglite'
 import { createLingxiOS, packageResources, releaseVersions, DEFAULT_MODEL } from 'lingxios'
@@ -49,14 +49,13 @@ const redactError = error => String(error instanceof Error ? error.message : 'Un
 const reports = []
 const connectionString = process.env.LINGXIOS_TEST_DATABASE_URL
 const source = resolve(process.env.LINGXILOOP_SOURCE ?? fileURLToPath(new URL('../../LingxiLoop/server/src', import.meta.url)))
-const Pool = connectionString ? createRequire(resolve(source, '../package.json'))('pg').Pool : undefined
 let databaseVersion
 let databaseInitialized = false
 const temporaryRoot = resolve(tmpdir())
 for (let repeat = 1; repeat <= Number(args[3]); repeat++) {
   for (const sample of cases) {
     const directory = await mkdtemp(join(temporaryRoot, 'lingxios-live-'))
-    const pool = Pool ? new Pool({ connectionString, max: 4, connectionTimeoutMillis: 5000 }) : undefined
+    const pool = connectionString ? new Pool({ connectionString, max: 4, connectionTimeoutMillis: 5000 }) : undefined
     const db = pool ? { query: pool.query.bind(pool), exec: pool.query.bind(pool), close: () => pool.end() }
       : new PGlite(join(directory, 'db'))
     const database = pool ?? { query: async (sql, params) => {
@@ -76,7 +75,7 @@ for (let repeat = 1; repeat <= Number(args[3]); repeat++) {
         if (tables.rows.length) throw new Error('LINGXIOS_TEST_DATABASE_URL must name an empty disposable PostgreSQL database')
         databaseVersion = (await pool.query('SELECT version() AS version')).rows[0].version
       }
-      await db.exec(await readFile(packageResources().schema, 'utf8'))
+      if (!pool || !databaseInitialized) await db.exec(await readFile(packageResources().schema, 'utf8'))
       databaseInitialized = true
       app = await createLingxiOS({ database, model, kernel: { homesRoot: join(directory, 'homes'), allowNetwork: false } })
       timeout = setTimeout(() => {

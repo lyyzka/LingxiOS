@@ -14,11 +14,12 @@ import { ControlPlaneError, ControlPlaneService, type LeaseProof } from './servi
 
 export interface ControlPlaneServerOptions {
   service: ControlPlaneService
-  claimWork: (workerId: string, requestId?: string) => Promise<import('../protocol/types.js').WorkItem | null>
+  claimWork: (workerId: string, requestId?: string, workKinds?: readonly string[]) => Promise<import('../protocol/types.js').WorkItem | null>
   serviceToken: string
   logger?: Logger
   metrics?: MetricsRegistry
   maxBodyBytes?: number
+  ready?: () => Promise<boolean>
 }
 
 function readBody(req: http.IncomingMessage, maxBytes: number): Promise<unknown> {
@@ -65,6 +66,7 @@ function leaseProofOf(id: string, body: Record<string, unknown>): LeaseProof {
 }
 
 export class ControlPlaneServer {
+  private readiness: Promise<boolean> | undefined
   private readonly server: http.Server
   private readonly logger: Logger
 
@@ -76,7 +78,7 @@ export class ControlPlaneServer {
           json(res, error.status, { error: error.message, ...(error.code ? { code: error.code } : {}) })
           return
         }
-        this.logger.error('control-plane request failed', { url: req.url, error })
+        this.logger.error('control-plane request failed', { path: req.url?.split('?')[0], error })
         json(res, 500, { error: 'internal error' })
       })
     })
@@ -98,9 +100,16 @@ export class ControlPlaneServer {
     const method = req.method ?? 'GET'
     const service = this.options.service
 
-    if (method === 'GET' && (path === '/healthz' || path === '/readyz')) {
+    if (method === 'GET' && path === '/healthz') {
       json(res, 200, { ok: true })
       return
+    }
+    if (method === 'GET' && path === '/readyz') {
+      this.readiness ??= (this.options.ready?.() ?? Promise.resolve(false)).catch(() => false).finally(() => { this.readiness = undefined })
+      let timer: NodeJS.Timeout | undefined
+      const ok = await Promise.race([this.readiness, new Promise<false>(resolve => { timer = setTimeout(() => resolve(false), 2_000) })])
+      if (timer) clearTimeout(timer)
+      json(res, ok ? 200 : 503, { ok }); return
     }
     if (method === 'GET' && path === '/metrics' && this.options.metrics) {
       res.writeHead(200, { 'content-type': 'text/plain; version=0.0.4' })
@@ -112,26 +121,28 @@ export class ControlPlaneServer {
       return
     }
 
-    const maxBody = path.endsWith('/artifacts') ? 24 * 1024 * 1024 : this.options.maxBodyBytes ?? 8 * 1024 * 1024
+    const maxBody = path.endsWith('/artifacts') || path.endsWith('/lecture') ? 24 * 1024 * 1024 : this.options.maxBodyBytes ?? 8 * 1024 * 1024
     const parsed = method === 'GET' ? {} : await readBody(req, maxBody)
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new ControlPlaneError(400, 'request body must be a JSON object')
     const body = parsed as Record<string, unknown>
 
     // Route table -----------------------------------------------------------
-    if (method === 'POST' && path === '/v2/work') {
+    if (method === 'POST' && path === '/v3/work') {
       json(res, 200, await service.enqueue(body as unknown as EnqueueWorkInput))
       return
     }
-    if (method === 'POST' && path === '/v2/work/claim') {
+    if (method === 'POST' && path === '/v3/work/claim') {
       if (body['requestId'] !== undefined && typeof body['requestId'] !== 'string') {
         throw new ControlPlaneError(400, 'requestId must be a string')
       }
+      if (!Array.isArray(body['workKinds']) || body['workKinds'].length < 1 || body['workKinds'].length > 64
+        || body['workKinds'].some(kind => typeof kind !== 'string' || !/^[a-z][a-z0-9_]{0,63}$/.test(kind))) throw new ControlPlaneError(400, 'workKinds are required')
       json(res, 200, await this.options.claimWork(stringField(body, 'workerId'),
-        typeof body['requestId'] === 'string' ? body['requestId'] : undefined))
+        typeof body['requestId'] === 'string' ? body['requestId'] : undefined, body['workKinds']))
       return
     }
 
-    const workMatch = /^\/v2\/work\/([^/]+)\/([a-z-]+)$/.exec(path)
+    const workMatch = /^\/v3\/work\/([^/]+)\/([a-z-]+)$/.exec(path)
     if (workMatch) {
       const id = decodeURIComponent(workMatch[1]!)
       const operation = workMatch[2]!
@@ -147,6 +158,8 @@ export class ControlPlaneServer {
       if (method === 'POST') {
         const proof = leaseProofOf(id, body)
         switch (operation) {
+          case 'lecture':
+            json(res, 200, await service.lecture(proof, body['command'] as never)); return
           case 'heartbeat':
             json(res, 200, await service.heartbeat(proof)); return
           case 'model-budget':
@@ -189,7 +202,7 @@ export class ControlPlaneServer {
       }
     }
 
-    if (method === 'PUT' && path === '/v2/sessions') {
+    if (method === 'PUT' && path === '/v3/sessions') {
       const proof = leaseProofOf(stringField(body, 'workId'), body)
       json(res, 200, await service.saveSession(proof, body['session'] as SessionRecord))
       return

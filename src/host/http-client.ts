@@ -20,6 +20,7 @@ export interface HttpHostClientOptions {
   baseUrl: string
   serviceToken: string
   workerId: string
+  workKinds?: readonly string[]
   requestTimeoutMs?: number
   maxAttempts?: number
   retryBaseMs?: number
@@ -35,6 +36,10 @@ export class HostRequestError extends AgentOSError {
 }
 
 export class HttpHostClient implements HostPort {
+  lastContactAt = 0
+  lecture(work: WorkItem, command: import('../lecture-deck/transport.js').LectureCommand): Promise<unknown> {
+    return this.request('POST', `/v3/work/${encodeURIComponent(work.id)}/lecture`, { ...this.proof(work), command })
+  }
   private readonly baseUrl: string
   private readonly timeoutMs: number
   private readonly maxAttempts: number
@@ -48,7 +53,7 @@ export class HttpHostClient implements HostPort {
     this.timeoutMs = options.requestTimeoutMs ?? 30_000
     this.maxAttempts = options.maxAttempts ?? 3
     this.retryBaseMs = options.retryBaseMs ?? 250
-    this.maxResponseBytes = options.maxResponseBytes ?? 10 * 1024 * 1024
+    this.maxResponseBytes = options.maxResponseBytes ?? 24 * 1024 * 1024
     this.fetchImpl = options.fetchImpl ?? fetch
     this.sleep = options.sleep ?? ((ms) => new Promise((resolveSleep) => setTimeout(resolveSleep, ms)))
   }
@@ -70,7 +75,7 @@ export class HttpHostClient implements HostPort {
           signal: combined,
         })
         const detail = await readBody(response, this.maxResponseBytes)
-        if (response.ok) return JSON.parse(detail) as T
+        if (response.ok) { this.lastContactAt = Date.now(); return JSON.parse(detail) as T }
         let message = detail
         let responseCode: string | undefined
         try {
@@ -104,79 +109,79 @@ export class HttpHostClient implements HostPort {
   }
 
   async claimWork(signal?: AbortSignal): Promise<WorkItem | null> {
-    return this.request<WorkItem | null>('POST', '/v2/work/claim', {
-      workerId: this.options.workerId, requestId: randomUUID(),
+    return this.request<WorkItem | null>('POST', '/v3/work/claim', {
+      workerId: this.options.workerId, requestId: randomUUID(), workKinds: this.options.workKinds ?? ['turn', 'resume'],
     }, signal)
   }
 
   async heartbeat(work: WorkItem): Promise<HeartbeatResult> {
-    return this.request<HeartbeatResult>('POST', `/v2/work/${encodeURIComponent(work.id)}/heartbeat`, this.proof(work))
+    return this.request<HeartbeatResult>('POST', `/v3/work/${encodeURIComponent(work.id)}/heartbeat`, this.proof(work))
   }
 
   async loadContext(work: WorkItem): Promise<TurnContext> {
     const query = new URLSearchParams({ fence: String(work.fence), leaseToken: work.leaseToken })
-    const context = await this.request<TurnContext>('GET', `/v2/work/${encodeURIComponent(work.id)}/context?${query}`)
+    const context = await this.request<TurnContext>('GET', `/v3/work/${encodeURIComponent(work.id)}/context?${query}`)
     // The wire strips the lease token from the embedded work item; restore it.
     context.work = { ...context.work, leaseToken: work.leaseToken, homeEpoch: work.homeEpoch }
     return context
   }
 
   async executeAction(work: WorkItem, action: HostAction): Promise<HostActionResult> {
-    return this.request<HostActionResult>('POST', `/v2/work/${encodeURIComponent(work.id)}/actions`, {
+    return this.request<HostActionResult>('POST', `/v3/work/${encodeURIComponent(work.id)}/actions`, {
       ...this.proof(work), action,
     })
   }
 
   async reserveModelCall(work: WorkItem, callId: string, limits: ModelBudgetLimits): Promise<ModelBudgetReservation> {
-    return this.request('POST', `/v2/work/${encodeURIComponent(work.id)}/model-budget`, { ...this.proof(work), callId, limits })
+    return this.request('POST', `/v3/work/${encodeURIComponent(work.id)}/model-budget`, { ...this.proof(work), callId, limits })
   }
 
   async recordModelUsage(work: WorkItem, callId: string, usage: { inputTokens: number; outputTokens: number; costMicros: number }): Promise<void> {
-    await this.request('POST', `/v2/work/${encodeURIComponent(work.id)}/model-usage`, { ...this.proof(work), callId, usage })
+    await this.request('POST', `/v3/work/${encodeURIComponent(work.id)}/model-usage`, { ...this.proof(work), callId, usage })
   }
 
   async recoverCell(work: WorkItem, cellId: string) {
     return this.request<Array<{ action: string; idempotencyKey: string; result: HostActionResult }> | null>(
-      'POST', `/v2/work/${encodeURIComponent(work.id)}/reconcile`, { ...this.proof(work), cellId })
+      'POST', `/v3/work/${encodeURIComponent(work.id)}/reconcile`, { ...this.proof(work), cellId })
   }
 
   async recoverStep(work: WorkItem, cellId: string) {
     return this.request<{ output: string; artifacts: import('../protocol/types.js').KernelArtifact[] } | null>(
-      'POST', `/v2/work/${encodeURIComponent(work.id)}/step`, { ...this.proof(work), cellId })
+      'POST', `/v3/work/${encodeURIComponent(work.id)}/step`, { ...this.proof(work), cellId })
   }
 
   async stageArtifact(work: WorkItem, artifact: import('../protocol/types.js').KernelArtifact, bytes: Uint8Array): Promise<void> {
-    await this.request('POST', `/v2/work/${encodeURIComponent(work.id)}/artifacts`, {
+    await this.request('POST', `/v3/work/${encodeURIComponent(work.id)}/artifacts`, {
       ...this.proof(work), artifact, contentBase64: Buffer.from(bytes).toString('base64'),
     })
   }
 
   async emitEvent(work: WorkItem, event: RunEvent): Promise<void> {
-    await this.request('POST', `/v2/work/${encodeURIComponent(work.id)}/events`, { ...this.proof(work), event })
+    await this.request('POST', `/v3/work/${encodeURIComponent(work.id)}/events`, { ...this.proof(work), event })
   }
 
   async loadSession(work: WorkItem, key: string): Promise<SessionRecord | null> {
-    const payload = await this.request<{ session: SessionRecord | null }>('POST', `/v2/work/${encodeURIComponent(work.id)}/session`, { ...this.proof(work), key })
+    const payload = await this.request<{ session: SessionRecord | null }>('POST', `/v3/work/${encodeURIComponent(work.id)}/session`, { ...this.proof(work), key })
     return payload.session
   }
 
   async saveSession(work: WorkItem, session: SessionRecord): Promise<void> {
-    const saved = await this.request<{ revision: number }>('PUT', '/v2/sessions', {
+    const saved = await this.request<{ revision: number }>('PUT', '/v3/sessions', {
       workId: work.id, ...this.proof(work), session,
     })
     session.revision = saved.revision
   }
 
   async commitMessage(work: WorkItem, message: AssistantMessage): Promise<void> {
-    await this.request('POST', `/v2/work/${encodeURIComponent(work.id)}/messages`, { ...this.proof(work), message })
+    await this.request('POST', `/v3/work/${encodeURIComponent(work.id)}/messages`, { ...this.proof(work), message })
   }
 
   async completeWork(work: WorkItem, completion: WorkCompletion): Promise<void> {
-    await this.request('POST', `/v2/work/${encodeURIComponent(work.id)}/complete`, { ...this.proof(work), ...completion })
+    await this.request('POST', `/v3/work/${encodeURIComponent(work.id)}/complete`, { ...this.proof(work), ...completion })
   }
 
   async yieldWork(work: WorkItem): Promise<void> {
-    await this.request('POST', `/v2/work/${encodeURIComponent(work.id)}/yield`, this.proof(work))
+    await this.request('POST', `/v3/work/${encodeURIComponent(work.id)}/yield`, this.proof(work))
   }
 }
 

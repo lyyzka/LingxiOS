@@ -1,6 +1,13 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { LectureDeckService, MemoryLectureRepository, ModelLectureAuthor, buildStandaloneLecture, validateDeck, validateLectureMarkup, type CoursePlan, type LectureAuthor, type SlideSpec } from '../src/lecture-deck/index.js'
+import { LectureDeckService, MemoryLectureRepository, ModelLectureAuthor, ModelLectureReviewer, buildStandaloneLecture, validateDeck, validateLectureMarkup, type CoursePlan, type LectureAuthor, type SlideSpec } from '../src/lecture-deck/index.js'
+
+async function approvedCreate(service: LectureDeckService, scope: { tenantId: string; principalId: string }, request: unknown) {
+  const draft = await service.create(scope, request)
+  assert.equal(draft.status, 'awaiting_outline_approval')
+  await service.approveOutline(scope, draft.id, draft.revision)
+  return service.run(scope, draft.id)
+}
 
 const slide = (input: Parameters<LectureAuthor['slide']>[0]): SlideSpec => ({
   id: input.pageId, order: input.order, chapterId: input.chapter.id,
@@ -30,7 +37,7 @@ test('native lecture pipeline publishes offline HTML and revises only selected p
     reviewer: { review: async () => ({ passed: true, issues: [] }) },
     publisher: { publish: async (_record, artifact) => { artifacts.push(artifact.bytes) } }, now: () => '2026-01-01T00:00:00.000Z' })
   const scope = { tenantId: 'tenant', principalId: 'teacher' }
-  const created = await service.create(scope, { requirements: 'Teach the topic', targetSlideCount: 3, sourceIds: ['source'] })
+  const created = await approvedCreate(service, scope, { requirements: 'Teach the topic', targetSlideCount: 3, sourceIds: ['source'] })
   assert.equal(created.status, 'ready')
   assert.equal(created.manifest?.slides.length, 3)
   assert.equal(artifacts.length, 1)
@@ -38,7 +45,9 @@ test('native lecture pipeline publishes offline HTML and revises only selected p
   assert.doesNotMatch(new TextDecoder().decode(artifacts[0]), /<script[^>]+src=/)
 
   const originalBodies = created.manifest!.slides.map(item => item.bodyHtml)
-  const revised = await service.revise(scope, created.id, { instruction: 'Turn this into a process', scope: 'page', pageIds: ['pg_page_2'], expectedRevision: 1 })
+  const revision = await service.revise(scope, created.id, { instruction: 'Turn this into a process', scope: 'page', pageIds: ['pg_page_2'], expectedRevision: 1 })
+  await service.approveOutline(scope, revision.id, revision.revision)
+  const revised = await service.run(scope, revision.id)
   assert.equal(revised.status, 'ready')
   assert.equal(revised.revision, 2)
   assert.equal(revised.manifest!.slides[0]!.bodyHtml, originalBodies[0])
@@ -85,6 +94,36 @@ test('real model adapter repairs malformed structured output before accepting it
   assert.equal(calls, 2)
 })
 
+test('negative or contradictory lecture reviews cannot pass', async () => {
+  for (const value of [{ passed: false, issues: [] }, { passed: true, issues: [{ code: 'bad', message: 'unsupported claim' }] }]) {
+    const model = { structured: async () => ({ value }) } as unknown as ConstructorParameters<typeof ModelLectureReviewer>[0]
+    const report = await new ModelLectureReviewer(model).review({ slides: [{ bindings: [] }], evidence: [], course: {} } as never)
+    assert.equal(report.passed, false)
+  }
+})
+
+test('publication recovery keeps its commitment and does not regenerate after a lost acknowledgement', async () => {
+  const repository = new MemoryLectureRepository()
+  let slides = 0, publishes = 0, bytes: Uint8Array | null = null
+  const author: LectureAuthor = {
+    async plan(request) { return { title: 'x', audience: 'x', prerequisites: [], objectives: [{ id: 'o', description: 'x' }], chapters: [{ id: 'c', order: 0, title: 'c', objectiveIds: ['o'], slideIds: ['pg_1','pg_2','pg_3'] }], targetSlideCount: 3, durationMinutes: request.durationMinutes, terminology: {} } },
+    async slide(input) { slides++; return slide(input) },
+  }
+  const dependencies = { repository, author, evidence: { search: async () => [{ marker: 'S1', sourceId: 's', sourceVersion: 'v', chunkId: 'c', title: 's', excerpt: 'e' }] },
+    reviewer: { review: async () => ({ passed: true, issues: [] }) },
+    publisher: { read: async () => bytes, publish: async (_record: unknown, artifact: { bytes: Uint8Array }) => { publishes++; bytes = artifact.bytes; throw new Error('acknowledgement lost') } } }
+  const service = new LectureDeckService(dependencies), scope = { tenantId: 't', principalId: 'p' }
+  const draft = await service.create(scope, { requirements: 'x', targetSlideCount: 3 })
+  assert.equal(slides, 0, 'approval must precede all slide calls')
+  await service.approveOutline(scope, draft.id, 1)
+  await assert.rejects(service.run(scope, draft.id), /acknowledgement lost/)
+  assert.equal((await repository.get('t', draft.id))?.status, 'publishing')
+  const recovered = await new LectureDeckService(dependencies).run(scope, draft.id)
+  assert.equal(recovered.status, 'ready')
+  assert.equal(slides, 3)
+  assert.equal(publishes, 1)
+})
+
 test('cancellation while independent review is pending prevents publication', async () => {
   const repository = new MemoryLectureRepository(); let release!: () => void, reviewed!: () => void, published = 0
   const reviewing = new Promise<void>(resolve => { release = resolve })
@@ -93,6 +132,8 @@ test('cancellation while independent review is pending prevents publication', as
   const service = new LectureDeckService({ repository, author, evidence: { search: async () => [{ marker: 'S1', sourceId: 's', sourceVersion: 'v', chunkId: 'c', title: 's', excerpt: 'e' }] },
     reviewer: { review: async () => { reviewed(); await reviewing; return { passed: true, issues: [] } } }, publisher: { publish: async () => { published++ } } })
   const scope = { tenantId: 't', principalId: 'p' }, record = await service.begin(scope, { requirements: 'x', targetSlideCount: 3 }, 'deck_cancel')
+  await service.run(scope, record.id)
+  await service.approveOutline(scope, record.id, record.revision)
   const running = service.run(scope, record.id)
   await entered
   assert.equal((await service.cancel(scope, record.id)).status, 'cancelled')
@@ -108,7 +149,7 @@ test('retry resumes completed slide checkpoints instead of regenerating them', a
     async slide(input) { const count = (calls.get(input.pageId) ?? 0) + 1; calls.set(input.pageId, count); if (input.pageId === 'pg_2' && count === 1) throw new Error('simulated worker loss'); return slide(input) },
   }
   const service = new LectureDeckService({ repository, author, evidence: { search: async () => [{ marker: 'S1', sourceId: 's', sourceVersion: 'v', chunkId: 'c', title: 's', excerpt: 'e' }] }, reviewer: { review: async () => ({ passed: true, issues: [] }) }, publisher: { publish: async () => {} } })
-  const scope = { tenantId: 't', principalId: 'p' }, failed = await service.create(scope, { requirements: 'x', targetSlideCount: 3 })
+  const scope = { tenantId: 't', principalId: 'p' }, failed = await approvedCreate(service, scope, { requirements: 'x', targetSlideCount: 3 })
   assert.equal(failed.status, 'failed')
   const ready = await service.retry(scope, failed.id)
   assert.equal(ready.status, 'ready')

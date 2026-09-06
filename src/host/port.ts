@@ -10,6 +10,7 @@ import type {
 import type { ModelBudgetLimits, ModelBudgetReservation } from '../control-plane/stores.js'
 
 export interface HostPort {
+  lecture?(work: WorkItem, command: import('../lecture-deck/transport.js').LectureCommand): Promise<unknown>
   /** Claim one queued work item, or null when none is available. */
   claimWork(signal?: AbortSignal): Promise<WorkItem | null>
 

@@ -172,9 +172,9 @@ it('assembles the public app through HTTP model and Python, persisting results a
     await assert.rejects(controlApp.listenControlPlane({ serviceToken: '', port: 0 }), /token is required/)
     const controlPort = await controlApp.listenControlPlane({ serviceToken: 'test-worker-secret', port: 0 })
     await assert.rejects(controlApp.listenControlPlane({ serviceToken: 'test-worker-secret', port: 0 }), /already/)
-    const claimUrl = `http://127.0.0.1:${controlPort}/v2/work/claim`
+    const claimUrl = `http://127.0.0.1:${controlPort}/v3/work/claim`
     assert.equal((await fetch(claimUrl, { method: 'POST' })).status, 401)
-    const recoveredClaim = await fetch(claimUrl, { method: 'POST', headers: { authorization: 'Bearer test-worker-secret', 'content-type': 'application/json' }, body: JSON.stringify({ workerId: 'remote-worker' }) })
+    const recoveredClaim = await fetch(claimUrl, { method: 'POST', headers: { authorization: 'Bearer test-worker-secret', 'content-type': 'application/json' }, body: JSON.stringify({ workerId: 'remote-worker', workKinds: ['turn','resume'] }) })
     assert.equal(recoveredClaim.status, 200)
     assert.equal(await recoveredClaim.json(), null)
     assert.equal(requests.length, 2)
@@ -264,7 +264,7 @@ it('assembles the public app through HTTP model and Python, persisting results a
     const beforeCorruptRecovery = requests.length
     await db.query("UPDATE lingxios.agent_messages SET message=message-'envelope' WHERE run_id=$1", [identity.runId])
     await db.query("UPDATE lingxios.agent_work_items SET status='queued',available_at=NOW() WHERE id=$1", [identity.runId])
-    const corruptClaim = await fetch(claimUrl, { method: 'POST', headers: { authorization: 'Bearer test-worker-secret', 'content-type': 'application/json' }, body: JSON.stringify({ workerId: 'remote-worker' }) })
+    const corruptClaim = await fetch(claimUrl, { method: 'POST', headers: { authorization: 'Bearer test-worker-secret', 'content-type': 'application/json' }, body: JSON.stringify({ workerId: 'remote-worker', workKinds: ['turn','resume'] }) })
     assert.equal(corruptClaim.status, 500)
     assert.equal(requests.length, beforeCorruptRecovery)
     assert.equal((await app.readMessage(identity))?.body, '4')

@@ -76,7 +76,7 @@ export class MemoryWorkStore implements WorkStore {
   private readonly routes = new Map<string, SessionRoute>()
   private readonly sessionLeases = new Map<string, SessionLease>()
   private readonly workerLastSeen = new Map<string, number>()
-  private readonly claims = new Map<string, { workerId: string; work: WorkItem | null }>()
+  private readonly claims = new Map<string, { workerId: string; work: WorkItem | null; kinds: string[] | null }>()
   private readonly leaseTtlMs: number
   private readonly workerTimeoutMs: number
 
@@ -139,11 +139,13 @@ export class MemoryWorkStore implements WorkStore {
     return seen !== undefined && now - seen < this.workerTimeoutMs
   }
 
-  async claim(workerId: string, requestId?: string): Promise<WorkItem | null> {
+  async claim(workerId: string, requestId?: string, workKinds?: readonly string[]): Promise<WorkItem | null> {
+    const kinds = workKinds ? [...new Set(workKinds)].sort() : null
     if (requestId) {
       const prior = this.claims.get(requestId)
       if (prior) {
         if (prior.workerId !== workerId) throw new Error('claim request identity reused by another worker')
+        if (!isDeepStrictEqual(prior.kinds, kinds)) throw new Error('claim request task types changed')
         return structuredClone(prior.work)
       }
       if (this.claims.size >= 10_000) this.claims.delete(this.claims.keys().next().value!)
@@ -155,6 +157,7 @@ export class MemoryWorkStore implements WorkStore {
     }
     const candidates = [...this.rows.values()]
       .filter((row) => {
+        if (kinds && !kinds.includes(row.kind)) return false
         if ((row.kind === 'memory_synthesis' || row.kind === 'memory_index') && row.attempts >= 3) return false
         const claimable = row.status === 'queued'
           || (row.status === 'leased' && (row.leaseExpiresAt ?? 0) <= now)
@@ -172,7 +175,7 @@ export class MemoryWorkStore implements WorkStore {
         || (Date.parse(a.createdAt) - Date.parse(b.createdAt)))
     const row = candidates[0]
     if (!row) {
-      if (requestId) this.claims.set(requestId, { workerId, work: null })
+      if (requestId) this.claims.set(requestId, { workerId, work: null, kinds })
       return null
     }
 
@@ -199,7 +202,7 @@ export class MemoryWorkStore implements WorkStore {
     row.attempts += 1
     this.sessionLeases.set(sessionKey, { workId: row.id, fence: row.fence, expiresAt: now + this.leaseTtlMs })
     const work = this.toWorkItem(row, token, homeEpoch)
-    if (requestId) this.claims.set(requestId, { workerId, work: structuredClone(work) })
+    if (requestId) this.claims.set(requestId, { workerId, work: structuredClone(work), kinds })
     return work
   }
 
@@ -478,18 +481,22 @@ export class MemoryActionLedger implements ActionLedgerStore {
 }
 
 export class MemoryModelBudgetStore implements ModelBudgetStore {
-  private readonly budgets = new Map<string, ModelBudgetLimits & { calls: Set<string>; recorded: Set<string>; tokens: number; costMicros: number }>()
+  private readonly budgets = new Map<string, ModelBudgetLimits & { calls: Map<string, [number, number]>; recorded: Set<string>; tokens: number; costMicros: number }>()
 
   async reserve(rootWorkId: string, callId: string, limits: ModelBudgetLimits): Promise<ModelBudgetReservation> {
     let budget = this.budgets.get(rootWorkId)
     if (!budget) {
-      budget = { ...limits, calls: new Set(), recorded: new Set(), tokens: 0, costMicros: 0 }
+      budget = { ...limits, calls: new Map(), recorded: new Set(), tokens: 0, costMicros: 0 }
       this.budgets.set(rootWorkId, budget)
     }
     const existing = budget.calls.has(callId)
     const allowed = existing || (Date.now() < Date.parse(budget.deadlineAt)
-      && budget.calls.size < budget.maxModelCalls && budget.tokens < budget.maxTokens && budget.costMicros < budget.maxCostMicros)
-    if (allowed && !existing) budget.calls.add(callId)
+      && budget.calls.size < budget.maxModelCalls && budget.tokens + (limits.reservedTokens ?? 0) <= budget.maxTokens && budget.costMicros + (limits.reservedCostMicros ?? 0) <= budget.maxCostMicros)
+    if (allowed && !existing) {
+      budget.calls.set(callId, [limits.reservedTokens ?? 0, limits.reservedCostMicros ?? 0])
+      budget.tokens += limits.reservedTokens ?? 0
+      budget.costMicros += limits.reservedCostMicros ?? 0
+    }
     return { allowed, remainingCalls: Math.max(0, budget.maxModelCalls - budget.calls.size),
       remainingTokens: Math.max(0, budget.maxTokens - budget.tokens),
       remainingCostMicros: Math.max(0, budget.maxCostMicros - budget.costMicros), deadlineAt: budget.deadlineAt }
@@ -500,7 +507,7 @@ export class MemoryModelBudgetStore implements ModelBudgetStore {
     if (!budget || !budget.calls.has(callId)) throw new Error('model call budget reservation is missing')
     if (budget.recorded.has(callId)) return
     budget.recorded.add(callId)
-    budget.tokens += inputTokens + outputTokens
-    budget.costMicros += costMicros
+    budget.tokens += inputTokens + outputTokens - budget.calls.get(callId)![0]
+    budget.costMicros += costMicros - budget.calls.get(callId)![1]
   }
 }

@@ -4,6 +4,8 @@ import type { HostAction, WorkItem } from '../../protocol/types.js'
 import type { LingxiLoopServices } from './service-contracts.js'
 import { nativeWork } from './actions.js'
 import { claimApprovalExecution, inspectApproval, persistApproval, resumeApproved } from './approvals.js'
+import { createLectureDeckApp } from '../../lecture-deck/app.js'
+import type { LectureDeckService } from '../../lecture-deck/service.js'
 
 type Services = Pick<LingxiLoopServices, 'presentations' | 'permissionService'>
 
@@ -38,18 +40,23 @@ export async function requestPresentationApproval(database: SqlPool, services: S
 }
 
 export async function approvePresentation(database: SqlPool, services: Services,
-  input: { companyId: string; userId: string; approvalId: string }) {
+  input: { companyId: string; userId: string; approvalId: string }, lecture: LectureDeckService) {
   const reviewed = await inspectApproval(database, services, input)
   if (reviewed.action.action !== 'presentations.approve_outline') throw new Error('unsupported presentation approval')
   if (reviewed.status === 'EXECUTED') return resumeApproved(database, input, reviewed)
-  const { intent, recovering } = await claimApprovalExecution(database, input, reviewed)
+  await withTransaction(database, async db => {
+  const { intent, recovering } = await claimApprovalExecution(db, input, reviewed)
   const work = { id: intent.workId, fence: 0, homeEpoch: 0, tenantId: intent.tenantId, agentId: intent.agentId,
     sessionId: intent.sessionId, triggerRef: '', kind: 'resume' as const, lane: 'approval' as const,
     ...(intent.principalId ? { principalId: intent.principalId } : {}) }
   const prepared = await preparePresentationApproval(services, work, reviewed.action, input.userId, recovering)
   if (!recovering && !isDeepStrictEqual(prepared.preview, reviewed.preview)) throw new Error('presentation approval preview is stale')
-  const value = await prepared.execute()
-  await withTransaction(database, async db => {
+  const value = await createLectureDeckApp(database, lecture).enqueueLectureOperation({
+    tenantId: intent.tenantId, principalId: intent.principalId!, agentId: intent.agentId, sessionId: intent.sessionId,
+    ...(intent.threadId ? { threadId: intent.threadId } : {}), deckId: String(reviewed.action.args['presentationId']),
+    operation: 'approve_outline', idempotencyKey: reviewed.action.idempotencyKey,
+    request: { expectedRevision: reviewed.action.args['expectedRevision'] },
+  }, db)
     const updated = await db.query(`UPDATE approvals SET status='EXECUTED',resolved_at=NOW(),resolved_by=$2,executed_at=NOW(),result=$3::jsonb,error=NULL
       WHERE id=$1 AND company_id=$4 AND status='EXECUTING' RETURNING id`, [input.approvalId, input.userId, JSON.stringify(value), input.companyId])
     if (updated.rows.length !== 1) throw new Error('presentation approval changed while executing')

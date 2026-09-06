@@ -11,11 +11,15 @@ import { buildStandaloneLecture, type LectureArtifact } from './standalone.js'
 import { validateDeck } from './validation.js'
 
 export type LectureStage = 'plan-course' | 'plan-chapter' | 'author-slide' | 'validate-slide' | 'repair-slide' | 'validate-deck' | 'publish-deck'
-export type LectureStatus = 'planning' | 'generating' | 'validating' | 'publishing' | 'ready' | 'failed' | 'cancelled'
+export type LectureStatus = 'planning' | 'awaiting_outline_approval' | 'generating' | 'validating' | 'publishing' | 'ready' | 'failed' | 'cancelled'
 export interface LectureCheckpoint { stage: LectureStage; key: string; inputHash: string; output: unknown; outputHash: string; attempts: number; completedAt: string }
 export interface LectureRecord {
   id: string; tenantId: string; principalId: string; revision: number; status: LectureStatus; request: LectureDeckCreateRequest
   manifest?: DeckManifest; report?: ValidationReport; artifact?: Omit<LectureArtifact, 'bytes'>; error?: string
+  outline?: CoursePlan; evidence?: EvidenceSnapshot[]; outlineApproved?: boolean
+  revisionRequest?: LectureDeckRevisionRequest
+  stateVersion?: number
+  rootWorkId?: string
 }
 export interface LectureRepository {
   create(record: LectureRecord): Promise<void>
@@ -47,7 +51,8 @@ const contentHashBytes = (bytes: Uint8Array) => createHash('sha256').update(byte
 export class LectureDeckService {
   private readonly now: () => string
   private readonly active = new Map<string, AbortController>()
-  constructor(private readonly deps: LectureDeckDependencies) { this.now = deps.now ?? (() => new Date().toISOString()) }
+  constructor(readonly dependencies: LectureDeckDependencies) { this.now = dependencies.now ?? (() => new Date().toISOString()) }
+  private get deps() { return this.dependencies }
 
   async begin(scope: { tenantId: string; principalId: string }, value: unknown, id: string = randomUUID()): Promise<LectureRecord> {
     const request = validateCreateRequest(value)
@@ -68,6 +73,8 @@ export class LectureDeckService {
 
   async run(scope: { tenantId: string; principalId: string }, id: string, signal?: AbortSignal): Promise<LectureRecord> {
     const record = await this.owned(scope, id)
+    if (record.status === 'ready' || record.status === 'awaiting_outline_approval' || record.status === 'cancelled') return record
+    if (record.status === 'publishing') return this.publish(record, signal)
     if (!['planning', 'generating', 'validating'].includes(record.status)) throw new Error('lecture is not awaiting generation or recovery')
     return this.withCancellation(record.id, signal, activeSignal => this.generate(record, activeSignal))
   }
@@ -76,7 +83,7 @@ export class LectureDeckService {
     const record = await this.owned(scope, id)
     if (!['failed', 'cancelled'].includes(record.status)) throw new Error('only failed or cancelled lectures can be retried')
     const { error: _error, ...retryable } = record
-    const next: LectureRecord = { ...retryable, status: 'planning' }
+    const next: LectureRecord = { ...retryable, status: record.outlineApproved ? 'generating' : 'planning' }
     await this.deps.repository.save(next, record.revision)
     return this.withCancellation(next.id, signal, activeSignal => this.generate(next, activeSignal))
   }
@@ -86,23 +93,38 @@ export class LectureDeckService {
     const current = await this.owned(scope, id)
     if (!current.manifest || current.status !== 'ready') throw new Error('only ready lectures can be revised')
     if (current.revision !== request.expectedRevision) throw new Error('lecture revision changed')
-    const affected = this.affectedSlides(current.manifest, request)
+    this.affectedSlides(current.manifest, request)
     const revision = current.revision + 1
     const { artifact: _artifact, report: _report, ...revisable } = current
-    const next: LectureRecord = { ...revisable, revision, status: 'generating' }
+    const next: LectureRecord = { ...revisable, revision, status: 'awaiting_outline_approval', outlineApproved: false, revisionRequest: request }
     await this.deps.repository.save(next, current.revision)
-    try {
-      return await this.withCancellation(next.id, signal, async activeSignal => {
-        const slides = [...current.manifest!.slides]
-        for (const original of affected) {
-          abortIfNeeded(activeSignal)
-          const chapter = current.manifest!.course.chapters.find(item => item.id === original.chapterId)!
-          slides[original.order] = await this.authorSlide(next, current.manifest!.course, chapter, original.order, original.id, current.manifest!.evidence, original, request.instruction, activeSignal)
-        }
-        const { contentHash: _hash, ...base } = current.manifest!
-        return await this.finish(next, { ...base, revision, slides, createdAt: this.now() }, activeSignal)
-      })
-    } catch (error) { return this.fail(next, error) }
+    abortIfNeeded(signal)
+    return next
+  }
+
+  async approveOutline(scope: { tenantId: string; principalId: string }, id: string, expectedRevision: number) {
+    const record = await this.owned(scope, id)
+    if (record.revision !== expectedRevision) throw new Error('lecture revision changed')
+    if (record.outlineApproved) return record
+    if (record.status !== 'awaiting_outline_approval' || !record.outline) throw new Error('lecture outline is not awaiting approval')
+    const approved: LectureRecord = { ...record, outlineApproved: true, status: 'generating' }
+    await this.deps.repository.save(approved, expectedRevision)
+    return approved
+  }
+
+  async reviseOutline(scope: { tenantId: string; principalId: string }, id: string, input: { expectedRevision: number; feedback?: string; targetSlideCount?: number }) {
+    const record = await this.owned(scope, id)
+    if (record.revision !== input.expectedRevision || record.status !== 'awaiting_outline_approval') throw new Error('lecture outline changed or is not awaiting approval')
+    if (!input.feedback?.trim() && input.targetSlideCount === undefined) throw new Error('outline feedback or targetSlideCount is required')
+    const request = validateCreateRequest({ ...record.request,
+      requirements: [record.request.requirements, input.feedback].filter(Boolean).join('\n'),
+      ...(input.targetSlideCount === undefined ? {} : { targetSlideCount: input.targetSlideCount }) })
+    const next: LectureRecord = { id: record.id, tenantId: record.tenantId, principalId: record.principalId,
+      revision: record.revision + 1, status: 'planning', request,
+      ...(record.stateVersion === undefined ? {} : { stateVersion: record.stateVersion }),
+      ...(record.rootWorkId ? { rootWorkId: record.rootWorkId } : {}) }
+    await this.deps.repository.save(next, record.revision)
+    return next
   }
 
   async get(scope: { tenantId: string; principalId: string }, id: string) { return this.owned(scope, id) }
@@ -127,18 +149,35 @@ export class LectureDeckService {
   private async generate(record: LectureRecord, signal?: AbortSignal): Promise<LectureRecord> {
     try {
       abortIfNeeded(signal)
+      if (!record.outline) {
       const sourceIds = record.request.sourceIds ?? []
       const broadItems = await this.deps.evidence.search({ tenantId: record.tenantId, principalId: record.principalId, sourceIds, queries: [record.request.requirements], limit: 200, ...(signal ? { signal } : {}) })
       const broad = this.trimEvidence(snapshotEvidence(`${record.id}:course`, broadItems), 40)
       const course = await this.cached(record, 'plan-course', 'course', { request: record.request, evidence: broad }, () => this.deps.author.plan(record.request, broad, signal))
       this.validatePlan(course, record.request.targetSlideCount)
-      record = { ...record, status: 'generating' }
-      await this.deps.repository.save(record, record.revision)
       const evidence: EvidenceSnapshot[] = [broad]
       for (const chapter of course.chapters) {
         abortIfNeeded(signal)
         const items = await this.deps.evidence.search({ tenantId: record.tenantId, principalId: record.principalId, sourceIds, queries: [chapter.title, ...chapter.objectiveIds.map(id => course.objectives.find(item => item.id === id)?.description ?? id)], limit: 200, ...(signal ? { signal } : {}) })
         evidence.push(this.trimEvidence(snapshotEvidence(`${record.id}:${chapter.id}`, items), 60))
+      }
+      const waiting: LectureRecord = { ...record, outline: course, evidence, outlineApproved: false, status: 'awaiting_outline_approval' }
+      await this.deps.repository.save(waiting, record.revision)
+      return waiting
+      }
+      if (!record.outlineApproved) throw new Error('lecture outline must be approved before authoring slides')
+      const course = record.outline, evidence = record.evidence ?? []
+      record = { ...record, status: 'generating' }
+      await this.deps.repository.save(record, record.revision)
+      if (record.revisionRequest && record.manifest) {
+        const slides = [...record.manifest.slides]
+        for (const original of this.affectedSlides(record.manifest, record.revisionRequest)) {
+          abortIfNeeded(signal)
+          const chapter = course.chapters.find(item => item.id === original.chapterId)!
+          slides[original.order] = await this.authorSlide(record, course, chapter, original.order, original.id, evidence, original, record.revisionRequest.instruction, signal)
+        }
+        const { contentHash: _hash, ...base } = record.manifest
+        return await this.finish(record, { ...base, revision: record.revision, slides, createdAt: this.now() }, signal)
       }
       const chapterForOrder = new Map(course.chapters.flatMap(chapter => chapter.slideIds.map(id => [id, chapter] as const)))
       const orderedIds = course.chapters.flatMap(chapter => chapter.slideIds).slice(0, course.targetSlideCount)
@@ -182,7 +221,7 @@ export class LectureDeckService {
     let report = validateDeck(manifest)
     if (report.passed) {
       const semantic = await this.deps.reviewer.review(manifest, signal)
-      report = { passed: semantic.passed, issues: [...report.issues, ...semantic.issues] }
+      report = { passed: semantic.passed === true && semantic.issues.length === 0, issues: [...report.issues, ...semantic.issues] }
     }
     if (!report.passed) throw new Error(`lecture quality gate failed: ${report.issues.map(issue => issue.code).join(', ')}`)
     abortIfNeeded(signal)
@@ -192,8 +231,21 @@ export class LectureDeckService {
     const artifact = buildStandaloneLecture(manifest, this.deps.maxArtifactBytes)
     const ready: LectureRecord = { ...record, status: 'ready', manifest, report, artifact: { filename: artifact.filename, mime: artifact.mime, size: artifact.size, sha256: artifact.sha256 } }
     abortIfNeeded(signal)
-    if (!await this.deps.repository.claimPublication({ ...record, status: 'publishing' })) return await this.owned(record, record.id)
-    await this.deps.publisher.publish(ready, artifact)
+    const publishing: LectureRecord = { ...ready, status: 'publishing' }
+    if (!await this.deps.repository.claimPublication(publishing)) return await this.owned(record, record.id)
+    return this.publish(publishing, signal)
+  }
+
+  private async publish(record: LectureRecord, signal?: AbortSignal): Promise<LectureRecord> {
+    abortIfNeeded(signal)
+    if (!record.manifest || !record.artifact || !record.report?.passed || record.report.issues.length) throw new Error('lecture publication intent is incomplete')
+    const artifact = buildStandaloneLecture(record.manifest, this.deps.maxArtifactBytes)
+    if (artifact.sha256 !== record.artifact.sha256 || artifact.size !== record.artifact.size) throw new Error('lecture publication intent hash mismatch')
+    const existing = await this.deps.publisher.read?.(record)
+    if (existing && (contentHashBytes(existing) !== artifact.sha256 || existing.length !== artifact.size)) throw new Error('published lecture hash mismatch')
+    if (!existing) await this.deps.publisher.publish(record, artifact)
+    abortIfNeeded(signal)
+    const ready: LectureRecord = { ...record, status: 'ready' }
     await this.deps.repository.save(ready, record.revision)
     return ready
   }
@@ -201,8 +253,10 @@ export class LectureDeckService {
   private async fail(record: LectureRecord, error: unknown): Promise<LectureRecord> {
     const latest = await this.deps.repository.get(record.tenantId, record.id)
     if (latest?.status === 'cancelled' || latest && latest.revision !== record.revision) return latest
-    const failed = { ...record, status: 'failed' as const, error: error instanceof Error ? error.message : String(error) }
-    await this.deps.repository.save(failed, record.revision).catch(() => undefined)
+    // A publication intent is recoverable; never replace it with a pre-publication snapshot.
+    if (latest?.status === 'publishing') throw error
+    const failed = { ...(latest ?? record), status: 'failed' as const, error: error instanceof Error ? error.message : String(error) }
+    await this.deps.repository.save(failed, record.revision)
     return failed
   }
 
@@ -291,6 +345,7 @@ export class ModelLectureReviewer implements LectureReviewer {
       const result = await this.model.structured({ instructions: 'Independently review these lecture pages for citation support, teaching continuity, meaningful visuals, skipped prerequisites, and professional readability. Return strict JSON {"passed":boolean,"issues":[{"code":"string","message":"string","pageId":"optional","objectId":"optional"}]}. Do not claim browser geometry was checked.', input: { course: deck.course, slides, evidence }, signal })
       const report = result.value as ValidationReport
       if (!report || typeof report.passed !== 'boolean' || !Array.isArray(report.issues) || report.issues.some(issue => !issue || typeof issue.code !== 'string' || typeof issue.message !== 'string')) throw new Error('lecture reviewer returned an invalid report')
+      if (!report.passed && report.issues.length === 0) issues.push({ code: 'review.rejected', message: 'Reviewer rejected these slides without a detailed issue' })
       issues.push(...report.issues)
     }
     return { passed: issues.length === 0, issues }

@@ -44,6 +44,7 @@ import { CorrectionBudget } from './corrections.js'
 import { refreshResourceChecks } from './resource-refresh.js'
 import { DefaultRuntimePolicy, type RuntimePolicy } from './policy.js'
 import { createHash } from 'node:crypto'
+import { ModelBudgetExceededError } from '../errors.js'
 import { boundedToolOutput, parseIPythonArguments } from './tool.js'
 
 export interface WorkProcessorContext {
@@ -153,10 +154,10 @@ export class AgentRuntime {
     if (!Number.isSafeInteger(this.modelTrace.retentionDays) || this.modelTrace.retentionDays < 1) throw new Error('model trace retentionDays must be a positive integer')
     if (options.modelTrace?.recordPayloads === true) this.recordModelPayloads = true
     this.rootModelBudget = {
-      maxModelCalls: options.rootModelBudget?.maxModelCalls ?? this.maxHops,
-      maxTokens: options.rootModelBudget?.maxTokens ?? 1_000_000,
+      maxModelCalls: options.rootModelBudget?.maxModelCalls ?? 512,
+      maxTokens: options.rootModelBudget?.maxTokens ?? 10_000_000,
       maxCostMicros: options.rootModelBudget?.maxCostMicros ?? 10_000_000,
-      wallClockMs: options.rootModelBudget?.wallClockMs ?? 30 * 60_000,
+      wallClockMs: options.rootModelBudget?.wallClockMs ?? 2 * 60 * 60_000,
       inputCostMicrosPerMillion: options.rootModelBudget?.inputCostMicrosPerMillion ?? 0,
       outputCostMicrosPerMillion: options.rootModelBudget?.outputCostMicrosPerMillion ?? 0,
     }
@@ -167,30 +168,50 @@ export class AgentRuntime {
   }
 
   /** Register a custom processor or the normal conversation pipeline for a work kind. */
+  get workKinds(): string[] { return ['turn', 'resume', ...this.processors.keys()].sort() }
+
   registerProcessor(kind: string, processor: WorkProcessor | 'conversation'): void {
     this.processors.set(kind, processor)
   }
 
   private observedModel(work: WorkItem): ModelDriver {
-    if (!this.onModelCall) return this.model
     const observer = this.onModelCall
     let sequence = 0
     const call = async <T extends { model: string; usage: { available: boolean; inputTokens: number; outputTokens: number } }>(
-      purpose: ModelCallObservation['purpose'], operation: () => Promise<T>,
+      purpose: ModelCallObservation['purpose'], request: { signal?: AbortSignal | undefined }, operation: (signal?: AbortSignal) => Promise<T>,
     ): Promise<T> => {
       const callId = `${work.id}:${work.fence}:model:${++sequence}`
       const startedAt = Date.now()
+      const estimatedInput = Buffer.byteLength(JSON.stringify(request), 'utf8') + (this.model.toolDefinitionTokens ?? 0)
+      const reservedTokens = estimatedInput + (this.model.maxOutputTokens ?? 4096)
+      const reservedCostMicros = Math.ceil((estimatedInput * this.rootModelBudget.inputCostMicrosPerMillion
+        + (this.model.maxOutputTokens ?? 4096) * this.rootModelBudget.outputCostMicrosPerMillion) / 1_000_000)
+      const reservation = await this.host.reserveModelCall?.(work, callId, {
+        maxModelCalls: this.rootModelBudget.maxModelCalls, maxTokens: this.rootModelBudget.maxTokens,
+        maxCostMicros: this.rootModelBudget.maxCostMicros, deadlineAt: new Date(Date.now() + this.rootModelBudget.wallClockMs).toISOString(),
+        reservedTokens, reservedCostMicros,
+      })
+      if (reservation && !reservation.allowed) throw new ModelBudgetExceededError('root work model budget exhausted')
+      const remainingMs = reservation ? Date.parse(reservation.deadlineAt) - Date.now() : this.rootModelBudget.wallClockMs
+      if (remainingMs <= 0) throw new ModelBudgetExceededError('root work deadline exceeded')
+      const deadline = AbortSignal.timeout(Math.min(2_147_483_647, remainingMs))
+      const signal = request.signal ? AbortSignal.any([request.signal, deadline]) : deadline
       let result: T
       try {
-        result = await operation()
+        result = await operation(signal)
       } catch (error) {
-        await observer({ callId, purpose, workId: work.id, tenantId: work.tenantId, agentId: work.agentId,
+        await observer?.({ callId, purpose, workId: work.id, tenantId: work.tenantId, agentId: work.agentId,
           sessionId: work.sessionId, ...(work.threadId ? { threadId: work.threadId } : {}),
           ...(work.principalId ? { principalId: work.principalId } : {}), model: this.model.modelId ?? 'unknown',
           latencyMs: Date.now() - startedAt, status: 'failed', error: errorMessage(error) })
         throw error
       }
-      await observer({ callId, purpose, workId: work.id, tenantId: work.tenantId, agentId: work.agentId,
+      const inputTokens = result.usage.available ? result.usage.inputTokens : estimatedInput
+      const outputTokens = result.usage.available ? result.usage.outputTokens : this.model.maxOutputTokens ?? 4096
+      const costMicros = Math.ceil((inputTokens * this.rootModelBudget.inputCostMicrosPerMillion
+        + outputTokens * this.rootModelBudget.outputCostMicrosPerMillion) / 1_000_000)
+      await this.host.recordModelUsage?.(work, callId, { inputTokens, outputTokens, costMicros })
+      await observer?.({ callId, purpose, workId: work.id, tenantId: work.tenantId, agentId: work.agentId,
         sessionId: work.sessionId, ...(work.threadId ? { threadId: work.threadId } : {}),
         ...(work.principalId ? { principalId: work.principalId } : {}), model: result.model,
         usage: result.usage, latencyMs: Date.now() - startedAt, status: 'succeeded' })
@@ -202,12 +223,12 @@ export class AgentRuntime {
       ...(this.model.contextWindowTokens === undefined ? {} : { contextWindowTokens: this.model.contextWindowTokens }),
       ...(this.model.maxOutputTokens === undefined ? {} : { maxOutputTokens: this.model.maxOutputTokens }),
       ...(this.model.toolDefinitionTokens === undefined ? {} : { toolDefinitionTokens: this.model.toolDefinitionTokens }),
-      run: (request) => call('agent-turn', async () => {
-        const result = await this.model.run(request)
+      run: (request) => call('agent-turn', request, async signal => {
+        const result = await this.model.run({ ...request, signal })
         return { ...result, model: result.model ?? this.model.modelId ?? 'unknown' }
       }),
-      structured: (request) => call('structured', () => this.model.structured(request)),
-      compact: (request) => call('compaction', () => this.model.compact(request)),
+      structured: (request) => call('structured', request, signal => this.model.structured({ ...request, ...(signal ? { signal } : {}) })),
+      compact: (request) => call('compaction', request, signal => this.model.compact({ ...request, ...(signal ? { signal } : {}) })),
     }
   }
 
@@ -417,12 +438,6 @@ export class AgentRuntime {
       const sample = Number.parseInt(inputSha256.slice(0, 8), 16) / 0xffffffff < this.modelTrace.sampleRate
       const tracePayload = (value: unknown) => this.modelTrace.redact ? this.modelTrace.redact(structuredClone(value)) : value
       const traceExpiresAt = new Date(Date.now() + this.modelTrace.retentionDays * 86_400_000).toISOString()
-      const reservation = await this.host.reserveModelCall?.(work, modelCallId, {
-        maxModelCalls: this.rootModelBudget.maxModelCalls, maxTokens: this.rootModelBudget.maxTokens,
-        maxCostMicros: this.rootModelBudget.maxCostMicros,
-        deadlineAt: new Date(Date.now() + this.rootModelBudget.wallClockMs).toISOString(),
-      })
-      if (reservation && !reservation.allowed) throw new HardLimitExceededError('root work model budget exhausted')
       await this.event(work, runId, { kind: 'model.started', stage: 'started', visibility: 'internal', data: {
         hop: hop + 1, callId: modelCallId, ...(memoryForModel ? { memorySnapshotId: memoryForModel.id, memorySnapshot: memoryForModel }
           : liveContext.memory ? { memoryOmittedForBudget: true } : {}),
@@ -469,14 +484,6 @@ export class AgentRuntime {
             ...(turn.finalCandidate === undefined ? {} : { finalCandidate: tracePayload(turn.finalCandidate) }) } : {}),
         },
       })
-      if (this.host.recordModelUsage) {
-        const inputTokens = turn.usage.available ? turn.usage.inputTokens : 0
-        const outputTokens = turn.usage.available ? turn.usage.outputTokens : 0
-        const costMicros = Math.ceil((inputTokens * this.rootModelBudget.inputCostMicrosPerMillion
-          + outputTokens * this.rootModelBudget.outputCostMicrosPerMillion) / 1_000_000)
-        await this.host.recordModelUsage(work, modelCallId, { inputTokens, outputTokens, costMicros })
-      }
-
       await signals.refresh()
       if (signals.leaseLost()) throw signals.leaseLost()!
       if (signals.lifecycle.signal.aborted) throw new RunCancelledError('lifecycle')

@@ -38,6 +38,7 @@ import type {
 import { isModelItem } from './stores.js'
 
 export interface ControlPlaneDeps {
+  lecture?: (work: WorkItem, command: import('../lecture-deck/transport.js').LectureCommand) => Promise<unknown>
   work: WorkStore
   sessions: SessionStore
   events: EventStore
@@ -94,6 +95,12 @@ export class ControlPlaneService {
     this.logger = deps.logger ?? nullLogger
   }
 
+  async lecture(proof: LeaseProof, command: import('../lecture-deck/transport.js').LectureCommand): Promise<unknown> {
+    const work = await this.requireLease(proof, { rejectCancelled: true })
+    if (!this.deps.lecture) throw new ControlPlaneError(501, 'lecture capability is not configured')
+    return this.deps.lecture({ ...work, leaseToken: proof.leaseToken }, command)
+  }
+
   async reserveModelCall(proof: LeaseProof, callId: string, limits: ModelBudgetLimits) {
     const work = await this.requireLease(proof, { rejectCancelled: true })
     if (!this.deps.modelBudgets) throw new ControlPlaneError(501, 'durable model budgets are unavailable')
@@ -103,6 +110,7 @@ export class ControlPlaneService {
       || !Number.isSafeInteger(limits.maxTokens) || limits.maxTokens < 1
       || !Number.isSafeInteger(limits.maxCostMicros) || limits.maxCostMicros < 1
       || !Number.isFinite(Date.parse(limits.deadlineAt))) throw new ControlPlaneError(400, 'invalid model budget reservation')
+    if ([limits.reservedTokens ?? 0, limits.reservedCostMicros ?? 0].some(value => !Number.isSafeInteger(value) || value < 0)) throw new ControlPlaneError(400, 'invalid reserved model resources')
     return this.deps.modelBudgets.reserve(rootWorkId, callId, limits)
   }
 
@@ -160,14 +168,15 @@ export class ControlPlaneService {
     return result
   }
 
-  async claim(workerId: string, requestId?: string): Promise<WorkItem | null> {
+  async claim(workerId: string, requestId?: string, workKinds?: readonly string[]): Promise<WorkItem | null> {
     if (typeof workerId !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(workerId)) {
       throw new ControlPlaneError(400, 'workerId must be 1-128 safe identifier characters')
     }
     if (requestId !== undefined && !/^[A-Za-z0-9_-]{16,128}$/.test(requestId)) {
       throw new ControlPlaneError(400, 'requestId must be a 16-128 character identifier')
     }
-    const work = await this.deps.work.claim(workerId, requestId)
+    if (workKinds && (workKinds.length < 1 || workKinds.length > 64 || workKinds.some(kind => typeof kind !== 'string' || !/^[a-z][a-z0-9_]{0,63}$/.test(kind)))) throw new ControlPlaneError(400, 'invalid worker task types')
+    const work = await this.deps.work.claim(workerId, requestId, workKinds)
     if (work) {
       this.deps.metrics?.counter('agentos_work_claimed_total', 'Work items claimed').inc({ lane: work.lane })
     }

@@ -1,9 +1,11 @@
 /** First-release public API: assembled runtime and stable data contracts. */
 export { releaseVersions } from './versions.js'
-export { createLingxiOS, type LingxiOSOptions, type RequestInput, type DelegatedRequestInput, type LectureRequestInput, type LectureOperationInput, type MessageIdentity, type ActionResolutionInput } from './app/index.js'
+export { createLingxiOS, type LingxiOSOptions, type RequestInput, type DelegatedRequestInput, type MessageIdentity, type ActionResolutionInput } from './app/index.js'
 export { packageResources } from './app/resources.js'
 export { doctor, type DoctorCheck } from './app/doctor.js'
 export { ConfigError } from './errors.js'
+export { createLogger, type Logger } from './logging.js'
+export { MetricsRegistry } from './metrics.js'
 export { isGoalOutcome, type GoalOutcome, type Verification } from './protocol/outcome.js'
 export type { AssistantMessage, RunEvent, KernelArtifact } from './protocol/types.js'
 export type { RequestSnapshot } from './context/request.js'

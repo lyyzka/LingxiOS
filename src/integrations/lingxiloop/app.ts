@@ -65,6 +65,12 @@ export function canvasVerifierCapabilities(services: LingxiLoopServices, capabil
 /** Native LingxiLoop integration; product authentication remains outside this package boundary. */
 export async function createLingxiLoop(options: LingxiLoopOptions) {
   const { services, database } = options
+  if (process.env['NODE_ENV'] === 'production') {
+    for (const name of ['knowledge', 'calendar', 'documents', 'canvas', 'learning', 'teacher', 'email', 'pollApplication', 'directory', 'conversations', 'handoffs', 'storage'] as const) {
+      if (!services[name]) throw new Error(`full production deployment requires native ${name}`)
+    }
+    if (!options.lectureDeck) throw new Error('full production deployment requires package-owned lectureDeck')
+  }
   const execution = options.execution ?? 'worker'
   if (execution === 'control' && options.model) throw new Error('LingxiLoop control instances must not configure a model')
   const semantic = options.embeddings ? createSemanticMemory(database, options.embeddings) : undefined
@@ -384,7 +390,8 @@ export async function createLingxiLoop(options: LingxiLoopOptions) {
       },
     },
   })
-  if (!services.presentations && options.lectureDeck) services.presentations = createNativePresentationBridge(app, options.lectureDeck)
+  if (services.presentations && !options.lectureDeck) throw new Error('presentations require the package-owned lectureDeck service')
+  if (options.lectureDeck) services.presentations = createNativePresentationBridge(app.lectures!, options.lectureDeck)
   const { enqueue, enqueueDelegated, continueInput, ...lifecycle } = app
   const ownedLifecycle = execution === 'worker' ? lifecycle : { ...lifecycle,
     runNext: async () => { throw new Error('LingxiLoop control instances cannot claim work') },
@@ -396,7 +403,10 @@ export async function createLingxiLoop(options: LingxiLoopOptions) {
     approveCalendar: (input: { companyId: string; userId: string; approvalId: string }) => approveCalendar(database, services, input),
     approveDocument: (input: { companyId: string; userId: string; approvalId: string }) => approveDocument(database, services, input),
     approveEmail: (input: { companyId: string; userId: string; approvalId: string }) => approveEmail(database, services, input),
-    approvePresentation: (input: { companyId: string; userId: string; approvalId: string }) => approvePresentation(database, services, input),
+    approvePresentation: (input: { companyId: string; userId: string; approvalId: string }) => {
+      if (!options.lectureDeck) throw new Error('package-owned lectureDeck is required')
+      return approvePresentation(database, services, input, options.lectureDeck)
+    },
     approveKnowledge: (input: { companyId: string; userId: string; approvalId: string }) => approveKnowledge(database, services, input),
     approveTeacher: (input: { companyId: string; userId: string; approvalId: string }) => approveTeacher(database, services, input),
     rejectApproval: (input: { companyId: string; userId: string; approvalId: string }) => rejectApproval(database, services, input),

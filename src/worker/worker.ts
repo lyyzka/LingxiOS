@@ -25,6 +25,7 @@ export interface AgentWorkerOptions {
   healthPort?: number
   logger?: Logger
   metrics?: MetricsRegistry
+  lastContactAt?: () => number
 }
 
 export class AgentWorker {
@@ -35,6 +36,8 @@ export class AgentWorker {
   private polling: Promise<void> | null = null
   private health: http.Server | null = null
   private started = false
+  private lastClaimAt = 0
+  private checked = false
   private readonly shutdown = new AbortController()
   private readonly stopPolling = new AbortController()
 
@@ -49,6 +52,7 @@ export class AgentWorker {
   async start(): Promise<{ healthPort: number | null }> {
     if (this.started || this.stopping) throw new Error('worker has already been started or stopped')
     this.started = true
+    await this.check()
     let healthPort: number | null = null
     if (this.options.healthPort !== undefined) {
       this.health = http.createServer((req, res) => {
@@ -58,7 +62,7 @@ export class AgentWorker {
           return
         }
         if (req.url === '/readyz') {
-          res.writeHead(this.stopping ? 503 : 200, { 'content-type': 'application/json' })
+          res.writeHead(this.ready ? 200 : 503, { 'content-type': 'application/json' })
           res.end(JSON.stringify(this.status()))
           return
         }
@@ -83,13 +87,21 @@ export class AgentWorker {
 
   private status(): Record<string, unknown> {
     return {
-      ok: !this.stopping,
+      ok: this.ready,
       workerId: this.options.workerId,
       activeRuns: this.active.size,
       maxConcurrentRuns: this.options.maxConcurrentRuns,
       draining: this.stopping,
       ...(this.options.kernels ? { kernels: this.options.kernels.size } : {}),
     }
+  }
+
+  get ready(): boolean { const contact = this.options.lastContactAt?.() ?? this.lastClaimAt; return this.checked && !this.stopping && contact > 0 && Date.now() - contact < 60_000 }
+
+  async check(): Promise<void> {
+    if (this.checked) return
+    await this.options.kernels?.check?.()
+    this.checked = true
   }
 
   private async poll(): Promise<void> {
@@ -100,6 +112,7 @@ export class AgentWorker {
           continue
         }
         const work = await this.options.host.claimWork(this.stopPolling.signal)
+        this.lastClaimAt = Date.now()
         if (this.stopping) return
         if (!work) {
           await this.sleep(this.pollIdleMs)

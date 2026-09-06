@@ -1,4 +1,4 @@
-import type { LectureOperationInput, LectureRequestInput } from '../../app/index.js'
+import type { LectureOperationInput, LectureRequestInput } from '../../lecture-deck/app.js'
 import { validateCreateRequest, validateRevisionRequest } from '../../lecture-deck/contracts.js'
 import type { LectureDeckService } from '../../lecture-deck/service.js'
 import type { LingxiLoopServices, NativeWork } from './service-contracts.js'
@@ -6,6 +6,7 @@ import type { LingxiLoopServices, NativeWork } from './service-contracts.js'
 interface LectureApp {
   enqueueLecture(input: LectureRequestInput): Promise<{ id: string; deckId: string; revision: number; status: string }>
   enqueueLectureOperation(input: LectureOperationInput): Promise<{ id: string; deckId: string; revision: number; status: string }>
+  cancelLecture(input: { tenantId: string; principalId: string; deckId: string }): Promise<unknown>
 }
 const object = (value: unknown) => {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('presentation request is invalid')
@@ -21,7 +22,7 @@ const scope = (work: NativeWork) => {
 }
 const appInput = (work: NativeWork) => ({ tenantId: work.companyId, principalId: work.authorizationUserId!, agentId: work.agentId, sessionId: work.channelId })
 
-/** Uses the package-owned LectureDeck service when LingxiLoop has no legacy presentation implementation. */
+/** Package-owned presentation workflow; native services supply only product resources. */
 export function createNativePresentationBridge(app: LectureApp, service: LectureDeckService): NonNullable<LingxiLoopServices['presentations']> {
   const createSchema = { parse(value: unknown) {
     const input = object(value), key = idempotency(input), { idempotencyKey: _key, ...request } = input
@@ -49,22 +50,26 @@ export function createNativePresentationBridge(app: LectureApp, service: Lecture
       const queued = await app.enqueueLecture({ ...appInput(work), id: idempotencyKey, sourceRef: work.triggerClientMsgNo, request })
       return { id: queued.deckId, status: queued.status, workId: queued.id, revision: queued.revision }
     },
-    getPresentationForAgent: (work, id) => service.get(scope(work), id),
-    cancelPresentationForAgent: (work, id) => service.cancel(scope(work), id),
+    async getPresentationForAgent(work, id) {
+      const deck = await service.get(scope(work), id)
+      return { ...deck, title: deck.outline?.title ?? deck.request.title, outlineRevision: deck.revision,
+        status: deck.status === 'awaiting_outline_approval' ? 'awaitingOutlineApproval' : deck.status }
+    },
+    cancelPresentationForAgent: (work, id) => app.cancelLecture({ ...scope(work), deckId: id }),
     async retryPresentationForAgent(work, id, input) {
       return app.enqueueLectureOperation({ ...appInput(work), deckId: id, operation: 'retry', idempotencyKey: input.idempotencyKey })
     },
     async approvePresentationOutlineForAgent(work, id, input) {
       const deck = await service.get(scope(work), id)
       if (deck.revision !== input.expectedRevision) throw new Error('presentation outline changed')
-      return deck
+      return app.enqueueLectureOperation({ ...appInput(work), deckId: id, operation: 'approve_outline', idempotencyKey: input.idempotencyKey!, request: { expectedRevision: input.expectedRevision } })
     },
     async revisePresentationOutlineForAgent(work, id, input) {
       const deck = await service.get(scope(work), id)
       if (deck.revision !== input.expectedRevision) throw new Error('presentation outline changed')
       const instruction = [input.feedback, input.targetSlideCount === undefined ? '' : `Use ${input.targetSlideCount} slides.`].filter(Boolean).join(' ')
       if (!instruction) throw new Error('outline feedback or targetSlideCount is required')
-      return app.enqueueLectureOperation({ ...appInput(work), deckId: id, operation: 'revise', idempotencyKey: input.idempotencyKey!, request: { instruction, scope: 'deck', expectedRevision: deck.revision } })
+      return app.enqueueLectureOperation({ ...appInput(work), deckId: id, operation: 'revise_outline', idempotencyKey: input.idempotencyKey!, request: { expectedRevision: deck.revision, ...(input.feedback ? { feedback: input.feedback } : {}), ...(input.targetSlideCount === undefined ? {} : { targetSlideCount: input.targetSlideCount }) } })
     },
     async revisePresentationForAgent(work, id, input) {
       const deck = await service.get(scope(work), id)

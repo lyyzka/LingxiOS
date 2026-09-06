@@ -1,7 +1,7 @@
 import { ControlPlaneServer } from '../control-plane/http-server.js'
 import { checkStorage } from './storage.js'
 import { captureMemoryEvidence, retryMemorySynthesis } from '../memory/evidence.js'
-import { memorySynthesisProcessor, memoryIndexProcessor } from '../memory/processor.js'
+import { registerProcessors } from '../worker/processors.js'
 import { readArtifact, persistArtifacts, stageArtifact } from './artifacts.js'
 import { resolve } from 'node:path'
 import { snapshotAttachments, type RequestAttachment } from '../context/attachments.js'
@@ -24,10 +24,19 @@ import type { ControlPlaneDeps } from '../control-plane/service.js'
 import type { ActionResolution, ContextProvider } from '../control-plane/stores.js'
 import type { RuntimePolicy } from '../runtime/policy.js'
 import type { ModelCallObserver } from '../runtime/runtime.js'
-import { lectureDeckProcessor, type LectureDeckService } from '../lecture-deck/service.js'
-import { contentHash } from '../lecture-deck/contracts.js'
+import { type LectureDeckService } from '../lecture-deck/service.js'
+import { createLectureDeckApp } from '../lecture-deck/app.js'
+import { lectureControl } from '../lecture-deck/control.js'
+import { kernelIsolation } from '../kernel/isolation.js'
+import { mkdir, open, unlink } from 'node:fs/promises'
+import { createLogger, type Logger } from '../logging.js'
+import { MetricsRegistry } from '../metrics.js'
+import { loadModelBudget } from '../config.js'
+import { maintainStorage } from './maintenance.js'
 
 export interface LingxiOSOptions {
+  logger?: Logger
+  metrics?: MetricsRegistry
   database: SqlPool
   model?: { id?: string; apiKey: string; baseUrl?: string; reasoningEffort?: 'high' | 'max'; maxOutputTokens?: number; contextWindowTokens?: number }
   persona?: PromptContext['persona']
@@ -44,7 +53,7 @@ export interface LingxiOSOptions {
   onModelCall?: ModelCallObserver
   /** Optional native professional HTML lecture-deck processor. */
   lectureDeck?: LectureDeckService
-  kernel?: Pick<KernelManagerOptions, 'pythonCommand' | 'homesRoot' | 'startupTimeoutMs' | 'executionTimeoutMs' | 'hostActionTimeoutMs' | 'maxOutputChars' | 'allowNetwork' | 'isolation'>
+  kernel?: Omit<KernelManagerOptions, 'runnerPath' | 'logger' | 'maxKernels'>
   /** Required in production for untrusted model-authored code. */
   kernelFactory?: (bridge: KernelHostBridge) => ManagedKernelExecutor
   /** Explicit opt-in for trusted model code using the local process backend in production. */
@@ -79,11 +88,6 @@ export interface MessageIdentity {
   sessionId: string
 }
 
-export interface LectureRequestInput extends Omit<RequestInput, 'text' | 'attachments' | 'authorName'> { request: unknown }
-export interface LectureOperationInput extends Omit<LectureRequestInput, 'request' | 'id'> {
-  deckId: string; operation: 'retry' | 'revise'; idempotencyKey: string; request?: unknown
-}
-
 export type ActionResolutionInput = ActionResolution & Pick<RequestInput,
   'tenantId' | 'agentId' | 'sessionId' | 'principalId' | 'threadId'>
 
@@ -95,10 +99,20 @@ export async function createLingxiOS(options: LingxiOSOptions) {
 /** Package-internal assembly hook; never exposed as consumer configuration. */
 export async function assembleApp(options: LingxiOSOptions, integration?: Pick<ControlPlaneDeps, 'contextProvider' | 'capabilityResolver' | 'actionExecutor' | 'delivery'> & { beforeClaim?(): Promise<void> }) {
   if (!options.database?.query || !options.database.connect) throw new ConfigError('a PostgreSQL pool is required')
+  if (options.lectureDeck && !options.lectureDeck.dependencies.publisher.read) throw new ConfigError('lecture publisher must support reading committed artifacts for recovery')
   if (options.model && ((options.model.id !== undefined && !options.model.id.trim()) || !options.model.apiKey?.trim())) throw new ConfigError('model apiKey is required and any explicit model id must be non-empty')
   const concurrency = options.worker?.concurrency ?? 2
   if (!Number.isSafeInteger(concurrency) || concurrency < 1 || concurrency > 1_024) throw new ConfigError('worker concurrency must be 1-1024')
   await checkStorage(options.database)
+  const logger = options.logger ?? createLogger()
+  const metrics = options.metrics ?? new MetricsRegistry()
+  const homesRoot = resolve(options.kernel?.homesRoot ?? process.env['AGENT_OS_HOMES_ROOT'] ?? '.agent-os/homes')
+  const modelBudget = { ...loadModelBudget(), ...options.modelBudget }
+  metrics.gauge('agentos_cost_budget_enabled', 'Configured prices make the cost budget effective').set(
+    modelBudget.inputCostMicrosPerMillion! > 0 || modelBudget.outputCostMicrosPerMillion! > 0 ? 1 : 0)
+  let lastContactAt = 0
+  let lastMaintenanceAt = 0
+  let maintenance: Promise<unknown> | undefined
   const persona = options.persona ?? { name: 'Assistant', role: 'assistant', instructions: 'Follow the current user request. Clearly distinguish verified results from remaining work.' }
   const workerId = options.worker?.id ?? `lingxios-${randomUUID()}`
   const sessions = new PgSessionStore(options.database)
@@ -135,6 +149,8 @@ export async function assembleApp(options: LingxiOSOptions, integration?: Pick<C
   }
 
   const service = new ControlPlaneService({
+    logger, metrics,
+    ...(options.lectureDeck ? { lecture: lectureControl(options.database, options.lectureDeck) } : {}),
     work: new PgWorkStore(options.database), sessions,
     events: new PgEventStore(options.database), actions: new PgActionLedger(options.database),
     modelBudgets: new PgModelBudgetStore(options.database),
@@ -188,11 +204,16 @@ export async function assembleApp(options: LingxiOSOptions, integration?: Pick<C
       },
     },
   })
-  async function claimWork(claimingWorkerId: string, requestId?: string) {
+  async function claimWork(claimingWorkerId: string, requestId?: string, workKinds?: readonly string[]) {
+    if (!maintenance && Date.now() - lastMaintenanceAt > 60_000) {
+      lastMaintenanceAt = Date.now()
+      maintenance = maintainStorage(options.database, homesRoot).catch(error => logger.error('maintenance failed', { error })).finally(() => { maintenance = undefined })
+    }
     await flushDeliveries()
     if (integration) await retryMemorySynthesis(options.database)
     await integration?.beforeClaim?.()
-    const work = await service.claim(claimingWorkerId, requestId)
+    const work = await service.claim(claimingWorkerId, requestId, workKinds)
+    lastContactAt = Date.now()
     if (!work) return null
     const { rows } = await options.database.query(
       'SELECT message FROM lingxios.agent_messages WHERE run_id=$1 AND tenant_id=$2 AND agent_id=$3 AND session_id=$4',
@@ -221,7 +242,8 @@ export async function assembleApp(options: LingxiOSOptions, integration?: Pick<C
     return work
   }
   const host: HostPort = {
-    claimWork: () => claimWork(workerId), heartbeat: (work) => service.heartbeat(work),
+    lecture: (work, command) => service.lecture(work, command),
+    claimWork: () => claimWork(workerId, undefined, local?.runtime.workKinds), heartbeat: async (work) => { const result = await service.heartbeat(work); lastContactAt = Date.now(); return result },
     loadContext: (work) => service.loadContext(work), executeAction: (work, action) => service.executeAction(work, action),
     reserveModelCall: (work, callId, limits) => service.reserveModelCall(work, callId, limits),
     recordModelUsage: (work, callId, usage) => service.recordModelUsage(work, callId, usage),
@@ -244,23 +266,18 @@ export async function assembleApp(options: LingxiOSOptions, integration?: Pick<C
     if (!options.model) throw new ConfigError('model configuration is required for local execution')
     const model = new OpenAIChatDriver(options.model.id ?? DEFAULT_MODEL.id, options.model)
     const bridge: KernelHostBridge = { execute: (work, action) => service.executeAction(work, action) }
-    if (!options.kernelFactory && options.kernel?.isolation !== 'bubblewrap' && process.env['NODE_ENV'] === 'production' && options.trustProcessKernel !== true) {
-      throw new ConfigError('production local execution requires an OS-isolated kernelFactory; trustProcessKernel is only for trusted model code')
-    }
-    const kernels = options.kernelFactory?.(bridge) ?? new KernelManager(bridge, { ...options.kernel, maxKernels: concurrency })
+    const kernels = options.kernelFactory?.(bridge) ?? new KernelManager(bridge, { ...options.kernel, maxKernels: concurrency,
+      isolation: kernelIsolation(options.kernel?.isolation ?? process.env['AGENT_OS_KERNEL_ISOLATION'], process.env['NODE_ENV'] === 'production', options.trustProcessKernel) })
     const runtime = new AgentRuntime(host, model, kernels, {
+      logger,
       ...(options.policy ? { policy: options.policy } : {}), recordModelPayloads: options.recordModelPayloads ?? false,
       ...(options.modelTrace ? { modelTrace: options.modelTrace } : {}),
-      ...(options.modelBudget ? { rootModelBudget: options.modelBudget } : {}),
+      rootModelBudget: modelBudget,
       ...(options.onModelCall ? { onModelCall: options.onModelCall } : {}),
     })
-    runtime.registerProcessor('memory_synthesis', memorySynthesisProcessor)
-    runtime.registerProcessor('memory_index', memoryIndexProcessor)
-    runtime.registerProcessor('teacher_digest', 'conversation')
-    runtime.registerProcessor('routine', 'conversation')
-    runtime.registerProcessor('mission_coordinator', 'conversation')
-    if (options.lectureDeck) runtime.registerProcessor('lecture_deck', lectureDeckProcessor(options.lectureDeck))
+    registerProcessors(runtime, options.lectureDeck)
     const worker = new AgentWorker({ host, runtime, kernels, workerId, maxConcurrentRuns: concurrency,
+      logger, metrics, lastContactAt: () => lastContactAt,
       shutdownGraceMs: options.worker?.shutdownGraceMs ?? 20_000,
       ...(options.worker?.pollIdleMs === undefined ? {} : { pollIdleMs: options.worker.pollIdleMs }),
       ...(options.worker?.healthPort === undefined ? {} : { healthPort: options.worker.healthPort }),
@@ -270,6 +287,9 @@ export async function assembleApp(options: LingxiOSOptions, integration?: Pick<C
   }
   let controlPlane: ControlPlaneServer | undefined
   return {
+    metrics: () => metrics.expose(),
+    maintenance: () => maintainStorage(options.database, homesRoot),
+    lectures: options.lectureDeck ? createLectureDeckApp(options.database, options.lectureDeck) : undefined,
     /** Authenticate and authorize the caller before using this server API. */
     readArtifact: (identity: MessageIdentity & Pick<RequestInput, 'principalId' | 'threadId'>, path: string) =>
       readArtifact(options.database, resolve(options.kernel?.homesRoot ?? process.env['AGENT_OS_HOMES_ROOT'] ?? '.agent-os/homes'), identity, path),
@@ -333,38 +353,9 @@ export async function assembleApp(options: LingxiOSOptions, integration?: Pick<C
           parentRequestVersion: delegation.parentRequestVersion, delegation: { ...delegation, assignment: request.text } },
       })
     },
-    async enqueueLecture(input: LectureRequestInput) {
-      if (!options.lectureDeck) throw new Error('native lecture-deck capability is not configured')
-      if (!input?.principalId?.trim()) throw new Error('authenticated principalId is required')
-      const requestId = input.id ?? randomUUID()
-      const deckId = `deck_${contentHash([input.tenantId, input.principalId, requestId]).slice(0, 32)}`
-      const deck = await options.lectureDeck.begin({ tenantId: input.tenantId, principalId: input.principalId }, input.request, deckId)
-      const workId = `lecture_${deck.id}_r${deck.revision}`
-      const queued = await service.enqueue({ id: workId, tenantId: input.tenantId, agentId: input.agentId, sessionId: input.sessionId,
-        ...(input.threadId ? { threadId: input.threadId } : {}), principalId: input.principalId, kind: 'lecture_deck', lane: 'background',
-        triggerRef: input.sourceRef ?? requestId, meta: { operation: 'run', deckId: deck.id } })
-      return { ...queued, deckId: deck.id, revision: deck.revision, status: deck.status }
-    },
-    async enqueueLectureOperation(input: LectureOperationInput) {
-      if (!options.lectureDeck) throw new Error('native lecture-deck capability is not configured')
-      if (!input?.principalId?.trim() || !input.idempotencyKey?.trim()) throw new Error('authenticated principalId and idempotencyKey are required')
-      const deck = await options.lectureDeck.get({ tenantId: input.tenantId, principalId: input.principalId }, input.deckId)
-      const workId = `lecture_${contentHash([deck.id, deck.revision, input.operation, input.idempotencyKey]).slice(0, 48)}`
-      const queued = await service.enqueue({ id: workId, tenantId: input.tenantId, agentId: input.agentId, sessionId: input.sessionId,
-        ...(input.threadId ? { threadId: input.threadId } : {}), principalId: input.principalId, kind: 'lecture_deck', lane: 'background',
-        triggerRef: input.sourceRef ?? input.idempotencyKey, meta: { operation: input.operation, deckId: deck.id, ...(input.request === undefined ? {} : { request: input.request }) } })
-      return { ...queued, deckId: deck.id, revision: deck.revision, status: deck.status }
-    },
-    async readLecture(input: { tenantId: string; principalId: string; deckId: string }) {
-      if (!options.lectureDeck) throw new Error('native lecture-deck capability is not configured')
-      return options.lectureDeck.get({ tenantId: input.tenantId, principalId: input.principalId }, input.deckId)
-    },
-    async readLectureHtml(input: { tenantId: string; principalId: string; deckId: string }) {
-      if (!options.lectureDeck) throw new Error('native lecture-deck capability is not configured')
-      return options.lectureDeck.readHtml({ tenantId: input.tenantId, principalId: input.principalId }, input.deckId)
-    },
     async runNext() {
-      const { runtime } = localExecution()
+      const { runtime, worker } = localExecution()
+      await worker.check()
       const work = await host.claimWork()
       if (!work) return false
       await runtime.runWork(work)
@@ -411,7 +402,18 @@ export async function assembleApp(options: LingxiOSOptions, integration?: Pick<C
       if (controlPlane) throw new Error('control plane is already listening or starting')
       if (!input.serviceToken?.trim()) throw new ConfigError('control plane service token is required')
       if (!Number.isSafeInteger(input.port) || input.port < 0 || input.port > 65535) throw new ConfigError('control plane port must be 0-65535')
-      const server = new ControlPlaneServer({ service, claimWork, serviceToken: input.serviceToken })
+      const server = new ControlPlaneServer({ service, claimWork, serviceToken: input.serviceToken, logger, metrics,
+        ready: async () => {
+          if (stopped) return false
+          await checkStorage(options.database)
+          await mkdir(homesRoot, { recursive: true, mode: 0o700 })
+          const path = resolve(homesRoot, `.ready-${randomUUID()}`)
+          const file = await open(path, 'wx', 0o600)
+          try { await file.writeFile('ready'); await file.sync() } finally { await file.close(); await unlink(path) }
+          const { rows } = await options.database.query(`SELECT COUNT(*)::integer AS count FROM lingxios.agent_delivery_outbox WHERE delivered_at IS NULL`)
+          metrics.gauge('agentos_delivery_pending', 'Pending message deliveries').set(Number(rows[0]?.['count'] ?? 0))
+          return !stopped
+        } })
       controlPlane = server
       try {
         listening = server.listen(input.port, input.host ?? '127.0.0.1')
@@ -426,6 +428,7 @@ export async function assembleApp(options: LingxiOSOptions, integration?: Pick<C
       stopped = true
       stopPromise ??= (async () => {
         await local?.worker.stop()
+        await maintenance
         // The listen caller receives startup errors; shutdown still releases any listener.
         await listening?.catch(() => {})
         if (controlPlane) {

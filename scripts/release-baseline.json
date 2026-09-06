@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "lingxiLoopRepository": "https://github.com/lyyzka/LingxiLoop.git",
+  "lingxiLoopCommit": "27295d82137ae6bcfb96d09ab139d5b780e0806b",
+  "postgresImage": "postgres:17.6-bookworm",
+  "liveRepeats": 3,
+  "workers": 2,
+  "concurrencyPerWorker": 2,
+  "queuedWork": 100
+}

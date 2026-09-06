@@ -117,7 +117,7 @@ try {
       const tool = ++calls % 2 === 1
       const code = calls === 1 ? `print(host.learning.get_mission(missionId=${JSON.stringify(mission.id)}))`
         : 'print(host.learning.start_mission(goal="Compare fractions", successCriteria="Explain equivalent fractions", explicit=True))'
-      const delta = tool ? { tool_calls: [{ index: 0, id: 'mission-action', function: { name: 'ipython', arguments: JSON.stringify({ code }) } }] } : { content: JSON.stringify({ body: 'Mission is ready for planning.', status: 'blocked',
+      const delta = tool ? { tool_calls: [{ index: 0, id: 'mission-action', function: { name: 'ipython', arguments: JSON.stringify({ code }) } }] } : { content: JSON.stringify({ body: 'Nova: Mission is ready for planning.', status: 'blocked',
         checks: [{ requirement: 'Help me learn fractions', status: 'unknown', basis: 'The fixture verified Mission setup only.' }], gaps: ['Planning and learning work have not been performed by this fixture.'] }) }
       res.writeHead(200, { 'content-type': 'text/event-stream' })
       res.end(`data: ${JSON.stringify({ choices: [{ delta, finish_reason: tool ? 'tool_calls' : 'stop' }] })}\n\ndata: [DONE]\n\n`)
@@ -127,7 +127,11 @@ try {
   const unavailable = async () => { throw new Error('unexpected mutation') }
   const app = await createLingxiLoop({ database, services: { ...services,
     learning: { ...services.learning, createPermissionService: unavailable, proposeLearningEvaluation: unavailable, learningScoreBreakdownSchema: { parse: unavailable }, recordLearningAttempt: unavailable, findLearningDocumentEvidence: unavailable, findLearningCanvasEvidence: unavailable, createKnowledgeUnits: unavailable, draftActivity: unavailable,
-      loadLearningTurnContext: async (native, actor) => { assert.equal(native.reason, 'handoff'); assert.equal(actor, 'learner'); return { project: { id: 'project' }, learnerId: 'learner', knowledgeUnits: [], due: [] } },
+      loadLearningTurnContext: async (native, actor) => {
+        assert.ok(['handoff', 'message', 'routine'].includes(native.reason))
+        assert.equal(actor, 'learner')
+        return { project: { id: 'project' }, learnerId: 'learner', knowledgeUnits: [], due: [] }
+      },
       getMission: async (id, company, project, learner, conversation) => {
         const stored = await repository.findLearningMission(database, company, project, id)
         assert.equal(stored.learnerId, learner); assert.equal(stored.conversationId, conversation)
@@ -140,7 +144,7 @@ try {
     assert.equal(await app.runNext(), true)
     assert.equal(calls, 2, JSON.stringify(await jobs()))
     const run = { tenantId: 'tenant', agentId: 'nova', sessionId: 'room', threadId: 'human-message', runId: job.id }
-    assert.equal((await app.readMessage(run))?.body, 'Mission is ready for planning.')
+    assert.equal((await app.readMessage(run))?.body, 'Nova: Mission is ready for planning.')
     assert.equal(await app.readDelivery(run), 'delivered')
     assert.deepEqual([cards.at(-1)[2], cards.at(-1)[3].replyToClientMsgNo], ['nova', 'human-message'])
     messages[0].clientMsgNo = 'via-host'
@@ -152,7 +156,7 @@ try {
     delete messages[0].payload.refs
     const received = await app.receive({ companyId: 'tenant', agentId: 'assistant', channelId: 'room', clientMsgNo: 'via-host' })
     assert.equal(await app.runNext(), true)
-    assert.equal(calls, 4)
+    assert.equal(calls, 6, 'the second fixture response is retried because it identifies Nova in Assistant’s turn')
     const delegated = (await jobs()).filter(item => item.kind === 'mission_coordinator' && item.trigger_ref === 'via-host')
     assert.equal(delegated.length, 1)
     assert.deepEqual([delegated[0].agent_id, delegated[0].principal_id, delegated[0].meta.text], ['nova', 'learner', messages[0].payload.body])
