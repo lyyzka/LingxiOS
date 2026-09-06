@@ -36,6 +36,8 @@ test('native lecture pipeline publishes offline HTML and revises only selected p
   assert.equal(artifacts.length, 1)
   assert.match(new TextDecoder().decode(artifacts[0]), /application\/json/)
   assert.doesNotMatch(new TextDecoder().decode(artifacts[0]), /<script[^>]+src=/)
+  const html = new TextDecoder().decode(artifacts[0])
+  for (const feature of [/id="pages"/, /async function goTo/, /\.animate\(/, /classList\.add\('is-focus'\)/]) assert.match(html, feature)
 
   const originalBodies = created.manifest!.slides.map(item => item.bodyHtml)
   const revised = await service.revise(scope, created.id, { instruction: 'Turn this into a process', scope: 'page', pageIds: ['pg_page_2'], expectedRevision: 1 })
