@@ -44,7 +44,7 @@ export interface NativeWork {
   channelId: string
   threadRootClientMsgNo?: string
   triggerClientMsgNo: string
-  reason: 'message' | 'resume' | 'routine' | 'handoff'
+  reason: 'message' | 'resume' | 'routine' | 'handoff' | 'canvas_worker' | 'canvas_summary'
   executionRole: 'coordinator' | 'specialist' | 'verifier' | 'reporter'
   lane: 'learner' | 'approval' | 'collaboration' | 'background'
   leaseToken: string
@@ -66,7 +66,7 @@ export interface NativeMessage {
   channelId: string
   channelType: number
   fromUid: string
-  payload: { version: 1; kind: string; body?: string; replyToClientMsgNo?: string; refs?: { agentId?: unknown }; data?: Record<string, unknown> }
+  payload: { version: 1; kind: string; body?: string; replyToClientMsgNo?: string; refs?: { agentId?: unknown; handoffId?: unknown; toAgentId?: unknown }; data?: Record<string, unknown> }
 }
 
 export interface NativeTextMessage {
@@ -169,7 +169,13 @@ export interface LingxiLoopServices {
   calendar?: {
     calendarApplication: {
       list(scope: { companyId: string; projectId: string; userId: string }, range: { from?: Date; to?: Date }): Promise<{ id: string; title: string; startAt: string }[]>
-      get(scope: { companyId: string; projectId: string; userId: string }, eventId: string): Promise<{ id: string; title: string; startAt: string }>
+      get(scope: { companyId: string; projectId: string; userId: string }, eventId: string): Promise<{
+        id: string; createdBy: string; kind: 'personal' | 'agent_task'; title: string; description: string | null
+        assigneeId: string | null; targetConversationId: string | null; agentPrompt: string | null; startAt: string
+      }>
+      dispatches(scope: { companyId: string; projectId: string; userId: string }, eventId: string): Promise<{
+        eventId: string; scheduledFor: string; status: string; conversationId: string | null; messageId: string | null
+      }[]>
     }
     listCalendarEventsQuerySchema: { parse(value: unknown): { from?: Date; to?: Date } }
     writes?: {
@@ -188,6 +194,7 @@ export interface LingxiLoopServices {
   }
   documents?: {
     listAgentDocuments(scope: { companyId: string; projectId: string }): Promise<NativeDocument[]>
+    listRecentAgentDocumentCreations(scope: { companyId: string; projectId: string; userId: string }, sinceMinutes: number): Promise<Array<{ id: string; title: string; createdBy: string; createdAt: unknown }>>
     readAgentDocument(scope: { companyId: string; projectId: string; userId: string }, documentId: string): Promise<NativeDocument & { body: string }>
     writes?: {
       content?: NativeDocumentContent
@@ -291,14 +298,52 @@ export interface LingxiLoopServices {
     getActivity(activityId: string, companyId: string, projectId: string): Promise<unknown>
   }
   advanceAgentReadReceipt?(input: { companyId: string; channelId: string; agentId: string; readThroughSeq: number }): Promise<unknown>
+  directory?: {
+    getAgentCliIdentity(id: string): Promise<unknown>
+    listAgentCliParticipants(actorId: string, kind: string | null): Promise<unknown[]>
+    listAgentCliStatuses(actorId: string): Promise<unknown[]>
+  }
+  conversations?: {
+    getAgentConversationMetadata(agentId: string, conversationId: string): Promise<unknown>
+    addAgentConversationMember(agentId: string, conversationId: string, participantId: string): Promise<unknown>
+    setAgentConversationTopic(agentId: string, conversationId: string, topic: string | null): Promise<unknown>
+    setAgentConversationTitle(agentId: string, conversationId: string, title: string, expectedTitle?: string): Promise<unknown>
+    listAgentConversationMutes(agentId: string): Promise<unknown[]>
+    setAgentConversationMuted(agentId: string, conversationId: string, mute: boolean, until: Date | null): Promise<unknown>
+  }
+  messaging?: {
+    missingAgentChannelMessageIds(input: { companyId: string; agentId: string; channelId: string; messageIds: string[] }): Promise<string[]>
+    getAgentChannelHistory(input: { companyId: string; agentId: string; channelId: string; limit?: number; beforeSequence?: number }): Promise<Array<{ channelId: string; messageSeq: number }> | null>
+    sendAgentChannelMessage(input: { companyId: string; agentId: string; channelId: string; clientNonce: string; payload: NativeTextMessage | (Omit<NativeTextMessage, 'kind'> & { kind: 'questionnaire' }) }): Promise<{ kind: 'accepted'; duplicate: boolean; messageId: string; sequence: number } | { kind: 'channel_not_found' | 'nonce_conflict' | 'verbatim_peer' }>
+    getAgentInbox(input: { companyId: string; agentId: string; limit?: number }): Promise<Array<{ channelId: string }>>
+    clearAgentChannelUnread(input: { companyId: string; agentId: string; channelId: string }): Promise<boolean>
+    searchAgentMessages(input: { companyId: string; agentId: string; query: string; channelId?: string; limit?: number }): Promise<unknown[]>
+    toggleAgentChannelReaction(input: { companyId: string; agentId: string; channelId: string; messageId: string; emoji: string }): Promise<{ kind: 'channel_not_found' | 'message_not_found' } | { kind: 'updated'; reactions: Array<{ emoji: string; count: number; users: string[] }> }>
+  }
+  handoffs?: {
+    createHandoff(input: { companyId: string; conversationId: string; fromAgentId: string; toAgentId: string; title: string;
+      contextMessageIds?: string[]; note?: string | null; idempotencyKey?: string | null }): Promise<{ id: string; sourceMessageId: string }>
+    updateHandoff(input: { companyId: string; handoffId: string; actorAgentId: string; status: 'accepted' | 'working' | 'completed' | 'blocked'; note?: string | null }): Promise<unknown>
+    listHandoffs(companyId: string, conversationId?: string): Promise<unknown[]>
+  }
+  email?: {
+    getAgentEmailIdentity(scope: { userId: string; companyId: string }): Promise<{ email: string; displayName: string } | null>
+    listAgentEmailContacts(scope: { userId: string; companyId: string }, query: string): Promise<unknown[]>
+    listAgentEmailInbox(scope: { userId: string; companyId: string }, input: { unreadOnly: boolean; limit: number }): Promise<unknown[]>
+    getAgentEmailThread(scope: { userId: string; companyId: string }, conversationId: string, limit: number): Promise<unknown>
+    sendAgentEmail(scope: { userId: string; companyId: string }, input: { to: string[]; cc: string[]; subject: string; body: string; attachments: NativeEmailAttachment[] }, identity: { idempotencyKey?: string; projectId?: string }): Promise<unknown>
+    replyToAgentEmail(scope: { userId: string; companyId: string }, messageId: string, input: { body: string; cc: string[]; attachments: NativeEmailAttachment[] }, identity: { idempotencyKey?: string; projectId?: string }): Promise<unknown>
+  }
   presentations?: {
     createPresentationForAgent(work: NativeWork, input: { idempotencyKey: string; requirements: string; title?: string | undefined; sourceIds?: string[] | undefined; targetSlideCount?: number | undefined; language?: string | undefined }): Promise<unknown>
     getPresentationForAgent(work: NativeWork, id: string): Promise<unknown>
     cancelPresentationForAgent(work: NativeWork, id: string, input: { idempotencyKey: string }): Promise<unknown>
     retryPresentationForAgent(work: NativeWork, id: string, input: { idempotencyKey: string }): Promise<unknown>
+    approvePresentationOutlineForAgent(work: NativeWork, id: string, input: { idempotencyKey?: string; expectedRevision: number }): Promise<unknown>
     revisePresentationOutlineForAgent(work: NativeWork, id: string, input: { idempotencyKey: string; expectedRevision: number; feedback?: string | undefined; targetSlideCount?: number | undefined }): Promise<unknown>
     revisePresentationForAgent(work: NativeWork, id: string, input: { idempotencyKey: string; instruction: string; scope: 'page' | 'section' | 'deck'; pageIds?: string[] | undefined; sectionIds?: string[] | undefined }): Promise<unknown>
     createPresentationRequestSchema: { parse(input: unknown): Parameters<NonNullable<LingxiLoopServices['presentations']>['createPresentationForAgent']>[1] }
+    approvePresentationOutlineRequestSchema: { parse(input: unknown): Parameters<NonNullable<LingxiLoopServices['presentations']>['approvePresentationOutlineForAgent']>[2] }
     revisePresentationOutlineRequestSchema: { parse(input: unknown): Parameters<NonNullable<LingxiLoopServices['presentations']>['revisePresentationOutlineForAgent']>[2] }
     revisePresentationRequestSchema: { parse(input: unknown): Parameters<NonNullable<LingxiLoopServices['presentations']>['revisePresentationForAgent']>[2] }
   }
@@ -320,8 +365,10 @@ export interface LingxiLoopServices {
       actorUserId: string
       companyId: string
       projectId?: string
-      action: 'calendar:write' | 'calendar:read' | 'document:write' | 'document:read' | 'document:delete' | 'agent_run:control' | 'agent_memory:read' | 'agent_memory:write' | 'canvas:write' | 'agent_approval:resolve' | 'learning:manage' | 'learning:read' | 'learning:submit' | 'agent:read' | 'conversation:read' | 'conversation:write' | 'knowledge:read' | 'knowledge:write' | 'knowledge:manage' | 'poll:read' | 'poll:create' | 'poll:vote' | 'poll:close'
-      resource: { type: 'calendar_event' | 'document' | 'canvas_frame' | 'canvas' | 'conversation' | 'knowledge_source' | 'poll' | 'approval' | 'project'; id: string }
+      action: 'calendar:write' | 'calendar:read' | 'document:write' | 'document:read' | 'document:delete' | 'agent_run:control' | 'agent_memory:read' | 'agent_memory:write' | 'canvas:write' | 'agent_approval:resolve' | 'learning:manage' | 'learning:read' | 'learning:submit' | 'agent:read' | 'conversation:read' | 'conversation:write' | 'conversation:manage' | 'email:read' | 'email:write' | 'knowledge:read' | 'knowledge:write' | 'knowledge:manage' | 'poll:read' | 'poll:create' | 'poll:vote' | 'poll:close'
+      resource: { type: 'company' | 'agent' | 'message' | 'routine' | 'calendar_event' | 'document' | 'canvas_frame' | 'canvas' | 'conversation' | 'knowledge_source' | 'poll' | 'approval' | 'project'; id: string }
     }): Promise<unknown>
   }
 }
+
+export interface NativeEmailAttachment { key: string; filename: string; mimeType: string; sizeBytes: number }

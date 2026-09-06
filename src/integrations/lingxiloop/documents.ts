@@ -2,7 +2,7 @@ import type { SqlQueryable } from '../../control-plane/pg-store.js'
 import type { HostAction, WorkItem } from '../../protocol/types.js'
 import type { LingxiLoopServices } from './service-contracts.js'
 
-export const DOCUMENT_METHODS = { list: [], read: ['documentId'] } as const
+export const DOCUMENT_METHODS = { list: [], recent: ['sinceMinutes'], read: ['documentId'] } as const
 
 export async function executeDocument(db: SqlQueryable, services: Pick<LingxiLoopServices, 'documents' | 'permissionService'>,
   work: Omit<WorkItem, 'leaseToken'>, action: HostAction) {
@@ -14,6 +14,8 @@ export async function executeDocument(db: SqlQueryable, services: Pick<LingxiLoo
   if (!work.principalId) throw new Error('document access requires the original human principal')
   const documentId = action.args['documentId']
   if (method === 'read' && (typeof documentId !== 'string' || !documentId.trim() || documentId.length > 2000)) throw new Error('documentId is required')
+  const sinceMinutes = action.args['sinceMinutes'] ?? 60
+  if (method === 'recent' && (!Number.isInteger(sinceMinutes) || Number(sinceMinutes) < 1 || Number(sinceMinutes) > 43_200)) throw new Error('sinceMinutes must be an integer from 1 to 43200')
   await services.permissionService.assertCan({ actorUserId: work.principalId, companyId: work.tenantId,
     action: 'conversation:read', resource: { type: 'conversation', id: work.sessionId } })
   const { rows } = await db.query('SELECT project_id FROM conversations WHERE company_id=$1 AND id=$2', [work.tenantId, work.sessionId])
@@ -24,8 +26,8 @@ export async function executeDocument(db: SqlQueryable, services: Pick<LingxiLoo
       ? { type: 'document' as const, id: documentId as string } : { type: 'project' as const, id: projectId } }
   await services.permissionService.assertCan(authorization)
   const scope = { companyId: work.tenantId, projectId, userId: work.principalId }
-  if (method === 'list') {
-    const documents = await api.listAgentDocuments(scope)
+  if (method === 'list' || method === 'recent') {
+    const documents = method === 'list' ? await api.listAgentDocuments(scope) : await api.listRecentAgentDocumentCreations(scope, Number(sinceMinutes))
     await services.permissionService.assertCan(authorization)
     return { documents: documents.slice(0, 100), truncated: documents.length > 100 }
   }

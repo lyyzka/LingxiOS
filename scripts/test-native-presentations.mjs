@@ -19,8 +19,9 @@ try {
   const schemas = await import(pathToFileURL(join(directory, 'contracts.mjs')).href)
   const calls = []
   const api = { ...schemas }
-  for (const name of ['create', 'get', 'cancel', 'retry', 'reviseOutline', 'revise']) {
-    const exported = name === 'reviseOutline' ? 'revisePresentationOutlineForAgent' : `${name}PresentationForAgent`
+  for (const name of ['create', 'get', 'cancel', 'retry', 'approveOutline', 'reviseOutline', 'revise']) {
+    const exported = name === 'approveOutline' ? 'approvePresentationOutlineForAgent'
+      : name === 'reviseOutline' ? 'revisePresentationOutlineForAgent' : `${name}PresentationForAgent`
     api[exported] = async (...args) => { calls.push({ name, args }); return { status: 'planning' } }
   }
   const services = { presentations: api, permissionService: { assertCan: async request => {
@@ -31,24 +32,25 @@ try {
   const call = (method, args) => executePresentation(work, { runId: 'work', cellId: 'cell', callIndex: 0, idempotencyKey: 'stable', action: `presentations.${method}`, args }, services)
   assert.deepEqual(await call('create', { requirements: 'Create a lecture', targetSlideCount: 24 }), { status: 'planning' })
   await call('get', { presentationId: 'deck' })
+  await call('approve_outline', { presentationId: 'deck', expectedRevision: 3 })
   await call('revise_outline', { presentationId: 'deck', expectedRevision: 3, feedback: 'Explain further' })
   await call('revise', { presentationId: 'deck', instruction: 'Expand', scope: 'page', pageIds: ['page'] })
   await call('cancel', { presentationId: 'deck' })
   await call('retry', { presentationId: 'deck' })
-  assert.deepEqual(calls.map(call => call.name), ['create', 'get', 'reviseOutline', 'revise', 'cancel', 'retry'])
+  assert.deepEqual(calls.map(call => call.name), ['create', 'get', 'approveOutline', 'reviseOutline', 'revise', 'cancel', 'retry'])
   for (const call of calls) {
     assert.equal(call.args[0].authorizationUserId, 'human')
     assert.equal(call.args[0].channelId, 'channel')
     if (call.name !== 'get') assert.equal(call.args.at(-1).idempotencyKey, 'stable')
   }
   assert.equal(calls[2].args[2].expectedRevision, 3)
+  assert.equal(calls[3].args[2].expectedRevision, 3)
   await assert.rejects(call('create', { requirements: 'Create', targetSlideCount: 2 }))
   await assert.rejects(call('revise_outline', { presentationId: 'deck', feedback: 'Missing revision' }))
   await assert.rejects(call('revise', { presentationId: 'deck', instruction: 'Edit', scope: 'page' }))
   await assert.rejects(call('create', { requirements: 'Create', authorizationUserId: 'forged' }), /unknown/)
-  await assert.rejects(call('approve_outline', { presentationId: 'deck', expectedRevision: 3 }), /approval-required/)
-  assert.equal(calls.length, 6)
-  console.log('Presentation bridge and native input schemas passed; domain execution and approval continuation remain unverified.')
+  assert.equal(calls.length, 7)
+  console.log('Presentation bridge and native input schemas passed; approval continuation is covered by package tests.')
 } finally {
   assert.equal(dirname(directory), resolve(tmpdir()))
   await rm(directory, { recursive: true, force: true })

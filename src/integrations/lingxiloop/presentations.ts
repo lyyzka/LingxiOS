@@ -5,6 +5,7 @@ import { nativeWork } from './actions.js'
 export const PRESENTATION_METHODS = {
   create: ['requirements', 'title', 'sourceIds', 'targetSlideCount', 'language'], get: ['presentationId'],
   cancel: ['presentationId'], retry: ['presentationId'],
+  approve_outline: ['presentationId', 'expectedRevision'],
   revise_outline: ['presentationId', 'expectedRevision', 'feedback', 'targetSlideCount'],
   revise: ['presentationId', 'instruction', 'scope', 'pageIds', 'sectionIds'],
 } as const
@@ -27,6 +28,7 @@ export async function executePresentation(work: Omit<WorkItem, 'leaseToken'>, ac
     case 'get': return api.getPresentationForAgent(native, presentationId)
     case 'cancel': return api.cancelPresentationForAgent(native, presentationId, input)
     case 'retry': return api.retryPresentationForAgent(native, presentationId, input)
+    case 'approve_outline': return api.approvePresentationOutlineForAgent(native, presentationId, api.approvePresentationOutlineRequestSchema.parse(input))
     case 'revise_outline': return api.revisePresentationOutlineForAgent(native, presentationId, api.revisePresentationOutlineRequestSchema.parse(input))
     case 'revise': return api.revisePresentationForAgent(native, presentationId, api.revisePresentationRequestSchema.parse(input))
     default: throw new Error('unsupported presentation action')

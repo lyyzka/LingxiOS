@@ -46,15 +46,20 @@ import type * as membership from ${JSON.stringify(`${source}/modules/learning/me
 import type * as rooms from ${JSON.stringify(`${source}/modules/learning/rooms-repository.js`)}
 import type * as effects from ${JSON.stringify(`${source}/modules/learning/effects-repository.js`)}
 import type * as presentations from ${JSON.stringify(`${source}/modules/presentations/public.js`)}
+import type * as email from ${JSON.stringify(`${source}/modules/email/index.js`)}
+import type * as directory from ${JSON.stringify(`${source}/modules/agents/index.js`)}
+import type * as conversations from ${JSON.stringify(`${source}/modules/conversations/public.js`)}
 import type * as knowledge from ${JSON.stringify(`${source}/modules/knowledge/public.js`)}
 import type { pollApplication } from ${JSON.stringify(`${source}/modules/polls/index.js`)}
 import type * as access from ${JSON.stringify(`${source}/modules/access/public.js`)}
 import type { permissionService } from ${JSON.stringify(`${source}/modules/access/public.js`)}
 import type { advanceAgentReadReceipt } from ${JSON.stringify(`${source}/im/read-receipts.js`)}
 import type { wukongClient } from ${JSON.stringify(`${source}/im/wukong.js`)}
+import type * as messaging from ${JSON.stringify(`${source}/im/public.js`)}
+import type * as handoffs from ${JSON.stringify(`${source}/agents/coworker.js`)}
 import type { storage } from ${JSON.stringify(`${source}/storage.js`)}
 import type { LingxiLoopServices } from ${JSON.stringify(contracts)}
-declare const native: { calendar: typeof calendar & typeof calendarSchemas; teacher: typeof evaluation & typeof metrics & typeof projects & typeof projection & typeof curriculum & typeof teacherManagement & typeof teacherApproval & typeof teacherReporting & typeof identity & typeof teacherRepository & typeof learning & typeof membership & typeof rooms & typeof effects; canvas: typeof canvas; storage: typeof storage; learning: typeof learning & typeof missionRepository & typeof metrics & typeof missionsApplication & typeof learningEvidence & typeof evaluation & typeof learningSchemas & typeof access; advanceAgentReadReceipt: typeof advanceAgentReadReceipt; presentations: typeof presentations; pollApplication: typeof pollApplication; knowledge: typeof knowledge; permissionService: typeof permissionService; wukongClient: typeof wukongClient }
+declare const native: { calendar: typeof calendar & typeof calendarSchemas; teacher: typeof evaluation & typeof metrics & typeof projects & typeof projection & typeof curriculum & typeof teacherManagement & typeof teacherApproval & typeof teacherReporting & typeof identity & typeof teacherRepository & typeof learning & typeof membership & typeof rooms & typeof effects; canvas: typeof canvas; storage: typeof storage; learning: typeof learning & typeof missionRepository & typeof metrics & typeof missionsApplication & typeof learningEvidence & typeof evaluation & typeof learningSchemas & typeof access; advanceAgentReadReceipt: typeof advanceAgentReadReceipt; messaging: typeof messaging; handoffs: typeof handoffs; directory: typeof directory; conversations: typeof conversations; email: typeof email; presentations: typeof presentations; pollApplication: typeof pollApplication; knowledge: typeof knowledge; permissionService: typeof permissionService; wukongClient: typeof wukongClient }
 const binding: LingxiLoopServices = native
 declare const nativeCanvasOrchestration: typeof canvasOrchestration & typeof canvasAssignments & typeof canvasAssignmentRepository & typeof canvasEvidence & typeof access & typeof documentBus
 const packagedCanvasOrchestration: NonNullable<NonNullable<LingxiLoopServices['canvas']>['orchestration']> = nativeCanvasOrchestration
@@ -68,6 +73,7 @@ declare const nativeDocumentContent: typeof documentApplication & typeof documen
 const packagedDocumentContent: NonNullable<NonNullable<NonNullable<LingxiLoopServices['documents']>['writes']>['content']> = nativeDocumentContent
 const documentBoundary: {
   listAgentDocuments(scope: { companyId: string; projectId: string }): Promise<unknown[]>
+  listRecentAgentDocumentCreations(scope: { companyId: string; projectId: string; userId: string }, sinceMinutes: number): Promise<unknown[]>
   getAgentDocument(scope: { companyId: string; projectId: string }, documentId: string): Promise<unknown>
   readAgentDocument(scope: { companyId: string; projectId: string; userId: string }, documentId: string): Promise<{ id: string; body: string }>
   createAgentDocument(scope: { companyId: string; projectId: string; userId: string }, input: { id?: string; title: string; body: string }): Promise<{ document: { id: string }; replayed: boolean }>
@@ -98,7 +104,7 @@ const documentBoundary: {
   assert.ok(!(calendarConstructor.flags & ts.TypeFlags.Any) && calendarConstructor.getConstructSignatures().length)
   assert.ok(nativeDocuments && !(nativeDocuments.flags & ts.TypeFlags.Any))
   assert.ok(nativeDocumentWrites && !(nativeDocumentWrites.flags & ts.TypeFlags.Any))
-  for (const name of ['listAgentDocuments', 'getAgentDocument', 'readAgentDocument', 'createAgentDocument', 'renameAgentDocument', 'deleteAgentDocument']) {
+  for (const name of ['listAgentDocuments', 'listRecentAgentDocumentCreations', 'getAgentDocument', 'readAgentDocument', 'createAgentDocument', 'renameAgentDocument', 'deleteAgentDocument']) {
     const symbol = nativeDocuments.getProperty(name)
     assert.ok(symbol, `missing actual document export ${name}`)
     const type = checker.getTypeOfSymbolAtLocation(symbol, file)
@@ -110,7 +116,12 @@ const documentBoundary: {
     knowledge: ['listKnowledgeSourcesForAgent', 'addKnowledgeText', 'addKnowledgeUrl', 'addKnowledgeFile', 'retryKnowledgeSourceForAgent', 'setKnowledgeSourceEnabled', 'deleteKnowledgeSourceForAgent'],
     teacher: ['setLearningObjectiveStatus', 'publishLearningActivity', 'closeLearningActivity', 'reviewLearningEvaluation', 'inc', 'projectLifecycleProjection', 'ProjectLifecycleApplication', 'createLearningObjectives', 'createLearningActivity', 'updateTeacherCourseMetadata', 'setLearningCourseMembership', 'bindLearningCourseRoom', 'loadTeacherOverviewRows', 'listTeacherLearnerRows', 'findTeacherLearner', 'loadTeacherLearnerDetailRows', 'findTeacherAttemptDetail', 'listTeacherObjectives', 'listTeacherActivities', 'listTeacherReviews', 'listTeacherBindableRooms', 'auditInTransaction', 'findTeacherScopeBinding', 'findTeacherTurnCounts', 'findTeacherObjectiveApprovalTarget', 'findTeacherActivityApprovalTarget', 'findTeacherCourseApprovalTarget', 'findTeacherMembershipApprovalTarget', 'findTeacherEvaluationApprovalTarget', 'assertTeacherApprovalFresh', 'requireLearningCourseRole', 'setLearningCourseMembershipRecord', 'enqueueLearningEffect'],
     learning: ['createPermissionService', 'proposeLearningEvaluation', 'recordLearningAttempt', 'findLearningDocumentEvidence', 'findLearningCanvasEvidence', 'createKnowledgeUnits', 'draftActivity', 'findLearningRoomState', 'findEligibleLearningMissionCoordinator', 'upsertLearningMission', 'findLearningMission', 'inc', 'loadLearningTurnContext', 'getMission', 'getActivity'],
-    presentations: ['createPresentationForAgent', 'getPresentationForAgent', 'revisePresentationOutlineForAgent', 'revisePresentationForAgent', 'cancelPresentationForAgent', 'retryPresentationForAgent'],
+    presentations: ['createPresentationForAgent', 'getPresentationForAgent', 'approvePresentationOutlineForAgent', 'revisePresentationOutlineForAgent', 'revisePresentationForAgent', 'cancelPresentationForAgent', 'retryPresentationForAgent'],
+    email: ['getAgentEmailIdentity', 'listAgentEmailContacts', 'listAgentEmailInbox', 'getAgentEmailThread', 'sendAgentEmail', 'replyToAgentEmail'],
+    directory: ['getAgentCliIdentity', 'listAgentCliParticipants', 'listAgentCliStatuses'],
+    conversations: ['getAgentConversationMetadata', 'addAgentConversationMember', 'setAgentConversationTopic', 'setAgentConversationTitle', 'listAgentConversationMutes', 'setAgentConversationMuted'],
+    messaging: ['missingAgentChannelMessageIds', 'getAgentChannelHistory', 'sendAgentChannelMessage', 'getAgentInbox', 'clearAgentChannelUnread', 'searchAgentMessages', 'toggleAgentChannelReaction'],
+    handoffs: ['createHandoff', 'updateHandoff', 'listHandoffs'],
     pollApplication: ['conversationId', 'create', 'vote', 'close', 'show'],
     permissionService: ['assertCan'],
     storage: ['readObjectBounded'],
@@ -130,7 +141,7 @@ const documentBoundary: {
     }
   }
   const calendarType = checker.getTypeOfSymbolAtLocation(native.getProperty('calendar'), file)
-  for (const [object, methods] of [['calendarApplication', ['list', 'get']], ['listCalendarEventsQuerySchema', ['parse']]]) {
+  for (const [object, methods] of [['calendarApplication', ['list', 'get', 'dispatches']], ['listCalendarEventsQuerySchema', ['parse']]]) {
     const objectType = checker.getTypeOfSymbolAtLocation(calendarType.getProperty(object), file)
     assert.ok(!(objectType.flags & ts.TypeFlags.Any))
     for (const method of methods) {

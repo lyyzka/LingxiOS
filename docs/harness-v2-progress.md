@@ -1,6 +1,12 @@
 # 首发 Harness / AgentOS 开发状态
 
-以 2026-09-06 用户最新要求为准：停止补齐 LingxiLoop 能力，以 AgentOS / Harness 核心完成为本次发布范围。尚未完成的邮件扩展已撤下；已实现的业务绑定保留，但不宣称完整替换 LingxiLoop。当前不存在生产数据，交付单一首发架构。仅提供初始 schema version 1；不提供历史数据导入、schema 升级、旧协议兼容或双写路径。消费项目后续直接适配公开入口和领域服务契约。
+以 2026-09-06 用户最新要求为准：继续对照当前 LingxiLoop 补齐全部产品能力。当前不存在生产数据，交付单一首发架构；仅提供初始 schema version 1，不提供历史数据导入、schema 升级、旧协议兼容或双写路径。
+
+邮件原生能力已重新接入：`whoami/contacts/inbox/show` 使用 Agent 邮箱身份并先校验持久化人类的当前会话读取权限；`send/reply` 绑定收件人、主题、正文及当前会话已提交附件到版本化人工审批，批准时重新授权和复核预览，以动作键调用原生幂等投递，执行回执落库后才恢复任务。演示文稿 `approve_outline` 已接通原生 schema，并把标题、完整 outline 与 expected revision 绑定到版本化人工审批；批准时重新读取并拒绝陈旧 outline，原生幂等执行回执落库后才恢复任务。邮件真实 PostgreSQL/provider 执行检查仍待补齐。
+
+日历 Agent Task 原生唤醒入口已补齐：仅接受已提交的 `calendar` 系统消息，核对产品调度 nonce、原生派发记录、事件指派和目标会话，并从仍活跃的事件创建者恢复人类授权后入队；伪造系统消息不能直接获得 Agent 权限。文档 mention 已由产品写成 mentioner 身份的已提交消息，可复用普通入口。外部邮件发件人不能充当产品内人类授权主体，因此未伪造自动邮件执行权限。
+
+通用 Agent handoff 已接入当前 `agents/coworker.ts` 领域记录和结构化消息，创建前校验原人类会话权限与已提交上下文消息。创建时唤醒目标 Agent，完成或阻塞时唤醒来源 Agent；`receiveHandoff` 均通过原生 handoff 的幂等键回查 namespaced action intent/work，恢复原人类主体后写入唯一 LingxiOS 队列。list/update 继续使用原生领域状态；领域记录本身不被当作任务完成证据。
 
 已实现的主干包括：单包入口、PostgreSQL 存储、租约与 fencing、不可变请求快照及修订、动作意图与回执、交付 outbox、Python 执行、响应 envelope、部分 LingxiLoop 业务能力和知识审批。
 

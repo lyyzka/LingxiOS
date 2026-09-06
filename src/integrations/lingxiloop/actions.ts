@@ -9,10 +9,14 @@ export const KNOWLEDGE_METHODS = {
 
 export function nativeWork(work: Omit<WorkItem, 'leaseToken'>): NativeWork {
   if (!work.principalId) throw new Error('persisted human authorization principal is required')
+  const executionRole = work.kind === 'canvas_summary' ? 'reporter'
+    : work.kind === 'canvas_worker' && (work.meta?.['executionRole'] === 'specialist' || work.meta?.['executionRole'] === 'verifier')
+      ? work.meta['executionRole'] : 'coordinator'
   return { id: work.id, fence: work.fence, homeEpoch: work.homeEpoch,
     companyId: work.tenantId, authorizationUserId: work.principalId, agentId: work.agentId, channelId: work.sessionId,
     ...(work.threadId !== undefined ? { threadRootClientMsgNo: work.threadId } : {}), triggerClientMsgNo: work.triggerRef,
-    reason: work.kind === 'resume' ? 'resume' : work.kind === 'routine' ? 'routine' : work.kind === 'mission_coordinator' ? 'handoff' : 'message', executionRole: 'coordinator',
+    reason: work.kind === 'resume' ? 'resume' : work.kind === 'routine' ? 'routine' : work.kind === 'mission_coordinator' ? 'handoff'
+      : work.kind === 'canvas_worker' ? 'canvas_worker' : work.kind === 'canvas_summary' ? 'canvas_summary' : 'message', executionRole,
     lane: work.lane === 'interactive' ? 'learner' : work.lane, leaseToken: '',
   }
 }

@@ -73,6 +73,9 @@ import { wukongClient } from './im/wukong.js'
 
 const app = await createLingxiLoop({ database: pool, model, services: { knowledge, permissionService, wukongClient } })
 await app.receive({ companyId, agentId, channelId, clientMsgNo })
+
+// Native calendar scheduler messages use the separately validated system ingress.
+await app.receiveCalendarDispatch({ companyId, agentId, channelId, clientMsgNo })
 await app.start()
 ```
 
@@ -129,9 +132,9 @@ Bind the existing `pollApplication` export from `modules/polls/index.js` as `ser
 
 `npm run test:native-polls -- path/to/LingxiLoop/server/src` runs the actual reference poll domain and SQL using its existing dependencies and an isolated PGlite database. The checkout is read-only. IM publication and permission resolution use test resources; production behavior is not inferred from this check.
 
-Bind `import * as presentations from "./modules/presentations/public.js"` as `services.presentations` to enable presentation methods for knowledge-enabled agents. Native request schemas remain authoritative. Outline approval is withheld pending approval continuation. `npm run test:native-presentations` exercises native schemas and bridge arguments, not generation.
+Bind `import * as presentations from "./modules/presentations/public.js"` as `services.presentations` to enable presentation methods for knowledge-enabled agents. Native request schemas remain authoritative. Outline approval uses the package approval continuation and rechecks the complete reviewed outline before execution. `npm run test:native-presentations` exercises native schemas and bridge arguments, not generation.
 
-Supply the native `advanceAgentReadReceipt` export from `im/read-receipts.js` in services to enable chat history/send. History advances the native read sequence after scope validation. The current preview restricts chat actions to the current conversation; optional questionnaire questions use `host.chat.ask`; handoff remains pending.
+Supply `advanceAgentReadReceipt` plus the current `im/public.ts` exports to enable native chat history/send, inbox/current-room acknowledgement, search and reactions. Conversation controls add metadata, membership, topic, title and mute methods. Generic handoffs use `agents/coworker.ts`: `receiveHandoff` verifies both the created target wake and terminal completed/blocked source wake against the native record and source package action before restoring the original human principal. Clear-all unread and leaving the active execution room are intentionally not exposed.
 
 Worker session reads use `POST /v2/work/:id/session` with the work lease and session key in the body. The bundled worker and control plane share this protocol. Local assembly uses the same lease validation.
 

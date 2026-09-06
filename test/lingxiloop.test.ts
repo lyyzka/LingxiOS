@@ -45,8 +45,8 @@ it('binds native-shaped resources through the packaged ingress/action/delivery p
     CREATE TABLE knowledge_fixture(title text,body text,principal text,request_ref text);
     CREATE TABLE conversations(id text,company_id text,project_id text);
     INSERT INTO conversations VALUES('s','t','project');
-    CREATE TABLE calendar_events(id text,company_id text,project_id text,payload jsonb);
-    INSERT INTO calendar_events VALUES('event','t','project');
+    CREATE TABLE calendar_events(id text,company_id text,project_id text,created_by text,payload jsonb);
+    INSERT INTO calendar_events VALUES('event','t','project','u',NULL),('scheduled-event','t','project','u',NULL);
     CREATE TABLE documents(id text,company_id text,project_id text,title text,conversation_id text);
     INSERT INTO documents VALUES('doc','t','project','Document','s');
     INSERT INTO participants VALUES('t','a','agent','Assistant','assistant','', '["knowledge","canvas","learning","documents","calendar"]'::jsonb,NULL),('t','u','human','User','human','', '[]'::jsonb,NULL);
@@ -116,18 +116,25 @@ it('binds native-shaped resources through the packaged ingress/action/delivery p
         CH_CALENDAR_EVENTS: 'calendar', publish: async (channel, event) => { assert.equal(channel, 'calendar'); assert.equal(event.actorId, 'a') },
       },
       calendarApplication: {
+        dispatches: async (_scope, id) => id === 'scheduled-event' ? [{ eventId: id, scheduledFor: '2026-09-06T10:00:00.000Z',
+          status: 'dispatched', conversationId: 's', messageId: 'calendar-message' }] : [],
         list: async scope => { assert.deepEqual(scope, { companyId: 't', projectId: 'project', userId: 'u' }); return [{ id: 'event', title: calendarTitle, startAt: '2026-09-06T10:00:00Z' }] },
         get: async (scope, id) => {
           assert.equal(scope.userId, 'u')
-          if (id === 'event') return { id, title: calendarTitle, startAt: '2026-09-06T10:00:00Z' }
+          if (id === 'scheduled-event') return { id, createdBy: 'u', kind: 'agent_task' as const, title: 'Scheduled task', description: null,
+            assigneeId: 'a', targetConversationId: 's', agentPrompt: 'Prepare the scheduled report.', startAt: '2026-09-06T10:00:00Z' }
+          if (id === 'event') return { id, createdBy: 'u', kind: 'personal' as const, title: calendarTitle, description: null,
+            assigneeId: null, targetConversationId: null, agentPrompt: null, startAt: '2026-09-06T10:00:00Z' }
           const result = await database.query('SELECT payload FROM calendar_events WHERE id=$1', [id])
           assert.equal(result.rows.length, 1)
-          return result.rows[0]!['payload'] as { id: string; title: string; startAt: string }
+          return result.rows[0]!['payload'] as { id: string; createdBy: string; kind: 'personal' | 'agent_task'; title: string;
+            description: string | null; assigneeId: string | null; targetConversationId: string | null; agentPrompt: string | null; startAt: string }
         },
       },
       listCalendarEventsQuerySchema: { parse: value => { const range = value as { from: string; to: string }; return { from: new Date(range.from), to: new Date(range.to) } } },
     },
     documents: {
+      listRecentAgentDocumentCreations: async () => [],
       writes: {
         createPermissionService: () => services.permissionService,
         renameDocumentRequestSchema: { parse: value => value as { title: string } },
@@ -242,7 +249,9 @@ it('binds native-shaped resources through the packaged ingress/action/delivery p
       return {}
     } },
     wukongClient: () => ({
-      syncMessages: async () => [{ clientMsgNo: approvalMethod || 'm', messageSeq: 1, channelId: 's', channelType: 2, fromUid: 'u', payload: { version: 1, kind: 'text', body: approvalMethod?.startsWith('calendar-') ? 'Please ' + approvalMethod.slice(9) + ' the calendar event.' : teacherApproval === 'membership' ? 'Add new-teacher as a teacher.' : teacherApproval ? 'Publish the fractions objective.' : teacherActivity ? 'Draft fraction practice linked to the objective.' : teacherDraft ? 'Draft a fractions objective with a comparison success criterion.' : teacherWrite ? 'Rename this course to Updated course.' : approvalMethod ? 'Apply the requested knowledge source change.' : 'Save this source.', replyToClientMsgNo: 'thread-root' } },
+      syncMessages: async () => [{ clientMsgNo: 'calendar-dispatch:73fba3a26d0cb420bc4788aa83e43a27a3acb0eb3f77e8bb68dcac663781b379', messageSeq: 3,
+        channelId: 's', channelType: 2, fromUid: 'calendar', payload: { version: 1, kind: 'system', data: { calendarEventId: 'scheduled-event', scheduledFor: '2026-09-06T10:00:00.000Z' } } },
+        { clientMsgNo: approvalMethod || 'm', messageSeq: 1, channelId: 's', channelType: 2, fromUid: 'u', payload: { version: 1, kind: 'text', body: approvalMethod?.startsWith('calendar-') ? 'Please ' + approvalMethod.slice(9) + ' the calendar event.' : teacherApproval === 'membership' ? 'Add new-teacher as a teacher.' : teacherApproval ? 'Publish the fractions objective.' : teacherActivity ? 'Draft fraction practice linked to the objective.' : teacherDraft ? 'Draft a fractions objective with a comparison success criterion.' : teacherWrite ? 'Rename this course to Updated course.' : approvalMethod ? 'Apply the requested knowledge source change.' : 'Save this source.', replyToClientMsgNo: 'thread-root' } },
         { clientMsgNo: 'attachment', messageSeq: 2, channelId: 's', channelType: 2, fromUid: 'u', payload: { version: 1, kind: 'attachment', data: { key: 'attachments/t/file', name: 'notes.txt', mime: 'text/plain', size: Buffer.byteLength(attachmentText) } } }],
       sendMessage: async (channel, type, author, payload) => {
         if (sendFailures > 0) { sendFailures--; throw new Error('temporary transport failure') }
@@ -360,6 +369,11 @@ it('binds native-shaped resources through the packaged ingress/action/delivery p
   }
   try {
     assert.equal('enqueue' in app, false)
+    const calendarClientMsgNo = 'calendar-dispatch:73fba3a26d0cb420bc4788aa83e43a27a3acb0eb3f77e8bb68dcac663781b379'
+    const calendarRequest = await app.receiveCalendarDispatch({ companyId: 't', agentId: 'a', channelId: 's', clientMsgNo: calendarClientMsgNo })
+    assert.equal((await app.receiveCalendarDispatch({ companyId: 't', agentId: 'a', channelId: 's', clientMsgNo: calendarClientMsgNo })).deduplicated, true)
+    assert.equal(await app.cancel({ runId: calendarRequest.id, tenantId: 't', agentId: 'a', sessionId: 's', principalId: 'u', threadId: calendarClientMsgNo }), true)
+    await assert.rejects(app.receiveCalendarDispatch({ companyId: 't', agentId: 'a', channelId: 's', clientMsgNo: 'forged' }), /committed calendar dispatch/)
     const input = { companyId: 't', agentId: 'a', channelId: 's', clientMsgNo: 'm', principalId: 'forged', attachmentClientMsgNos: ['attachment'] }
     const request = await app.receive(input)
     assert.equal((await app.receive(input)).deduplicated, true)
@@ -479,7 +493,7 @@ it('binds native-shaped resources through the packaged ingress/action/delivery p
     const chatServices = { ...services, advanceAgentReadReceipt: async (input: unknown) => { advances.push(input) } }
     const history = await executeChat(work, { ...action, action: 'chat.history', args: { limit: 5 } }, chatServices, 2)
     assert.ok(Array.isArray(history))
-    assert.deepEqual(advances, [{ companyId: 't', channelId: 's', agentId: 'a', readThroughSeq: 2 }])
+    assert.deepEqual(advances, [{ companyId: 't', channelId: 's', agentId: 'a', readThroughSeq: 3 }])
     await executeChat({ ...work, threadId: 'thread-root' }, { ...action, action: 'chat.send', args: { body: 'Progress' } }, chatServices, 2)
     assert.equal(delivered.at(-1)?.clientMsgNo, `action-${action.idempotencyKey}`)
     assert.equal(delivered.at(-1)?.replyToClientMsgNo, 'thread-root')

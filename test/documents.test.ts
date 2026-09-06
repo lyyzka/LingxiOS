@@ -27,6 +27,10 @@ it('scopes document reads to the conversation and human, bounds output and rejec
         assert.equal(scope.projectId, 'project')
         return Array.from({ length: 101 }, (_, index) => ({ ...metadata, id: String(index) }))
       },
+      listRecentAgentDocumentCreations: async (scope, sinceMinutes) => {
+        assert.deepEqual([scope, sinceMinutes], [{ companyId: 't', projectId: 'project', userId: 'human' }, 30])
+        return [{ id: 'recent', title: 'Recent', createdBy: 'other', createdAt: 'now' }]
+      },
       readAgentDocument: async (scope, id) => {
         reads++
         assert.deepEqual([scope, id], [{ companyId: 't', projectId: 'project', userId: 'human' }, 'doc'])
@@ -41,6 +45,8 @@ it('scopes document reads to the conversation and human, bounds output and rejec
   assert.ok('documents' in listed)
   assert.equal(listed.documents.length, 100)
   assert.equal(listed.truncated, true)
+  assert.deepEqual(await executeDocument(db, services, work, { ...action, action: 'documents.recent', args: { sinceMinutes: 30 } }),
+    { documents: [{ id: 'recent', title: 'Recent', createdBy: 'other', createdAt: 'now' }], truncated: false })
   await assert.rejects(executeDocument(db, services, work, { ...action, args: { ...action.args, projectId: 'foreign' } }), /unknown document argument/)
   const { principalId: _principal, ...anonymous } = work
   await assert.rejects(executeDocument(db, services, anonymous, action), /original human/)
