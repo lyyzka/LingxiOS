@@ -38,6 +38,10 @@
     "./lingxiloop": {
       "types": "./dist/src/integrations/lingxiloop/index.d.ts",
       "import": "./dist/src/integrations/lingxiloop/index.js"
+    },
+    "./lecture-deck": {
+      "types": "./dist/src/lecture-deck/index.d.ts",
+      "import": "./dist/src/lecture-deck/index.js"
     }
   },
   "bin": {

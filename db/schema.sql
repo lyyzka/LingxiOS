@@ -48,6 +48,34 @@ CREATE INDEX IF NOT EXISTS agent_work_items_claim_idx
   ON lingxios.agent_work_items (status, available_at)
   WHERE status IN ('queued','leased');
 
+-- Native professional HTML lecture decks. The record is versioned as one
+-- immutable JSON document; checkpoints make long generation resumable.
+CREATE TABLE IF NOT EXISTS lingxios.lecture_decks (
+  id           TEXT PRIMARY KEY,
+  tenant_id    TEXT NOT NULL,
+  principal_id TEXT NOT NULL,
+  revision     INT NOT NULL CHECK (revision > 0),
+  status       TEXT NOT NULL CHECK (status IN ('planning','generating','validating','ready','failed','cancelled')),
+  record       JSONB NOT NULL CHECK (jsonb_typeof(record) = 'object'),
+  created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE (tenant_id, id)
+);
+CREATE INDEX IF NOT EXISTS lecture_decks_owner_idx ON lingxios.lecture_decks(tenant_id,principal_id,updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS lingxios.lecture_checkpoints (
+  deck_id      TEXT NOT NULL REFERENCES lingxios.lecture_decks(id) ON DELETE CASCADE,
+  revision     INT NOT NULL CHECK (revision > 0),
+  stage        TEXT NOT NULL CHECK (stage IN ('plan-course','plan-chapter','author-slide','validate-slide','repair-slide','validate-deck','publish-deck')),
+  stage_key    TEXT NOT NULL,
+  input_hash   TEXT NOT NULL,
+  output_hash  TEXT NOT NULL,
+  attempts     INT NOT NULL DEFAULT 1 CHECK (attempts > 0),
+  result       JSONB NOT NULL,
+  completed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (deck_id,revision,stage,stage_key)
+);
+
 -- A retried claim returns the original answer, including null, instead of
 -- leasing another work item after the first response was lost.
 CREATE TABLE IF NOT EXISTS lingxios.agent_claim_requests (

@@ -22,11 +22,14 @@ import { RUN_SEQUENCE_SPAN } from '../protocol/constants.js'
 import type { GoalOutcome } from '../protocol/outcome.js'
 import type { ControlPlaneDeps } from '../control-plane/service.js'
 import type { ActionResolution } from '../control-plane/stores.js'
+import { lectureDeckProcessor, type LectureDeckService } from '../lecture-deck/service.js'
 
 export interface LingxiOSOptions {
   database: SqlPool
   model?: { id?: string; apiKey: string; baseUrl?: string; reasoningEffort?: 'high' | 'max'; maxOutputTokens?: number; contextWindowTokens?: number }
   persona?: PromptContext['persona']
+  /** Optional native professional HTML lecture-deck processor. */
+  lectureDeck?: LectureDeckService
   kernel?: Pick<KernelManagerOptions, 'pythonCommand' | 'homesRoot' | 'startupTimeoutMs' | 'executionTimeoutMs' | 'hostActionTimeoutMs' | 'maxOutputChars' | 'allowNetwork'>
   /** Required in production for untrusted model-authored code. */
   kernelFactory?: (bridge: KernelHostBridge) => ManagedKernelExecutor
@@ -219,6 +222,7 @@ export async function assembleApp(options: LingxiOSOptions, integration?: Pick<C
     runtime.registerProcessor('teacher_digest', 'conversation')
     runtime.registerProcessor('routine', 'conversation')
     runtime.registerProcessor('mission_coordinator', 'conversation')
+    if (options.lectureDeck) runtime.registerProcessor('lecture_deck', lectureDeckProcessor(options.lectureDeck))
     const worker = new AgentWorker({ host, runtime, kernels, workerId, maxConcurrentRuns: concurrency,
       shutdownGraceMs: options.worker?.shutdownGraceMs ?? 20_000,
       ...(options.worker?.pollIdleMs === undefined ? {} : { pollIdleMs: options.worker.pollIdleMs }),
