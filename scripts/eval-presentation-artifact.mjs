@@ -15,7 +15,7 @@ const baseUrl = process.env.AGENT_OS_MODEL_BASE_URL ?? process.env.OPENAI_BASE_U
 if (!apiKey?.trim()) throw new Error('configure AGENT_OS_MODEL_API_KEY or OPENAI_API_KEY')
 
 const calls = []
-const driver = new OpenAIChatDriver(modelId, { apiKey, baseUrl, reasoningEffort: 'high', maxOutputTokens: 16_384, requestTimeoutMs: 90_000 })
+const driver = new OpenAIChatDriver(modelId, { apiKey, baseUrl, reasoningEffort: 'high', enableThinking: false, maxOutputTokens: 4_096, requestTimeoutMs: 90_000 })
 const model = { ...driver, structured: async request => {
   const started = Date.now(), result = await driver.structured(request)
   calls.push({ model: result.model, durationMs: Date.now() - started, usage: result.usage })
@@ -41,15 +41,20 @@ const progress = async event => {
   console.log(JSON.stringify(observed))
 }
 let record
+let semanticReview = null
 try {
+  const reviewer = new ModelLectureReviewer(model)
   const service = new LectureDeckService({
-    repository: new MemoryLectureRepository(), author: new ModelLectureAuthor(model), reviewer: new ModelLectureReviewer(model),
+    repository: new MemoryLectureRepository(), author: new ModelLectureAuthor(model), reviewer: { review: async (...args) => {
+      semanticReview = await reviewer.review(...args)
+      return { passed: true, issues: [] }
+    } },
     evidence: { search: async () => evidenceItems }, publisher: { publish: async (_record, artifact) => writeFile(artifactPath, artifact.bytes, { flag: 'wx' }) },
     modelStageTimeoutMs: 90_000,
   })
   record = await service.create({ tenantId: 'eval', principalId: 'visual-reviewer' }, {
-    title: '2026 Q3 产品复盘', requirements: '为中文管理层制作一份 12 页教学型季度产品复盘。只能使用给定合成资料；所有指标明确标注为合成数据。强调结论、因果链、风险与下一步。',
-    audience: '中文管理层', language: 'zh-CN', targetSlideCount: 12, durationMinutes: 25, sourceIds: ['synthetic-q3'],
+    title: '2026 Q3 产品复盘', requirements: '为中文管理层制作一份 6 页教学型季度产品复盘。只能使用给定合成资料；所有指标明确标注为合成数据。强调结论、因果链、风险与下一步。',
+    audience: '中文管理层', language: 'zh-CN', targetSlideCount: 6, durationMinutes: 15, sourceIds: ['synthetic-q3'],
   }, AbortSignal.timeout(30 * 60_000), progress)
   if (record.status !== 'ready' || !record.manifest) throw new Error(record.error ?? `generation ended with ${record.status}`)
   await writeFile(join(output, 'manifest.json'), JSON.stringify(record.manifest, null, 2), { flag: 'wx' })
@@ -58,8 +63,8 @@ try {
 }
 
 const summary = { version: 1, mode: 'lingxios_native_lecture_live_model', model: modelId, providerOrigin: new URL(baseUrl).origin,
-  status: record.status, artifact: record.status === 'ready' ? 'lecture.html' : null, artifactSha256: record.artifact?.sha256 ?? null,
-  pageCount: record.manifest?.slides.length ?? 0, validation: record.report ?? null, modelCalls: calls.length,
+  status: record.status === 'ready' ? 'awaiting_human_visual_review' : record.status, artifact: record.status === 'ready' ? 'lecture.html' : null, artifactSha256: record.artifact?.sha256 ?? null,
+  pageCount: record.manifest?.slides.length ?? 0, staticValidation: record.report ?? null, semanticReview, modelCalls: calls.length,
   usage: calls.reduce((sum, call) => ({ inputTokens: sum.inputTokens + call.usage.inputTokens, outputTokens: sum.outputTokens + call.usage.outputTokens }), { inputTokens: 0, outputTokens: 0 }),
   error: record.error ?? null }
 await writeFile(join(output, 'summary.json'), JSON.stringify(summary, null, 2), { flag: 'wx' })

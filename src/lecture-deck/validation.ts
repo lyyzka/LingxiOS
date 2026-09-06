@@ -2,7 +2,8 @@ import type { DeckManifest, SlideSpec, ValidationIssue, ValidationReport } from 
 import { LECTURE_SCHEMA_VERSION, contentHash } from './contracts.js'
 
 const validPageId = /^pg_[a-zA-Z0-9_-]{1,80}$/
-const tags = new Set(['div', 'p', 'span', 'strong', 'em', 'small', 'ul', 'ol', 'li', 'h2', 'h3', 'code', 'pre', 'table', 'thead', 'tbody', 'tr', 'th', 'td', 'svg', 'g', 'defs', 'marker', 'path', 'line', 'polyline', 'polygon', 'rect', 'circle', 'ellipse', 'text', 'tspan', 'image', 'use', 'title', 'desc'])
+const tags = new Set(['div', 'section', 'article', 'header', 'footer', 'p', 'span', 'strong', 'b', 'em', 'small', 'br', 'ul', 'ol', 'li', 'h1', 'h2', 'h3', 'h4', 'code', 'pre', 'table', 'thead', 'tbody', 'tr', 'th', 'td', 'svg', 'g', 'defs', 'marker', 'path', 'line', 'polyline', 'polygon', 'rect', 'circle', 'ellipse', 'text', 'tspan', 'image', 'use', 'title', 'desc'])
+const voidTags = new Set(['br'])
 const attributes = new Set(['id', 'class', 'role', 'viewbox', 'xmlns', 'width', 'height', 'x', 'y', 'x1', 'y1', 'x2', 'y2', 'cx', 'cy', 'r', 'rx', 'ry', 'd', 'points', 'fill', 'fill-opacity', 'stroke', 'stroke-width', 'stroke-linecap', 'stroke-linejoin', 'stroke-dasharray', 'opacity', 'transform', 'preserveaspectratio', 'marker-start', 'marker-mid', 'marker-end', 'refx', 'refy', 'markerwidth', 'markerheight', 'orient', 'font-size', 'font-weight', 'text-anchor', 'dominant-baseline', 'dx', 'dy', 'colspan', 'rowspan', 'href', 'src'])
 const decodeEntities = (value: string) => value.replace(/&#(x[0-9a-f]+|\d+);?/gi, (_, code: string) => String.fromCodePoint(code[0]?.toLowerCase() === 'x' ? Number.parseInt(code.slice(1), 16) : Number(code)))
   .replace(/&(colon|tab|newline|amp|quot|apos|lt|gt);/gi, (_, name: string) => ({ colon: ':', tab: '\t', newline: '\n', amp: '&', quot: '"', apos: "'", lt: '<', gt: '>' })[name.toLowerCase()]!)
@@ -38,7 +39,7 @@ export function validateLectureMarkup(markup: string): string[] {
       if (attrName === 'src' && !/^data:image\/(?:png|jpeg|gif|webp);base64,[a-z0-9+/]+=*$/i.test(value)) errors.push('Only embedded raster image sources are allowed')
       if (/[<>]/.test(value)) errors.push(`Markup is forbidden in attribute: ${rawName}`)
     }
-    if (!selfClosing) stack.push(name)
+    if (!selfClosing && !voidTags.has(name)) stack.push(name)
   }
   if (markup.slice(cursor).includes('<')) errors.push('Malformed tag')
   if (stack.length) errors.push('Unclosed tag')

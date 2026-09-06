@@ -25,6 +25,8 @@ export interface OpenAIDriverOptions {
   apiKey: string
   baseUrl?: string
   reasoningEffort?: 'high' | 'max'
+  /** Override provider thinking mode; useful for bounded structured generation. */
+  enableThinking?: boolean
   /** Max attempts per request across retryable failures (429/5xx/network). */
   maxAttempts?: number
   /** Base backoff in ms; grows exponentially with full jitter. */
@@ -188,7 +190,8 @@ export class OpenAIChatDriver implements ModelDriver {
           },
           body: JSON.stringify({ max_tokens: this.maxOutputTokens,
             ...(this.options.reasoningEffort ? { reasoning_effort: this.options.reasoningEffort } : {}),
-            ...(this.modelId === DEFAULT_MODEL.id ? { enable_thinking: true } : {}), ...body }),
+            ...(this.options.enableThinking !== undefined ? { enable_thinking: this.options.enableThinking }
+              : this.modelId === DEFAULT_MODEL.id ? { enable_thinking: true } : {}), ...body }),
           signal: combined,
         })
       } catch (error) {

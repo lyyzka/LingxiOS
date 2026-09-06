@@ -204,13 +204,14 @@ export function parseSlideSpec(value: unknown, expected: { id: string; order: nu
     const step = record(item, `step ${index}`); exact(step, ['id', 'title', 'explanation', 'anchorIds', 'claimIds'], `step ${index}`)
     return { id: text(step['id'], 'step.id', 100), title: text(step['title'], 'step.title', 500), explanation: text(step['explanation'], 'step.explanation', 10_000), anchorIds: strings(step['anchorIds'], 'step.anchorIds', 100), claimIds: strings(step['claimIds'], 'step.claimIds', 100) }
   })
+  const bodyHtml = text(slide['bodyHtml'], 'slide.bodyHtml', 500_000).replace(/<!--[\s\S]*?-->/g, '').replace(/\s+style\s*=\s*(?:"[^"]*"|'[^']*')/gi, '')
   return { id: expected.id, order: expected.order, chapterId: expected.chapterId, role: slide['role'] as SlideRole, purpose: slide['purpose'] as TeachingPurpose,
     title: text(slide['title'], 'slide.title', 500), conclusion: text(slide['conclusion'], 'slide.conclusion', 2_000), visualKind: slide['visualKind'] as VisualKind,
-    bodyHtml: text(slide['bodyHtml'], 'slide.bodyHtml', 500_000), anchors, steps, bindings }
+    bodyHtml, anchors, steps, bindings }
 }
 
 export const COURSE_PLAN_OUTPUT = `{"title":"string","audience":"string","prerequisites":["string"],"objectives":[{"id":"string","description":"string"}],"chapters":[{"id":"string","order":0,"title":"string","objectiveIds":["objective id"],"slideIds":["pg_stable_id"]}],"targetSlideCount":3,"durationMinutes":30,"terminology":{"term":"definition"}}`
-export const SLIDE_OUTPUT = `{"id":"pg_id","order":0,"chapterId":"chapter id","role":"cover|content|section|summary|ending","purpose":"explain|example|counterexample|practice|review|assessment","title":"string","conclusion":"string","visualKind":"diagram|process|chart|comparison|formula|exercise|source-image","bodyHtml":"inline HTML with accessible SVG and data-anchor-id attributes","anchors":[{"id":"string","x":0,"y":0,"width":1,"height":1}],"steps":[{"id":"string","title":"string","explanation":"string","anchorIds":["anchor id"],"claimIds":["claim id"]}],"bindings":[{"claimId":"string","snapshotId":"provided snapshot id","evidenceMarkers":["S1"],"kind":"source|derived|teaching-example","statement":"string"}]}`
+export const SLIDE_OUTPUT = `{"id":"pg_id","order":0,"chapterId":"chapter id","role":"cover|content|section|summary|ending","purpose":"explain|example|counterexample|practice|review|assessment","title":"string","conclusion":"string","visualKind":"diagram|process|chart|comparison|formula|exercise|source-image","bodyHtml":"inline HTML with accessible SVG and matching data-anchor-id attributes","anchors":[{"id":"main","x":80,"y":140,"width":720,"height":400}],"steps":[{"id":"string","title":"string","explanation":"string","anchorIds":["main"],"claimIds":["claim id"]}],"bindings":[{"claimId":"string","snapshotId":"exact input evidence snapshot id","evidenceMarkers":["exact marker in that snapshot"],"kind":"source|derived|teaching-example","statement":"string"}]}`
 
 export function newPageId(): string { return `pg_${randomUUID().replaceAll('-', '')}` }
 const canonical = (value: unknown): unknown => Array.isArray(value) ? value.map(canonical) : value && typeof value === 'object'

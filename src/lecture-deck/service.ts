@@ -170,11 +170,22 @@ export class LectureDeckService {
     slide = { ...slide, id: key, order, chapterId: chapter.id }
     for (let attempt = 0; attempt < (this.deps.maxRepairAttempts ?? 2); attempt++) {
       const probe = this.partialManifest(record, course, scopedEvidence, slide)
-      if (validateDeck(probe).issues.every(issue => issue.pageId !== slide.id && !issue.code.startsWith('security.'))) break
+      const issues = validateDeck(probe).issues.filter(issue => issue.pageId === slide.id || issue.code.startsWith('security.'))
+      if (!issues.length) {
+        await this.observe(progress, { deckId: record.id, revision: record.revision, stage: 'validate-slide', status: 'completed',
+          pageId: key, chapterId: chapter.id, completedSlides: order + 1, totalSlides: course.targetSlideCount })
+        break
+      }
+      await this.observe(progress, { deckId: record.id, revision: record.revision, stage: 'validate-slide', status: 'failed',
+        pageId: key, chapterId: chapter.id, completedSlides: order, totalSlides: course.targetSlideCount,
+        message: [...new Set(issues.map(issue => `${issue.code}: ${issue.message}`))].join('; ') })
       slide = await this.modelStage(record, { stage: 'repair-slide', pageId: key, chapterId: chapter.id, completedSlides: order, totalSlides: course.targetSlideCount }, signal, progress,
-        activeSignal => this.deps.author.slide({ ...input, previous: slide, instruction: 'Repair deterministic validation errors only.' }, activeSignal))
+        activeSignal => this.deps.author.slide({ ...input, previous: slide,
+          instruction: `Repair only these deterministic validation errors: ${issues.map(issue => issue.message).join('; ')}` }, activeSignal))
       slide = { ...slide, id: key, order, chapterId: chapter.id }
     }
+    const remaining = validateDeck(this.partialManifest(record, course, scopedEvidence, slide)).issues.filter(issue => issue.pageId === slide.id || issue.code.startsWith('security.'))
+    if (remaining.length) throw new Error(`slide ${key} remained invalid: ${[...new Set(remaining.map(issue => issue.code))].join(', ')}`)
     return slide
   }
 
@@ -296,7 +307,7 @@ export class ModelLectureAuthor implements LectureAuthor {
     return this.generate(`Create a rigorous course plan. Return only this exact JSON shape: ${COURSE_PLAN_OUTPUT}. Use exactly ${request.targetSlideCount} unique stable page IDs matching pg_[A-Za-z0-9_-]+, contiguous chapter order, and only supplied untrusted evidence.`, { request, evidence }, value => parseCoursePlan(value, request.targetSlideCount), signal)
   }
   async slide(input: Parameters<LectureAuthor['slide']>[0], signal?: AbortSignal): Promise<SlideSpec> {
-    return this.generate(`Author one professional 1280x720 teaching slide. Return only this exact JSON shape: ${SLIDE_OUTPUT}. Use semantic HTML and one accessible inline SVG primary visual; no scripts, styles, event handlers, foreignObject, or external resources. Every instructional slide needs substantial data-anchor-id geometry, explanation steps, and claim-level bindings using only supplied snapshot IDs/markers. Mark invented values as teaching-example.`, input,
+    return this.generate(`Author one professional 1280x720 teaching slide. Return only this exact JSON shape: ${SLIDE_OUTPUT}. bodyHtml may use only passive semantic HTML and inline SVG; no style, script, event handler, foreignObject, or external resource. Every instructional slide needs a substantial anchor in 1280x720 coordinates whose id exactly matches bodyHtml data-anchor-id, explanation steps, and claim-level bindings. A source or derived binding must copy snapshotId and evidenceMarkers exactly from the same input.evidence[] snapshot; never substitute sourceId or chunkId. Mark invented values as teaching-example.`, input,
       value => parseSlideSpec(value, { id: input.pageId, order: input.order, chapterId: input.chapter.id, evidence: input.evidence }), signal)
   }
   private async generate<T>(instructions: string, input: unknown, parse: (value: unknown) => T, signal?: AbortSignal): Promise<T> {

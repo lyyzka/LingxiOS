@@ -44,6 +44,14 @@ it('does not send provider-specific reasoning settings unless configured', async
   await model.run({ instructions: '', items: [] })
 })
 
+it('can disable provider thinking for bounded structured generation', async () => {
+  const model = new OpenAIChatDriver(DEFAULT_MODEL.id, { apiKey: 'test', enableThinking: false, fetchImpl: async (_url, init) => {
+    assert.equal(JSON.parse(String(init?.body)).enable_thinking, false)
+    return Response.json({ choices: [{ finish_reason: 'stop', message: { content: '{}' } }] })
+  } })
+  await model.structured({ instructions: '', input: {} })
+})
+
 it('keeps incremental text and rejects truncated or unfinished streams', async () => {
   const deltas: string[] = []
   const result = await driver({ content: 'hello' }).run({ instructions: '', items: [], onTextDelta: (text) => deltas.push(text) })
