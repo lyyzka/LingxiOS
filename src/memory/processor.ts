@@ -1,4 +1,5 @@
 import type { WorkProcessor } from '../runtime/runtime.js'
+import { auxiliaryInstructions } from '../context/compiler.js'
 import { parseMemoryChanges, type MemoryBatch } from './synthesis.js'
 
 export const memoryIndexProcessor: WorkProcessor = {
@@ -24,7 +25,8 @@ export const memorySynthesisProcessor: WorkProcessor = {
     if (!batch) return
     const signal = AbortSignal.any([context.signal, AbortSignal.timeout(90_000)])
     const call = async (purpose: string, instructions: string, input: unknown) => {
-      const size = Buffer.byteLength(instructions) + Buffer.byteLength(JSON.stringify(input)) + (context.model.maxOutputTokens ?? 8192)
+      instructions = auxiliaryInstructions(instructions)
+      const size = Buffer.byteLength(instructions) + Buffer.byteLength(JSON.stringify(input)) + (context.model.maxOutputTokens ?? 8192) + (context.model.maxThinkingTokens ?? 0)
       if (size > Math.floor((context.model.contextWindowTokens ?? 128_000) * 0.9)) throw new Error('memory synthesis exceeds model input budget')
       signal.throwIfAborted()
       const started = Date.now()

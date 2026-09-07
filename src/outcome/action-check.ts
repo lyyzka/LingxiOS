@@ -31,7 +31,7 @@ export async function inspectActions(database: SqlQueryable, work: Omit<WorkItem
     if (!result || result.executionState === 'unknown' || result.approval) {
       records.push({ checker, status: 'inconclusive', evidence: { action: action.action, reason: 'Effect requires reconciliation or approval' } })
     } else if (!result.ok) {
-      records.push({ checker, status: 'passed', evidence: { action: action.action, scope: 'confirmed_failed_action_without_effect' } })
+      records.push({ checker, status: 'passed', evidence: { action: action.action, scope: 'confirmed_failed_action_without_effect', error: result.error } })
     } else if (!executor?.verifyResult) {
       records.push({ checker, status: 'inconclusive', evidence: { action: action.action, reason: 'Authoritative business readback is unavailable' } })
     } else {

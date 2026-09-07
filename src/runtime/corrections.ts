@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto'
 
-export interface ProgressCheckpoint { last: string; count: number; observations: string[] }
+export interface ProgressCheckpoint { last: string; count: number; observations: string[]; protocolRepairs?: number }
 
 export type CorrectionCategory = 'content_acceptance' | 'tool_protocol' | 'kernel_error' | 'response_protocol'
 
@@ -8,16 +8,21 @@ export type CorrectionCategory = 'content_acceptance' | 'tool_protocol' | 'kerne
 export class CorrectionBudget {
   private last = ''
   private count = 0
+  private protocolRepairs = 0
   private observations = new Set<string>()
   constructor(checkpoint?: ProgressCheckpoint) {
-    if (checkpoint) { this.last = checkpoint.last; this.count = checkpoint.count; this.observations = new Set(checkpoint.observations) }
+    if (checkpoint) { this.last = checkpoint.last; this.count = checkpoint.count; this.observations = new Set(checkpoint.observations); this.protocolRepairs = checkpoint.protocolRepairs ?? 0 }
   }
-  snapshot(): ProgressCheckpoint { return { last: this.last, count: this.count, observations: [...this.observations] } }
+  snapshot(): ProgressCheckpoint { return { last: this.last, count: this.count, observations: [...this.observations], protocolRepairs: this.protocolRepairs } }
   consume(category: CorrectionCategory, failure = category as string): boolean {
+    if (category === 'response_protocol' || category === 'tool_protocol') {
+      this.protocolRepairs++
+      if (this.protocolRepairs > 2) return false
+    }
     const key = createHash('sha256').update(category + ':' + failure).digest('hex')
     this.count = this.last === key ? this.count + 1 : 1
     this.last = key
-    return this.count < 6
+    return this.count < 3
   }
   observe(value: string): void {
     const key = createHash('sha256').update(value).digest('hex')
@@ -26,6 +31,17 @@ export class CorrectionBudget {
     if (this.observations.size > 2048) this.observations.delete(this.observations.values().next().value!)
     this.last = ''; this.count = 0
   }
-  get rediagnose(): boolean { return this.count >= 3 }
-  has(_category: CorrectionCategory): boolean { return this.count < 5 }
+  get rediagnose(): boolean { return this.count >= 2 }
+  has(category: CorrectionCategory): boolean { return this.count < 2 && (!category.endsWith('protocol') || this.protocolRepairs < 2) }
+}
+
+/** Only resource versions, artifact content and action state transitions count as progress. */
+export function progressFacts(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(progressFacts)
+  if (!value || typeof value !== 'object') return undefined
+  return Object.fromEntries(Object.entries(value).flatMap(([key, item]) => {
+    if (['version', 'revision', 'sha256', 'ok', 'executionState', 'status', 'action'].includes(key)) return [[key, item]]
+    const nested = progressFacts(item)
+    return nested && (Array.isArray(nested) ? nested.some(Boolean) : Object.keys(nested).length) ? [[key, nested]] : []
+  }))
 }

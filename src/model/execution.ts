@@ -1,4 +1,5 @@
 import { setTimeout as delay } from 'node:timers/promises'
+import { createHash } from 'node:crypto'
 import { ModelBudgetExceededError, ModelDriverError, errorMessage } from '../errors.js'
 import type { HostPort } from '../host/port.js'
 import type { RunEvent, WorkItem } from '../protocol/types.js'
@@ -37,16 +38,16 @@ export const DEFAULT_MODEL_BUDGET: Required<RootModelBudgetOptions> = {
 
 /** One provider attempt boundary shared by generation, reviews, compaction and embeddings. */
 export function modelExecution(host: Pick<HostPort, 'reserveModelCall' | 'recordModelUsage'>,
-  model: Pick<ModelDriver, 'modelId' | 'maxOutputTokens' | 'toolDefinitionTokens'>, work: WorkItem,
+  model: Pick<ModelDriver, 'modelId' | 'maxOutputTokens' | 'maxThinkingTokens' | 'toolDefinitionTokens'>, work: WorkItem,
   limits: Required<RootModelBudgetOptions>, observer?: ModelCallObserver,
   emit?: (event: Omit<RunEvent, 'runId' | 'seq'>) => Promise<unknown>, namespace = 'model') {
   let sequence = 0, calls = 0, tokens = 0, cost = 0
   const started = Date.now()
   const invoke = async <T extends { model?: string; usage: ModelUsage }>(purpose: ModelCallObservation['purpose'],
-    request: { signal?: AbortSignal | undefined; input?: unknown }, operation: (signal: AbortSignal) => Promise<T>): Promise<T> => {
+    request: { signal?: AbortSignal | undefined; input?: unknown }, operation: (signal: AbortSignal) => Promise<T>, callModel = model): Promise<T> => {
     const logicalCallId = `${work.id}:${work.fence}:${namespace}:${++sequence}`
-    const input = Buffer.byteLength(JSON.stringify(request)) + (model.toolDefinitionTokens ?? 0)
-    const output = model.maxOutputTokens ?? 8192
+    const input = Buffer.byteLength(JSON.stringify(request)) + (callModel.toolDefinitionTokens ?? 0)
+    const output = (callModel.maxOutputTokens ?? 8192) + (callModel.maxThinkingTokens ?? 0)
     const reservedCost = Math.ceil((input * limits.inputCostMicrosPerMillion + output * limits.outputCostMicrosPerMillion) / 1_000_000)
     for (let attempt = 1; ; attempt++) {
       request.signal?.throwIfAborted()
@@ -68,7 +69,7 @@ export function modelExecution(host: Pick<HostPort, 'reserveModelCall' | 'record
       const began = Date.now()
       await emit?.({
         kind: 'model.request.started', stage: 'started', visibility: 'internal',
-        data: { callId, logicalCallId, purpose, model: model.modelId ?? 'unknown' } })
+        data: { callId, logicalCallId, purpose, model: callModel.modelId ?? 'unknown' } })
       let result: T | undefined, failure: unknown
       try { result = await operation(signal) } catch (error) { failure = error }
       const usage = result?.usage
@@ -80,7 +81,7 @@ export function modelExecution(host: Pick<HostPort, 'reserveModelCall' | 'record
         callId, ...(attempt > 1 ? { logicalCallId } : {}), purpose,
         workId: work.id, tenantId: work.tenantId, agentId: work.agentId, sessionId: work.sessionId,
         ...(work.threadId !== undefined ? { threadId: work.threadId } : {}), ...(work.principalId ? { principalId: work.principalId } : {}),
-        model: result?.model ?? model.modelId ?? 'unknown', ...(usage ? { usage } : {}),
+        model: result?.model ?? callModel.modelId ?? 'unknown', ...(usage ? { usage } : {}),
         latencyMs: Date.now() - began, status: result ? 'succeeded' : 'failed',
         ...(failure ? { error: errorMessage(failure) } : {}),
       }
@@ -101,18 +102,24 @@ export function modelExecution(host: Pick<HostPort, 'reserveModelCall' | 'record
 
 export function executionModel(host: Pick<HostPort, 'reserveModelCall' | 'recordModelUsage'>, source: ModelDriver, work: WorkItem,
   limits: Required<RootModelBudgetOptions>, observer?: ModelCallObserver,
-  emit?: (event: Omit<RunEvent, 'runId' | 'seq'>) => Promise<unknown>): ModelDriver {
-  const model = source.singleAttempt?.() ?? source
+  emit?: (event: Omit<RunEvent, 'runId' | 'seq'>) => Promise<unknown>, smallSource: ModelDriver = source): ModelDriver {
+  const primary = source.singleAttempt?.() ?? source
+  const small = smallSource === source ? primary : smallSource.singleAttempt?.() ?? smallSource
+  const model = work.kind === 'memory_synthesis' || work.kind === 'resume' && work.lane === 'approval' ? small : primary
+  const reviewer = work.kind === 'memory_synthesis' ? small : primary
   const { invoke, nextCallId } = modelExecution(host, model, work, limits, observer, emit)
+  const drivers = [model, reviewer, small]
   return {
     nextCallId,
     ...(model.modelId === undefined ? {} : { modelId: model.modelId }),
-    ...(model.configurationFingerprint === undefined ? {} : { configurationFingerprint: model.configurationFingerprint }),
-    ...(model.contextWindowTokens === undefined ? {} : { contextWindowTokens: model.contextWindowTokens }),
-    ...(model.maxOutputTokens === undefined ? {} : { maxOutputTokens: model.maxOutputTokens }),
+    ...(model.configurationFingerprint === undefined ? {} : { configurationFingerprint: small === primary ? model.configurationFingerprint
+      : createHash('sha256').update(JSON.stringify(drivers.map(driver => [driver.modelId, driver.configurationFingerprint]))).digest('hex') }),
+    ...(drivers.every(driver => driver.contextWindowTokens === undefined) ? {} : { contextWindowTokens: Math.min(...drivers.map(driver => driver.contextWindowTokens ?? 128_000)) }),
+    ...(drivers.every(driver => driver.maxOutputTokens === undefined) ? {} : { maxOutputTokens: Math.max(...drivers.map(driver => driver.maxOutputTokens ?? 8192)) }),
+    ...(drivers.every(driver => driver.maxThinkingTokens === undefined) ? {} : { maxThinkingTokens: Math.max(...drivers.map(driver => driver.maxThinkingTokens ?? 0)) }),
     ...(model.toolDefinitionTokens === undefined ? {} : { toolDefinitionTokens: model.toolDefinitionTokens }),
     run: request => invoke('agent-turn', request, signal => model.run({ ...request, signal })),
-    structured: request => invoke('structured', request, signal => model.structured({ ...request, signal })),
-    compact: request => invoke('compaction', request, signal => model.compact({ ...request, signal })),
+    structured: request => invoke('structured', request, signal => reviewer.structured({ ...request, signal }), reviewer),
+    compact: request => invoke('compaction', request, signal => small.compact({ ...request, signal }), small),
   }
 }

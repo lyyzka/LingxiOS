@@ -142,17 +142,17 @@ it('approves routines separately from activation, fences stale previews, and sco
         const request = JSON.parse(prompt)
         if (!request.stream && request.response_format?.type === 'json_object') {
           const instructions = String(request.messages[0]?.content)
-          assert.match(instructions, /^(Maintain compact learning memory\.|Independently audit every proposed memory change)/)
+          assert.match(instructions, /Maintain compact learning memory\.|Independently audit every proposed memory change|Check a candidate delivery/)
           res.writeHead(200, { 'content-type': 'application/json' })
           res.end(JSON.stringify({ model: 'test', choices: [{ message: {
-            content: instructions.startsWith('Maintain') ? '{"changes":[]}' : '{"approved":true,"confidence":0.9}',
+            content: instructions.includes('Maintain compact learning memory.') ? '{"changes":[]}' : instructions.includes('Check a candidate delivery') ? '{"missing":[]}' : '{"approved":true,"confidence":0.9}',
           }, finish_reason: 'stop' }] }))
           return
         }
         const tool = ++calls % 2 === 1
         assert.match(prompt, /Summarize the current project/)
         if (!tool) assert.match(prompt, /Daily summary/)
-        const delta = tool ? { tool_calls: [{ index: 0, id: 'routines-read', function: { name: 'ipython', arguments: JSON.stringify({ code: 'print(host.routines.list())\nprint(host.knowledge.list_sources())' }) } }] } : { content: JSON.stringify({ body: 'Scheduled summary.', status: 'satisfied', gaps: [], checks: [{ requirement: 'Summarize the current project', status: 'met', basis: 'Summary supplied from the recorded reads.' }] }) }
+        const delta = tool ? { tool_calls: [{ index: 0, id: 'routines-read', function: { name: 'ipython', arguments: JSON.stringify({ code: 'print(host.routines.list())\nprint(host.knowledge.list_sources())' }) } }] } : { content: 'Scheduled summary.' }
         res.writeHead(200, { 'content-type': 'text/event-stream' })
         res.end(`data: ${JSON.stringify({ choices: [{ delta, finish_reason: tool ? 'tool_calls' : 'stop' }] })}\n\ndata: [DONE]\n\n`)
       })

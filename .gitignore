@@ -2,3 +2,5 @@ node_modules/
 dist/
 *.log
 release-results/
+.agent-os/
+eval/results/

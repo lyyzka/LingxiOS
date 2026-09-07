@@ -8,7 +8,7 @@ import { HttpHostClient } from '../host/http-client.js'
 import { KernelManager, type KernelHostBridge, type ManagedKernelExecutor } from '../kernel/manager.js'
 import { createLogger } from '../logging.js'
 import { MetricsRegistry } from '../metrics.js'
-import { OpenAIChatDriver } from '../model/openai.js'
+import { DEFAULT_SMALL_MODEL, OpenAIChatDriver } from '../model/openai.js'
 import { AgentRuntime } from '../runtime/runtime.js'
 import { AgentWorker } from './worker.js'
 import { registerProcessors } from './processors.js'
@@ -36,6 +36,7 @@ export async function startWorker(env: NodeJS.ProcessEnv = process.env, options:
     baseUrl: config.model.baseUrl,
     ...(config.model.reasoningEffort ? { reasoningEffort: config.model.reasoningEffort } : {}),
   })
+  const smallModel = new OpenAIChatDriver(config.smallModel.id, { ...DEFAULT_SMALL_MODEL, ...config.smallModel })
   const bridge: KernelHostBridge = { execute: (work, action) => host.executeAction(work, action) }
   const kernels = options.kernelFactory?.(bridge) ?? new KernelManager(
     bridge, { logger, maxKernels: config.maxConcurrentRuns,
@@ -44,7 +45,7 @@ export async function startWorker(env: NodeJS.ProcessEnv = process.env, options:
   const policyName = env['AGENT_OS_RUNTIME_POLICY']?.trim()
   if (policyName && policyName !== 'lingxiloop') throw new ConfigError('AGENT_OS_RUNTIME_POLICY must be lingxiloop when set')
   const policy = options.policy ?? (policyName === 'lingxiloop' ? createLingxiLoopRuntimePolicy() : undefined)
-  const runtime = new AgentRuntime(host, model, kernels, { logger, ...(policy ? { policy } : {}),
+  const runtime = new AgentRuntime(host, model, kernels, { logger, smallModel, ...(policy ? { policy } : {}),
     rootModelBudget: loadModelBudget(env),
     recordModelPayloads: boolEnv('AGENT_OS_RECORD_MODEL_PAYLOADS', false, env) })
   registerProcessors(runtime)

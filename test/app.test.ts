@@ -43,7 +43,9 @@ it('assembles the public app through HTTP model and Python, persisting results a
         contentChecks++
         assert.match(payload.messages[0].content, /Check a candidate delivery/)
         res.writeHead(200, { 'content-type': 'application/json' })
-        res.end(JSON.stringify({ model: 'test', choices: [{ message: { content: '{"missing":[]}' }, finish_reason: 'stop' }] }))
+        const input = JSON.parse(payload.messages.at(-1).content)
+        const missing = input.revisions?.length ? [{ quote: input.revisions.at(-1).text, reason: 'Candidate ignores the revision.' }] : []
+        res.end(JSON.stringify({ model: 'test', choices: [{ message: { content: JSON.stringify({ missing }) }, finish_reason: 'stop' }] }))
         return
       }
       requests.push(payload)
@@ -53,8 +55,7 @@ it('assembles the public app through HTTP model and Python, persisting results a
         if (missingArtifactCalls === 2) await rm(join(kernelHome(options.kernel.homesRoot,
           { tenantId: 'tenant', agentId: 'assistant', sessionId: 'missing-artifact', homeEpoch: 1 }), 'missing.txt'))
         const delta = missingArtifactCalls === 1 ? { tool_calls: [{ index: 0, id: 'missing-artifact-cell', function: { name: 'ipython',
-          arguments: JSON.stringify({ code: 'open("missing.txt", "w").write("result")' }) } }] } : { content: JSON.stringify({ body: 'File prepared.', status: 'satisfied', gaps: [],
-            checks: [{ requirement: 'Create a result file.', status: 'met', basis: 'The Python cell wrote the file.' }] }) }
+          arguments: JSON.stringify({ code: 'open("missing.txt", "w").write("result")' }) } }] } : { content: 'File prepared.' }
         res.writeHead(200, { 'content-type': 'text/event-stream' })
         res.end(`data: ${JSON.stringify({ choices: [{ delta, finish_reason: missingArtifactCalls === 1 ? 'tool_calls' : 'stop' }] })}\n\ndata: [DONE]\n\n`)
         return
@@ -63,10 +64,7 @@ it('assembles the public app through HTTP model and Python, persisting results a
         ? { tool_calls: [{ index: 0, id: `budget-${requests.length}`, function: { name: 'ipython', arguments: JSON.stringify({ code: 'print(2 + 2)' }) } }] }
         : (requests.length === 1 || remoteCalls === 1)
         ? { content: 'Calculating.', tool_calls: [{ index: 0, id: 'cell', function: { name: 'ipython', arguments: JSON.stringify({ code: 'host.task.contract(deliverables=["Calculation"], constraints=[], actions=[], acceptance=["Return the result"])\nprint(2 + 2)\nopen("answer.txt", "w").write("4")' }) } }] }
-        : requests.length === 2 ? { content: JSON.stringify({
-          body: '4', status: 'satisfied', gaps: [], checks: [{ requirement: 'Calculate 2 + 2 using Python.', status: 'met', basis: 'Python returned 4.' }],
-        }) } : { content: JSON.stringify({ body: '4', status: 'satisfied', gaps: [], checks: [{
-          requirement: remoteCalls !== undefined ? 'Calculate 2 + 2 using Python.' : 'Answer this request.', status: 'met', basis: 'The result is supplied.' }] }) }
+        : { content: '4' }
       res.writeHead(200, { 'content-type': 'text/event-stream' })
       res.end(`data: ${JSON.stringify({ choices: [{ delta, finish_reason: exhaustBudget || (requests.length === 1 || remoteCalls === 1) ? 'tool_calls' : 'stop' }] })}\n\ndata: [DONE]\n\n`)
     })
@@ -75,8 +73,8 @@ it('assembles the public app through HTTP model and Python, persisting results a
   const address = server.address()
   assert.ok(address && typeof address === 'object')
   class InjectedPolicy extends DefaultRuntimePolicy {
-    override assembleSystemPrompt(candidate: PromptContext) {
-      return `${super.assembleSystemPrompt(candidate)}\n\nInjected policy marker.`
+    override productRules(candidate: PromptContext) {
+      return `${super.productRules(candidate)}\n\nInjected policy marker.`
     }
 
     override dynamicContextItems(context: TurnContext) {
@@ -87,7 +85,7 @@ it('assembles the public app through HTTP model and Python, persisting results a
     const persona = { name: 'Injected assistant', role: 'assistant', instructions: 'Use injected context.' }
     return { persona, capabilities: [], dynamic: { tenant: work.tenantId },
       messages: [{ ref: work.triggerRef, authorId: work.principalId!, authorName: String(work.meta?.['authorName'] ?? 'User'), authorKind: 'human' as const, body: String(work.meta?.['text']), createdAt: work.createdAt ?? '' }],
-      promptContextCandidate: { version: 2 as const, epoch: 0, assembledAt: '', systemInstructions: '', persona, capabilities: [], sourceVersions: { persona: 'injected-v1' } },
+      promptContextCandidate: { version: 3 as const, epoch: 0, assembledAt: '', systemInstructions: '', persona, capabilities: [], sourceVersions: { persona: 'injected-v1' } },
     }
   } }
   const options = { database: pool, model: { id: 'test', apiKey: 'test', baseUrl: `http://127.0.0.1:${address.port}` }, kernel: { homesRoot: join(directory, 'homes') }, worker: { healthPort: 0, pollIdleMs: 50 },
@@ -142,11 +140,10 @@ it('assembles the public app through HTTP model and Python, persisting results a
     assert.ok(traces.every(trace => JSON.stringify(trace.data).includes('redacted') && !JSON.stringify(trace.data).includes('Calculate 2 + 2')))
     assert.ok(traces.every(trace => trace.expires_at))
     assert.deepEqual(await app.readOutcome(identity), { status: 'satisfied', verification: 'inconclusive', requestVersion: 1 })
-    assert.deepEqual(evaluation.message?.envelope.assessment, { status: 'satisfied', gaps: [],
-      checks: [{ requirement: 'Calculate 2 + 2 using Python.', status: 'met', basis: 'Python returned 4.' }] })
+    assert.equal(evaluation.message?.envelope.assessment, undefined)
     assert.equal(await app.readMessage({ ...identity, tenantId: 'another' }), null)
     assert.equal(requests.length, 2)
-    assert.match(requests[0]!.messages[0]!.content, /Tooling contract/)
+    assert.match(requests[0]!.messages[0]!.content, /Runtime authorization/)
     assert.match(requests[0]!.messages[0]!.content, /Injected policy marker/)
     assert.match(JSON.stringify(requests[0]!.messages), /Injected context:.*tenant/)
     const output = requests[1]!.messages.find((item) => item.role === 'tool')!

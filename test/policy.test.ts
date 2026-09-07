@@ -26,7 +26,7 @@ function context(overrides: Partial<TurnContext> = {}): TurnContext {
 
 function promptContext(overrides: Partial<PromptContext> = {}): PromptContext {
   return {
-    version: 2, epoch: 1, assembledAt: '2026-01-01T00:00:00Z',
+    version: 3, epoch: 1, assembledAt: '2026-01-01T00:00:00Z',
     systemInstructions: '', persona: { name: 'Bot', role: 'assistant', instructions: 'Be helpful.' },
     capabilities: ['fs', 'email'], sourceVersions: {}, ...overrides,
   }
@@ -40,21 +40,17 @@ describe('DefaultRuntimePolicy.kernelCapabilities', () => {
   })
 })
 
-describe('DefaultRuntimePolicy.assembleSystemPrompt', () => {
-  it('includes the tooling preamble, persona block, and granted capabilities', () => {
+describe('DefaultRuntimePolicy.productRules', () => {
+  it('contributes only trusted product configuration', () => {
     const policy = new DefaultRuntimePolicy()
-    const prompt = policy.assembleSystemPrompt(promptContext())
-    assert.match(prompt, /You are an agent running on the LingxiOS Agent OS/)
-    assert.match(prompt, /Name: Bot/)
-    assert.match(prompt, /Role: assistant/)
-    assert.match(prompt, /Be helpful\./)
-    assert.match(prompt, /- host\.fs/)
-    assert.match(prompt, /- host\.email/)
+    const prompt = policy.productRules(promptContext(), context({ productRules: 'Trusted product rule.' }))
+    assert.equal(prompt, 'Trusted product rule.')
+    assert.doesNotMatch(prompt, /Be helpful|Bot|host\./)
   })
 
   it('omits the capabilities section when none are granted', () => {
     const policy = new DefaultRuntimePolicy()
-    const prompt = policy.assembleSystemPrompt(promptContext({ capabilities: [] }))
+    const prompt = policy.productRules(promptContext({ capabilities: [] }))
     assert.doesNotMatch(prompt, /# Granted capabilities/)
   })
 })
@@ -67,15 +63,12 @@ describe('DefaultRuntimePolicy.dynamicContextItems', () => {
 })
 
 describe('DefaultRuntimePolicy.turnInputItems', () => {
-  it('renders only the trigger message when history already exists', () => {
+  it('does not duplicate the authoritative trigger in session history', () => {
     const policy = new DefaultRuntimePolicy()
     const trigger = message({ ref: 'm1', body: 'trigger body' })
     const other = message({ ref: 'm2', body: 'unrelated' })
     const items = policy.turnInputItems(context({ messages: [other, trigger] }), true)
-    assert.equal(items.length, 1)
-    assert.equal((items[0] as { role: string }).role, 'user')
-    assert.match((items[0] as { content: string }).content, /trigger body/)
-    assert.doesNotMatch((items[0] as { content: string }).content, /unrelated/)
+    assert.deepEqual(items, [])
   })
 
   it('renders the last 20 messages when there is no history yet', () => {

@@ -217,6 +217,7 @@ export interface ActionLedgerStore {
 /** Assembles everything but `work` in a TurnContext. */
 export interface ContextProvider {
   loadContext(work: Omit<WorkItem, 'leaseToken'>): Promise<{
+    productRules?: string
     memory?: import('../memory/store.js').MemorySnapshot
     evidence?: import('../context/evidence.js').EvidenceItem[]
     persona: { name: string; role: string; instructions: string }

@@ -6,6 +6,19 @@
  */
 import type { ModelDriver } from '../model/driver.js'
 import type { ModelItem, SessionRecord } from '../protocol/types.js'
+import { COMPACTION_INSTRUCTIONS } from '../context/compiler.js'
+
+export function boundSummary(raw: string, maxChars: number): string {
+  const value = JSON.parse(raw) as Record<string, unknown>
+  const fields = ['observedResults', 'decisions', 'remainingWork', 'uncertainties'] as const
+  if (!value || typeof value !== 'object' || Array.isArray(value) || Object.keys(value).sort().join(',') !== [...fields].sort().join(',')
+    || fields.some(field => typeof value[field] !== 'string')) throw new Error('invalid structured continuity summary')
+  if (maxChars < 320) throw new Error('structured summary requires at least 320 characters')
+  const limit = Math.floor((maxChars - 256) / (fields.length * 6))
+  // JSON escaping may expand a character to six bytes. Preserve every field and mark truncation explicitly.
+  return JSON.stringify({ version: 1, fields: Object.fromEntries(fields.map(field => [field, (value[field] as string).slice(0, limit)])),
+    truncated: fields.filter(field => (value[field] as string).length > limit) })
+}
 
 export interface CompactionOptions {
   contextWindowTokens: number
@@ -96,24 +109,9 @@ export async function compactIfNeeded(
     summarize.unshift(summaryItem(priorSummary))
   }
   try {
-    const call = await model.compact({ instructions, items: summarize, signal })
-    let combined = call.value
-    let usage = { model: call.model, ...call.usage }
-    if (combined.length > options.maxSummaryChars) {
-      const recompacted = await model.compact({
-        instructions,
-        items: [{ role: 'user', content: combined }],
-        signal,
-      })
-      combined = recompacted.value
-      usage = {
-        model: recompacted.model,
-        available: usage.available && recompacted.usage.available,
-        inputTokens: usage.inputTokens + recompacted.usage.inputTokens,
-        outputTokens: usage.outputTokens + recompacted.usage.outputTokens,
-      }
-    }
-    combined = combined.slice(0, options.maxSummaryChars)
+    const call = await model.compact({ instructions: COMPACTION_INSTRUCTIONS, items: summarize, signal })
+    const combined = boundSummary(call.value, options.maxSummaryChars)
+    const usage = { model: call.model, ...call.usage }
     session.summary = combined
     session.history = [summaryItem(combined), ...keep]
     session.compactionEpoch += 1

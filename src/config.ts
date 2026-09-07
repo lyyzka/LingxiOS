@@ -3,7 +3,7 @@
  * eagerly so a misconfigured service fails at boot, not mid-run.
  */
 import { ConfigError } from './errors.js'
-import { DEFAULT_MODEL } from './model/openai.js'
+import { DEFAULT_MODEL, DEFAULT_SMALL_MODEL } from './model/openai.js'
 import type { RootModelBudgetOptions } from './runtime/runtime.js'
 
 export function loadModelBudget(env: NodeJS.ProcessEnv = process.env): RootModelBudgetOptions {
@@ -55,6 +55,7 @@ export interface WorkerConfig {
     baseUrl: string
     reasoningEffort?: 'high' | 'max'
   }
+  smallModel: { id: string; apiKey: string; baseUrl: string }
 }
 
 export function loadWorkerConfig(env: NodeJS.ProcessEnv = process.env): WorkerConfig {
@@ -73,6 +74,11 @@ export function loadWorkerConfig(env: NodeJS.ProcessEnv = process.env): WorkerCo
       apiKey: requiredEnv('AGENT_OS_MODEL_API_KEY', env),
       baseUrl: env['AGENT_OS_MODEL_BASE_URL']?.trim() || DEFAULT_MODEL.baseUrl,
       ...(reasoningEffort ? { reasoningEffort } : {}),
+    },
+    smallModel: {
+      id: env['AGENT_OS_SMALL_MODEL']?.trim() || DEFAULT_SMALL_MODEL.id,
+      apiKey: env['AGENT_OS_SMALL_MODEL_API_KEY']?.trim() || requiredEnv('AGENT_OS_MODEL_API_KEY', env),
+      baseUrl: env['AGENT_OS_SMALL_MODEL_BASE_URL']?.trim() || env['AGENT_OS_MODEL_BASE_URL']?.trim() || DEFAULT_MODEL.baseUrl,
     },
   }
 }

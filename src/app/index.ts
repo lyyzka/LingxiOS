@@ -19,7 +19,7 @@ import { ControlPlaneService } from '../control-plane/service.js'
 import { withTransaction, PgWorkStore, PgSessionStore, PgEventStore, PgActionLedger, PgModelBudgetStore, type SqlPool } from '../control-plane/pg-store.js'
 import type { HostPort } from '../host/port.js'
 import { KernelManager, type KernelHostBridge, type KernelManagerOptions, type ManagedKernelExecutor } from '../kernel/manager.js'
-import { DEFAULT_MODEL, OpenAIChatDriver } from '../model/openai.js'
+import { DEFAULT_MODEL, DEFAULT_SMALL_MODEL, OpenAIChatDriver } from '../model/openai.js'
 import { AgentRuntime } from '../runtime/runtime.js'
 import { AgentWorker } from '../worker/worker.js'
 import type { AssistantMessage, PromptContext, WorkItem, RunEvent } from '../protocol/types.js'
@@ -45,7 +45,9 @@ export interface LingxiOSOptions {
   logger?: Logger
   metrics?: MetricsRegistry
   database: SqlPool
-  model?: { id?: string; apiKey: string; baseUrl?: string; reasoningEffort?: 'high' | 'max'; maxOutputTokens?: number; contextWindowTokens?: number }
+  model?: { id?: string; apiKey: string; baseUrl?: string; reasoningEffort?: 'high' | 'max'; maxOutputTokens?: number; maxThinkingTokens?: number; contextWindowTokens?: number }
+  /** Defaults to Qwen on the primary model's endpoint and credentials. */
+  smallModel?: LingxiOSOptions['model']
   persona?: PromptContext['persona']
   /** Trusted product context loaded for each execution attempt. */
   contextProvider?: ContextProvider
@@ -107,7 +109,9 @@ export async function createLingxiOS(options: LingxiOSOptions) {
 export async function assembleApp(options: LingxiOSOptions, integration?: Pick<ControlPlaneDeps, 'contextProvider' | 'capabilityResolver' | 'actionExecutor' | 'delivery'> & { tools?: readonly import('../tools/catalog.js').ToolDefinition[]; backgroundJobs?: Record<string, () => Promise<unknown>> }) {
   if (!options.database?.query || !options.database.connect) throw new ConfigError('a PostgreSQL pool is required')
   if (options.lectureDeck && !options.lectureDeck.dependencies.publisher.read) throw new ConfigError('lecture publisher must support reading committed artifacts for recovery')
-  if (options.model && ((options.model.id !== undefined && !options.model.id.trim()) || !options.model.apiKey?.trim())) throw new ConfigError('model apiKey is required and any explicit model id must be non-empty')
+  for (const configured of [options.model, options.smallModel]) {
+    if (configured && ((configured.id !== undefined && !configured.id.trim()) || !configured.apiKey?.trim())) throw new ConfigError('model apiKey is required and any explicit model id must be non-empty')
+  }
   const concurrency = options.worker?.concurrency ?? 2
   if (!Number.isSafeInteger(concurrency) || concurrency < 1 || concurrency > 1_024) throw new ConfigError('worker concurrency must be 1-1024')
   await checkStorage(options.database)
@@ -175,7 +179,7 @@ export async function assembleApp(options: LingxiOSOptions, integration?: Pick<C
       return {
         persona, capabilities: [],
         messages: [{ ref: work.triggerRef, authorId: work.principalId, authorName: String(work.meta?.['authorName'] ?? 'User'), authorKind: 'human', body: text, createdAt: work.createdAt ?? '' }],
-        promptContextCandidate: { version: 2, epoch: 0, assembledAt: '', systemInstructions: '', persona, capabilities: [], sourceVersions: { persona: JSON.stringify(persona) } },
+        promptContextCandidate: { version: 3, epoch: 0, assembledAt: '', systemInstructions: '', persona, capabilities: [], sourceVersions: { persona: JSON.stringify(persona) } },
       }
     } },
     capabilityResolver: integration?.capabilityResolver ?? { resolve: async () => [] },
@@ -292,11 +296,15 @@ export async function assembleApp(options: LingxiOSOptions, integration?: Pick<C
     if (local) return local
     if (!options.model) throw new ConfigError('model configuration is required for local execution')
     const model = new OpenAIChatDriver(options.model.id ?? DEFAULT_MODEL.id, options.model)
+    const smallModel = new OpenAIChatDriver(options.smallModel?.id ?? DEFAULT_SMALL_MODEL.id, {
+      apiKey: options.model.apiKey, ...(options.model.baseUrl ? { baseUrl: options.model.baseUrl } : {}),
+      ...DEFAULT_SMALL_MODEL, ...options.smallModel,
+    })
     const bridge: KernelHostBridge = { execute: (work, action) => service.executeAction(work, action) }
     const kernels = options.kernelFactory?.(bridge) ?? new KernelManager(bridge, { ...options.kernel, maxKernels: concurrency,
       isolation: kernelIsolation(options.kernel?.isolation ?? process.env['AGENT_OS_KERNEL_ISOLATION'], process.env['NODE_ENV'] === 'production', options.trustProcessKernel) })
     const runtime = new AgentRuntime(host, model, kernels, {
-      logger,
+      logger, smallModel,
       ...(options.policy ? { policy: options.policy } : {}), recordModelPayloads: options.recordModelPayloads ?? false,
       ...(options.modelTrace ? { modelTrace: options.modelTrace } : {}),
       rootModelBudget: modelBudget,

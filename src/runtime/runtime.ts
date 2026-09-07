@@ -1,4 +1,6 @@
 import { appendResearchEvidence } from '../context/research-evidence.js'
+import { compileContext, fingerprint, observationItems, type ContextBlock } from '../context/compiler.js'
+import { requiresReview } from '../outcome/completion.js'
 import { appendResourceCheck } from '../context/resource-checks.js'
 import { createTaskContract } from '../context/task-contract.js'
 /**
@@ -40,7 +42,7 @@ import {
   type SessionRecord, type SteerInput, type TurnContext, type WorkItem,
 } from '../protocol/types.js'
 import { compactIfNeeded, DEFAULT_COMPACTION, estimateTokens, HardLimitExceededError, type CompactionOptions } from './compaction.js'
-import { CorrectionBudget } from './corrections.js'
+import { CorrectionBudget, progressFacts } from './corrections.js'
 import { refreshResourceChecks } from './resource-refresh.js'
 import { DefaultRuntimePolicy, type RuntimePolicy } from './policy.js'
 import { createHash, randomUUID } from 'node:crypto'
@@ -60,6 +62,8 @@ export interface WorkProcessor {
 }
 
 export interface AgentRuntimeOptions {
+  /** Compact history, synthesize memory and describe resolved approvals with a smaller model. */
+  smallModel?: ModelDriver
   policy?: RuntimePolicy
   heartbeatMs?: number
   compaction?: Partial<CompactionOptions>
@@ -104,6 +108,7 @@ export class AgentRuntime {
   private readonly modelTrace: Required<Pick<ModelTracePolicy, 'sampleRate' | 'retentionDays'>> & Pick<ModelTracePolicy, 'redact'>
   private readonly rootModelBudget: Required<RootModelBudgetOptions>
   private readonly onModelCall: ModelCallObserver | undefined
+  private readonly smallModel: ModelDriver
   private readonly processors = new Map<string, WorkProcessor | 'conversation'>()
   private readonly eventSeqByRun = new Map<string, number>()
 
@@ -115,9 +120,11 @@ export class AgentRuntime {
   ) {
     this.policy = options.policy ?? new DefaultRuntimePolicy()
     this.heartbeatMs = options.heartbeatMs ?? 5_000
-    this.compaction = { ...DEFAULT_COMPACTION, ...(model.contextWindowTokens ? { contextWindowTokens: model.contextWindowTokens } : {}), ...options.compaction }
+    const contextWindowTokens = Math.min(model.contextWindowTokens ?? DEFAULT_COMPACTION.contextWindowTokens,
+      options.smallModel?.contextWindowTokens ?? model.contextWindowTokens ?? DEFAULT_COMPACTION.contextWindowTokens)
+    this.compaction = { ...DEFAULT_COMPACTION, contextWindowTokens, ...options.compaction }
     this.logger = options.logger ?? nullLogger
-    this.promptContractVersion = options.promptContractVersion ?? 'prompt-v6'
+    this.promptContractVersion = options.promptContractVersion ?? 'prompt-v3.0'
     this.recordModelPayloads = options.recordModelPayloads ?? false
     this.modelTrace = { sampleRate: options.modelTrace?.sampleRate ?? 1,
       retentionDays: options.modelTrace?.retentionDays ?? 30, ...(options.modelTrace?.redact ? { redact: options.modelTrace.redact } : {}) }
@@ -127,6 +134,7 @@ export class AgentRuntime {
     if (options.modelTrace?.recordPayloads === true) this.recordModelPayloads = true
     this.rootModelBudget = { ...DEFAULT_MODEL_BUDGET, ...options.rootModelBudget }
     this.onModelCall = options.onModelCall
+    this.smallModel = options.smallModel ?? model
     for (const [name, value] of Object.entries(this.rootModelBudget)) {
       if (!Number.isSafeInteger(value) || value < (name.includes('CostMicrosPerMillion') ? 0 : 1)) throw new Error(`${name} must be a positive safe integer`)
     }
@@ -205,7 +213,7 @@ export class AgentRuntime {
     const signals = this.startSignals(work, signal)
     let activeSession: SessionRecord | null = null
     const log = this.logger.child({ runId, workId: work.id, agentId: work.agentId, fence: work.fence })
-    const model = executionModel(this.host, this.model, work, this.rootModelBudget, this.onModelCall, event => this.event(work, runId, event))
+    const model = executionModel(this.host, this.model, work, this.rootModelBudget, this.onModelCall, event => this.event(work, runId, event), this.smallModel)
 
     try {
       await this.event(work, runId, {
@@ -279,13 +287,14 @@ export class AgentRuntime {
     let contentCheckExhausted = false
     let acceptanceGaps: string[] = []
     const artifacts: KernelArtifact[] = []
+    const executedSteps = [...(context.executionSteps ?? [])]
     const evidence = () => session.request?.evidence ?? snapshotEvidence(`${work.id}:evidence:1`, [])
     let protocolCorrection: ModelItem | null = null
 
     const applySteering = async () => {
       const steers = signals.drainSteer()
       if (steers.length > 0) {
-        budget.observe(JSON.stringify(steers))
+        budget.observe(JSON.stringify(steers.map(steer => ({ id: steer.id, text: steer.text }))))
         fallbackText = undefined
         lastGood = undefined
         acceptanceGaps = []
@@ -319,19 +328,22 @@ export class AgentRuntime {
       // Dynamic context stays outside conversational history; memory snapshots
       // are recorded separately with the model call for traceability.
       const liveContext = hop === 0 ? context : await this.host.loadContext(work)
-      const dynamicItems = this.policy.dynamicContextItems(liveContext)
-      const instructions = session.promptContext?.systemInstructions ?? context.persona.instructions
+      session.promptContext = this.freezePromptContext(liveContext.promptContextCandidate ?? session.promptContext!, session.compactionEpoch, liveContext)
+      const preferenceItems = compileContext(session.promptContext.blocks ?? []).items
+      const dynamicItems = [...preferenceItems, ...this.policy.dynamicContextItems(liveContext)]
+      const instructions = session.promptContext.systemInstructions
       if (budget.rediagnose && protocolCorrection && 'role' in protocolCorrection) protocolCorrection = { ...protocolCorrection, content: 'Repeated failure without new observations: diagnose the cause and change the approach before another attempt. ' + protocolCorrection.content }
       const supplementalItems = [...dynamicItems, ...evidenceItems(evidence()), ...(session.request ? requestItems(session.request) : []), ...(protocolCorrection ? [protocolCorrection] : [])]
       if (liveContext.priorArtifacts?.length) supplementalItems.push({ role: 'user', content:
         `Prior attempt artifact records (untrusted file metadata, not current delivery or proof of file availability). Check the files and call attach_file for any still required deliverables:\n${JSON.stringify(liveContext.priorArtifacts)}` })
       const estimateOverhead = () => estimateTokens([{ role: 'system', content: instructions }, ...supplementalItems])
-        + (model.maxOutputTokens ?? 8_192) + (model.toolDefinitionTokens ?? 1_024)
+        + (model.maxOutputTokens ?? 8_192) + (model.maxThinkingTokens ?? 0) + (model.toolDefinitionTokens ?? 1_024)
+        + Buffer.byteLength(JSON.stringify((liveContext.tools ?? []).map(tool => ({ type: 'function', function: { name: tool.name, description: tool.description, parameters: tool.parameters } }))))
       let overheadTokens = estimateOverhead()
       let memoryForModel = liveContext.memory
       if (memoryForModel && estimateTokens(session.history) + overheadTokens > this.compaction.contextWindowTokens * this.compaction.hardRatio) {
         const { memory: _memory, ...withoutMemory } = liveContext
-        supplementalItems.splice(0, dynamicItems.length, ...this.policy.dynamicContextItems(withoutMemory))
+        supplementalItems.splice(0, dynamicItems.length, ...preferenceItems, ...this.policy.dynamicContextItems(withoutMemory))
         memoryForModel = undefined
         overheadTokens = estimateOverhead()
       }
@@ -347,8 +359,8 @@ export class AgentRuntime {
         throw new HardLimitExceededError('input and reserved output exceed the context budget; original request was preserved')
       }
 
-      const modelItems = [...session.history, ...supplementalItems]
-      const modelInput = { instructions, items: modelItems }
+      const modelItems = observationItems([...session.history, ...supplementalItems], 'turn-context')
+      const modelInput = { instructions, items: modelItems, tools: liveContext.tools ?? [] }
       const inputSha256 = createHash('sha256').update(JSON.stringify(modelInput)).digest('hex')
       const modelCallId = model.nextCallId?.() ?? `${work.id}:${work.fence}:model:${hop + 1}`
       const sample = Number.parseInt(inputSha256.slice(0, 8), 16) / 0xffffffff < this.modelTrace.sampleRate
@@ -412,7 +424,7 @@ export class AgentRuntime {
       )
 
       let assessment: GoalAssessment | undefined
-      if (calls.length === 0 && turn.finalCandidate !== undefined && /^\s*\{/.test(turn.finalCandidate)) {
+      if (calls.length === 0 && turn.finalCandidate !== undefined) {
         try {
           if (!session.request) throw new Error('final candidate requires the original request')
           const candidate = parseFinalCandidate(turn.finalCandidate, session.request)
@@ -476,8 +488,9 @@ export class AgentRuntime {
         if (!violation) violation = this.policy.validateCompletion?.(turn.text, assessment ?? { status: 'satisfied', checks: [], gaps: [] }, liveContext) ?? null
         let contentCheckError: string | undefined
         let resourceGaps: string[] = []
+        if (liveContext.pendingApproval?.approved === false) resourceGaps.push('The human rejected the required action; the original requested change was not completed')
         let fileObservations: import('../outcome/verification.js').VerificationRecord[] = []
-        let needsContentCheck = Boolean(artifacts.length || session.request?.contract || session.request?.resourceChecks?.some(record =>
+        let needsContentCheck = Boolean(session.request && requiresReview(session.request, executedSteps, liveContext.tools ?? [], artifacts) || liveContext.dependencies?.length || artifacts.length || session.request?.contract || session.request?.resourceChecks?.some(record =>
           (record.result.value as Record<string, unknown> | undefined)?.['requestVersion'] === session.request!.revisions.length + 1))
         if (!violation && this.host.verifyCandidate) {
           const checked = await this.host.verifyCandidate(work, { body: turn.text.trim(), artifacts,
@@ -521,17 +534,21 @@ export class AgentRuntime {
         }
         if (!violation && needsContentCheck && session.request) {
           const check = await checkCandidateContent(model, session.request, turn.text.trim(), artifacts,
-            this.compaction.contextWindowTokens, signals.lifecycle.signal, resourceGaps, fileObservations)
+            this.compaction.contextWindowTokens, signals.lifecycle.signal, resourceGaps, fileObservations,
+            { steps: (liveContext.executionSteps ?? []).filter(step => !step.kind.startsWith('runtime.')).map(step => ({ id: step.id, requestVersion: step.requestVersion, kind: step.kind, output: step.output })),
+              dependencies: liveContext.dependencies ?? [] })
           await signals.refresh()
           if (signals.leaseLost()) throw signals.leaseLost()!
           if (signals.lifecycle.signal.aborted) throw new RunCancelledError('lifecycle')
           if (signals.hasSteer()) continue
           await this.event(work, runId, { kind: 'response.content_checked', stage: 'completed', visibility: 'internal', data: check })
+          await this.host.saveStep?.(work, { id: `review:${randomUUID()}`, kind: 'runtime.review', requestVersion: check.requestVersion,
+            input: { workId: work.id, candidateHash: check.candidateHash }, output: JSON.stringify(check), artifacts: [] })
           contentCheckError = 'error' in check ? check.error : undefined
           acceptanceGaps = [...resourceGaps, ...(contentCheckError ? [contentCheckError] : []),
             ...check.missing.map(item => `Content review finding for ${JSON.stringify(item.quote)}: ${item.reason}`)]
           if (check.missing.length) {
-            if (!budget.consume('content_acceptance', JSON.stringify(check.missing))) {
+            if (!budget.consume('content_acceptance', 'candidate requirements remain unmet')) {
               contentCheckExhausted = true
               fallbackText = turn.text.trim()
               break
@@ -582,6 +599,7 @@ export class AgentRuntime {
       }
 
       for (const call of calls) call.stepId ??= `step:${randomUUID()}`
+      executedSteps.push(...calls.map(call => ({ id: call.stepId!, kind: call.name, requestVersion: session.request!.revisions.length + 1, input: {}, artifacts: [] })))
       session.history.push(...turn.output)
       await this.host.saveSession(work, session)
       const onlyReads = calls.every(call => liveContext.tools?.some(tool => tool.name === call.name && tool.effect === 'read'))
@@ -781,11 +799,13 @@ export class AgentRuntime {
       const failures = receipts.filter(receipt => !receipt.result.ok && !receipt.result.approval)
       let correction: ModelItem | undefined
       if (failures.length) {
-        const failure = JSON.stringify([call.name, call.arguments, failures.map(receipt => [receipt.action, receipt.result.error])])
-        if (!budget.consume('kernel_error', failure)) throw new ModelBudgetExceededError('Same operation failed six times without new observations')
+        const failure = JSON.stringify([call.name, failures.map(receipt => [receipt.action, receipt.result.error])])
+        if (!budget.consume('kernel_error', failure)) throw new ModelBudgetExceededError('Same operation failed three times without new resource or action state')
         correction = { role: 'user', content: 'Inspect the recorded failures before proceeding. Reconcile unknown effects; do not repeat them under a new identity.' }
-      } else budget.observe(JSON.stringify({ stdout: execution.stdout, result: execution.result, artifacts: execution.artifacts,
-        observations: receipts.map(receipt => ({ action: receipt.action, result: receipt.result })) }))
+      } else {
+        const facts = progressFacts({ artifacts: execution.artifacts, observations: receipts.map(receipt => ({ action: receipt.action, result: receipt.result })) })
+        if (JSON.stringify(facts) !== '{}') budget.observe(JSON.stringify(facts))
+      }
       session.history.push({ type: 'function_call_output', callId: call.callId, output })
       await this.event(work, runId, {
         kind: 'ipython.completed', stage: 'completed', visibility: 'internal',
@@ -953,21 +973,18 @@ export class AgentRuntime {
     }
     session.compactionEpoch ??= 0
     if (session.request?.workId !== work.id) {
+      if (session.request) session.history.push({
+        role: 'user', content: JSON.stringify({ source: `history:request:${session.request.workId}`,
+          version: String(session.request.revisions.length + 1), trust: 'observation', truncated: false,
+          content: JSON.stringify({ originalText: session.request.originalText, revisions: session.request.revisions }) }),
+      })
       session.request = snapshotRequest(context)
     }
 
-    // A prompt-contract version change invalidates everything derived from it.
-    if (session.promptContext && session.promptContext.sourceVersions['promptContract'] !== this.promptContractVersion) {
-      delete session.promptContext
-    }
-    const candidate = context.promptContextCandidate
-    if (candidate && (
-      !session.promptContext
-      || session.promptContext.sourceVersions['persona'] !== candidate.sourceVersions['persona']
-      || JSON.stringify(session.promptContext.capabilities) !== JSON.stringify(candidate.capabilities)
-    )) {
-      session.promptContext = this.freezePromptContext(candidate, session.compactionEpoch, context)
-    }
+    const candidate = context.promptContextCandidate ?? { version: 3, epoch: 0, assembledAt: '', systemInstructions: '',
+      persona: context.persona, capabilities: context.capabilities, sourceVersions: {} }
+    const compiled = this.freezePromptContext(candidate, session.compactionEpoch, context)
+    if (session.promptContext?.fingerprint !== compiled.fingerprint) session.promptContext = compiled
 
     if (!session.appliedWorkIds.includes(work.id)) {
       session.history.push(...this.policy.turnInputItems(context, session.history.length > 0))
@@ -987,12 +1004,22 @@ export class AgentRuntime {
   }
 
   private freezePromptContext(candidate: PromptContext, epoch: number, context: TurnContext): PromptContext {
+    const blocks: ContextBlock[] = [
+      { source: 'product:rules', version: this.promptContractVersion, trust: 'product', truncated: false,
+        content: this.policy.productRules(candidate, context) },
+      { source: 'runtime:authorization', version: fingerprint(this.policy.kernelCapabilities(context)), trust: 'platform', truncated: false,
+        content: JSON.stringify({ grants: this.policy.kernelCapabilities(context) }) },
+      { source: 'persona', version: fingerprint(context.persona), trust: 'preference', truncated: false, content: JSON.stringify(context.persona) },
+    ]
+    const compiled = compileContext(blocks)
     return {
       ...structuredClone(candidate),
       epoch,
       assembledAt: new Date().toISOString(),
       sourceVersions: { ...candidate.sourceVersions, promptContract: this.promptContractVersion },
-      systemInstructions: this.policy.assembleSystemPrompt(candidate, context),
+      version: 3, blocks,
+      fingerprint: fingerprint({ compiled: compiled.fingerprint, schemas: context.tools, versions: candidate.sourceVersions }),
+      systemInstructions: compiled.instructions,
     }
   }
 

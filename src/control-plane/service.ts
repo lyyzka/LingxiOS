@@ -22,6 +22,7 @@ import { isDeepStrictEqual } from 'node:util'
 import { snapshotEvidence } from '../context/evidence.js'
 import { createResponseEnvelope, snapshotArtifacts } from '../outcome/envelope.js'
 import { parseFinalCandidate } from '../outcome/assessment.js'
+import { requiresReview, validateCompletion } from '../outcome/completion.js'
 import type { KernelArtifact } from '../protocol/types.js'
 import { errorMessage } from '../errors.js'
 import { nullLogger, type Logger } from '../logging.js'
@@ -120,6 +121,7 @@ export class ControlPlaneService {
     if (step.kind === 'runtime.checkpoint') {
       const state = step.input
       if (typeof state['last'] !== 'string' || !Number.isSafeInteger(state['count']) || Number(state['count']) < 0 || Number(state['count']) > 6
+        || state['protocolRepairs'] !== undefined && (!Number.isSafeInteger(state['protocolRepairs']) || Number(state['protocolRepairs']) < 0 || Number(state['protocolRepairs']) > 3)
         || !Array.isArray(state['observations']) || state['observations'].length > 2048
         || state['observations'].some(value => typeof value !== 'string' || !/^[a-f0-9]{64}$/.test(value))) throw new ControlPlaneError(400, 'invalid progress checkpoint')
     }
@@ -292,8 +294,9 @@ export class ControlPlaneService {
       await this.validateWait(work, completion.goalOutcome)
       if (completion.goalOutcome.status === 'satisfied' || completion.goalOutcome.status === 'delegated') {
         const committed = await this.deps.delivery.getMessage?.(work)
-        if (!committed?.envelope.assessment || !isDeepStrictEqual(committed.envelope.goalOutcome, completion.goalOutcome)
+        if (!committed || !isDeepStrictEqual(committed.envelope.goalOutcome, completion.goalOutcome)
           || committed.body !== completion.resultText) throw new ControlPlaneError(409, 'goal outcome requires the committed assessed response')
+        if (request) validateCompletion(committed.body, committed.envelope.assessment, request, completion.goalOutcome, [])
       }
     }
     const ok = await this.deps.work.complete(proof.id, proof.fence, hashToken(proof.leaseToken), completion)
@@ -350,7 +353,7 @@ export class ControlPlaneService {
     }
     const grants = await this.deps.capabilityResolver.resolve(work)
     if (typeof work.meta?.['text'] === 'string' && !grants.some(grant => grant.name === 'task')) grants.push({ name: 'task', methods: TASK_TOOLS.map(tool => tool.action.split('.')[1]!) })
-    return { work: { ...work, leaseToken: proof.leaseToken }, ...context, ...(checkpoint ? { executionCheckpoint: checkpoint.input as unknown as import('../runtime/corrections.js').ProgressCheckpoint } : {}), grants, dependencies: await this.deps.work.children?.(work) ?? [], tools: grantedTools(this.deps.tools ?? TASK_TOOLS, grants), priorArtifacts: [...priorArtifacts.values()] }
+    return { work: { ...work, leaseToken: proof.leaseToken }, ...context, executionSteps: steps, ...(checkpoint ? { executionCheckpoint: checkpoint.input as unknown as import('../runtime/corrections.js').ProgressCheckpoint } : {}), grants, dependencies: await this.deps.work.children?.(work) ?? [], tools: grantedTools(this.deps.tools ?? TASK_TOOLS, grants), priorArtifacts: [...priorArtifacts.values()] }
   }
 
   // -------------------------------------------------------------------------
@@ -635,7 +638,8 @@ export class ControlPlaneService {
     if (!session?.request?.evidence) throw new ControlPlaneError(409, 'response requires a saved request and evidence snapshot')
     if (session.request.workId !== work.id) throw new ControlPlaneError(409, 'response request belongs to another work item')
     const evidence = session.request.evidence
-    const recordedArtifacts = snapshotArtifacts((await this.deps.steps?.list(work.id) ?? []).flatMap(step => step.artifacts))
+    const steps = await this.deps.steps?.list(work.id) ?? []
+    const recordedArtifacts = snapshotArtifacts(steps.flatMap(step => step.artifacts))
     const artifacts = snapshotArtifacts(message.envelope.artifacts)
     if (artifacts.some(artifact => !recordedArtifacts.some(recorded => isDeepStrictEqual(recorded, artifact)))) {
       throw new ControlPlaneError(409, 'response artifact has no durable execution record')
@@ -643,6 +647,8 @@ export class ControlPlaneService {
     if (message.envelope.requestVersion !== session.request.revisions.length + 1) {
       throw new ControlPlaneError(409, 'response request version is stale')
     }
+    const latestRequest = await this.heartbeat(proof)
+    if (message.envelope.requestVersion !== (latestRequest.steer?.length ?? 0) + 1) throw new ControlPlaneError(409, 'response request version is stale')
     if (message.envelope.goalOutcome.status === 'delegated'
       && !await this.deps.work.hasPendingChild(work, message.envelope.goalOutcome.taskRef, message.envelope.requestVersion)) {
       throw new ControlPlaneError(409, 'delegated task is not pending for this request')
@@ -651,10 +657,17 @@ export class ControlPlaneService {
     let expected
     try {
       const assessment = message.envelope.assessment
-      if (assessment) {
-        parseFinalCandidate(JSON.stringify({ body: message.body, ...assessment }), session.request)
-
+      const gaps: string[] = []
+      if (requiresReview(session.request, steps, this.deps.tools ?? TASK_TOOLS, artifacts)
+        || (await this.deps.work.children?.(work) ?? []).length) {
+        const hash = candidateHash({ body: message.body, requestVersion: message.envelope.requestVersion, artifacts })
+        const review = steps.findLast(step => step.kind === 'runtime.review' && step.requestVersion === message.envelope.requestVersion
+          && step.input['workId'] === work.id && step.input['candidateHash'] === hash)
+        const checked = review?.output ? JSON.parse(review.output) : undefined
+        if (!checked || checked.error || checked.workId !== work.id || checked.candidateHash !== hash
+          || checked.requestVersion !== message.envelope.requestVersion || !Array.isArray(checked.missing) || checked.missing.length) gaps.push('Complex candidate lacks an independent review for this request version and content')
       }
+      validateCompletion(message.body, assessment, session.request, message.envelope.goalOutcome, gaps)
       if (message.envelope.goalOutcome.status === 'delegated' && (assessment?.status !== 'delegated'
         || assessment.taskRef !== message.envelope.goalOutcome.taskRef)) throw new Error('missing delegated self-assessment')
       if (message.envelope.goalOutcome.status === 'satisfied') {

@@ -263,7 +263,7 @@ export async function createLingxiLoop(options: LingxiLoopOptions) {
       }
       const base = { persona, capabilities, ...(memory ? { memory } : {}), ...((roleCompletion === undefined && !productTeacherContext) ? {} : { dynamic: { ...(roleCompletion === undefined ? {} : { roleCompletion }), ...(productTeacherContext ? { teacherContext: productTeacherContext } : {}) } }),
         messages: [{ ref: work.triggerRef, authorId: work.principalId, authorName: String(work.meta?.['authorName'] ?? 'User'), authorKind: 'human' as const, body: text, createdAt: work.createdAt ?? '' }],
-        promptContextCandidate: { version: 2 as const, epoch: 0, assembledAt: '', systemInstructions: '', persona, capabilities, sourceVersions: { persona: JSON.stringify(persona), ...(memory ? { memory: memory.id } : {}) } },
+        promptContextCandidate: { version: 3 as const, epoch: 0, assembledAt: '', systemInstructions: '', persona, capabilities, sourceVersions: { persona: JSON.stringify(persona), ...(memory ? { memory: memory.id } : {}) } },
       }
       return enrichLingxiLoopContext(database, work, services, await binding(work.tenantId, work.sessionId, work.agentId), base)
     } },

@@ -35,9 +35,9 @@ export class LingxiLoopRuntimePolicy extends DefaultRuntimePolicy {
     })
   }
 
-  override assembleSystemPrompt(candidate: PromptContext, context: TurnContext): string {
+  override productRules(candidate: PromptContext, context: TurnContext): string {
     const role = roleOf(context)
-    return `${super.assembleSystemPrompt(candidate, context)}\n\n# LingxiLoop runtime policy\nExecution role: ${role}. `
+    return `${super.productRules(candidate, context)}\n\n# LingxiLoop runtime policy\nExecution role: ${role}. `
       + 'The message author identifies you as an agent; never impersonate the human principal. Preserve the requested answer format. '
       + 'Cite retrieved knowledge with its supplied #cite-Sn marker immediately after the supported claim. '
       + 'Only report satisfied when every requested deliverable and role-specific handoff or report has been durably completed; queued, delegated, pending, or unverified work is incomplete.'

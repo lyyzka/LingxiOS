@@ -19,11 +19,15 @@ it('asks through real Python, exposes the question and continues after a human r
     let body = ''
     request.on('data', chunk => { body += chunk })
     request.on('end', () => {
+    if (!JSON.parse(body).stream) {
+      response.writeHead(200, { 'content-type': 'application/json' })
+      response.end(JSON.stringify({ model: 'test', choices: [{ message: { content: '{"missing":[]}' }, finish_reason: 'stop' }] }))
+      return
+    }
       requests++
       if (requests > 1) resumedContext = body
       const delta = requests === 1 ? { tool_calls: [{ index: 0, id: 'ask', function: { name: 'ipython',
-        arguments: JSON.stringify({ code: 'host.task.ask(question="Which city?")\nraise RuntimeError("must not execute after asking")' }) } }] } : { content: JSON.stringify({ body: 'Use Shanghai.', status: 'blocked',
-          checks: [{ requirement: 'Shanghai', status: 'met', basis: 'The continuation supplied the city.' }], gaps: ['This fixture supplies no itinerary.'] }) }
+        arguments: JSON.stringify({ code: 'host.task.ask(question="Which city?")\nraise RuntimeError("must not execute after asking")' }) } }] } : { content: 'Use Shanghai.' }
       response.writeHead(200, { 'content-type': 'text/event-stream' })
       response.end(`data: ${JSON.stringify({ choices: [{ delta, finish_reason: requests === 1 ? 'tool_calls' : 'stop' }] })}\n\ndata: [DONE]\n\n`)
     })

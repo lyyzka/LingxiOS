@@ -30,11 +30,11 @@ it('preserves exact long input and ordered revisions independently of history', 
   const snapshot = snapshotRequest(context)
   context.messages[0]!.body = 'changed'
   snapshot.revisions.push({ id: 'r', text: '现在请给完整答案。', createdAt: 'later' })
-  assert.deepEqual(requestItems(snapshot), [{ role: 'user', content: text }, { role: 'user', content: '现在请给完整答案。' }])
+  assert.deepEqual(requestItems(snapshot).map(item => 'content' in item ? JSON.parse(item.content).content : undefined), [text, '现在请给完整答案。'])
   assert.equal(snapshot.authorId, 'u')
   snapshot.contract = createTaskContract(text, 2, { deliverables: ['Answer'], constraints: [], actions: [], acceptance: ['Complete'] })
   assert.equal(requestItems(snapshot).length, 3)
-  assert.deepEqual(requestItems(snapshot)[0], { role: 'user', content: text })
+  assert.equal(JSON.parse((requestItems(snapshot)[0] as { content: string }).content).content, text)
   snapshot.revisions.push({ id: 'r2', text: 'New constraint', createdAt: 'later' })
   assert.equal(requestItems(snapshot).length, 3)
   assert.equal(JSON.stringify(requestItems(snapshot)).includes('Derived task checklist'), false)

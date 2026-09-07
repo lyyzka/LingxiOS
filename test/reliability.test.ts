@@ -11,6 +11,35 @@ import { toolCatalog } from '../src/tools/catalog.js'
 import { setTimeout as delay } from 'node:timers/promises'
 import { executionModel, DEFAULT_MODEL_BUDGET } from '../src/model/execution.js'
 import { ModelDriverError } from '../src/errors.js'
+import type { ModelDriver } from '../src/model/driver.js'
+import { DEFAULT_MODEL, DEFAULT_SMALL_MODEL } from '../src/model/openai.js'
+
+it('routes small work without splitting root budgets or assigning approval decisions to a model', async () => {
+  for (const kind of ['turn', 'resume', 'memory_synthesis']) {
+    const work: WorkItem = { id: kind, tenantId: 't', agentId: 'a', sessionId: 's', kind,
+      lane: kind === 'resume' ? 'approval' : 'interactive', triggerRef: 'm', fence: 1, homeEpoch: 1, leaseToken: 'token' }
+    const calls: string[] = [], reservations: Array<number | undefined> = [], settled: string[] = []
+    const usage = { available: true, inputTokens: 1, outputTokens: 1 }
+    const driver = (modelId: string, maxOutputTokens: number): ModelDriver => ({ modelId, maxOutputTokens,
+      run: async () => { calls.push(modelId + ':run'); return { text: 'Recorded result.', output: [], model: modelId, usage } },
+      structured: async () => { calls.push(modelId + ':review'); return { value: {}, model: modelId, usage } },
+      compact: async () => { calls.push(modelId + ':compact'); return { value: '{}', model: modelId, usage } } })
+    const model = executionModel({ reserveModelCall: async (_work, _id, limits) => {
+      reservations.push(limits.reservedOutputTokens)
+      return { allowed: true, remainingCalls: 9, remainingTokens: 99999, remainingCostMicros: 99999, deadlineAt: new Date(Date.now() + 5000).toISOString() }
+    }, recordModelUsage: async (_work, id, _usage, observation) => { settled.push(id + ':' + observation?.model) } },
+    driver(DEFAULT_MODEL.id, 8192), work, { ...DEFAULT_MODEL_BUDGET, maxModelCalls: 3 }, undefined, undefined, driver(DEFAULT_SMALL_MODEL.id, 2048))
+    await model.run({ instructions: '', items: [] })
+    await model.structured({ instructions: '', input: {} })
+    await model.compact({ instructions: '', items: [] })
+    await assert.rejects(model.run({ instructions: '', items: [] }), /model budget exhausted/)
+    const turnModel = kind === 'turn' ? DEFAULT_MODEL.id : DEFAULT_SMALL_MODEL.id
+    const reviewModel = kind === 'memory_synthesis' ? DEFAULT_SMALL_MODEL.id : DEFAULT_MODEL.id
+    assert.deepEqual(calls, [turnModel + ':run', reviewModel + ':review', DEFAULT_SMALL_MODEL.id + ':compact'])
+    assert.deepEqual(reservations, [kind === 'turn' ? 8192 : 2048, kind === 'memory_synthesis' ? 2048 : 8192, 2048])
+    assert.deepEqual(settled, [`${kind}:1:model:1:${turnModel}`, `${kind}:1:model:2:${reviewModel}`, `${kind}:1:model:3:${DEFAULT_SMALL_MODEL.id}`])
+  }
+})
 
 it('continues beyond twelve steps, bounds concurrent reads, and stops an unstarted write at approval', async () => {
   const work: WorkItem = { id: 'long', tenantId: 't', agentId: 'a', sessionId: 's', principalId: 'u', kind: 'turn',

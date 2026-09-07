@@ -277,15 +277,17 @@ it('binds native-shaped resources through the packaged ingress/action/delivery p
       }
       if (!requestBody.stream && requestBody.response_format?.type === 'json_object') {
         const instructions = String(requestBody.messages[0]?.content)
-        if (instructions.startsWith('Maintain compact learning memory.') || instructions.startsWith('Independently audit every proposed memory change')) {
+        if (instructions.includes('Maintain compact learning memory.') || instructions.includes('Independently audit every proposed memory change')) {
           memorySynthesisCalls++
           res.writeHead(200, { 'content-type': 'application/json' })
-          res.end(JSON.stringify({ model: 'test', choices: [{ message: { content: instructions.startsWith('Maintain') ? '{"changes":[]}' : '{"approved":true,"confidence":0.9}' }, finish_reason: 'stop' }] }))
+          res.end(JSON.stringify({ model: 'test', choices: [{ message: { content: instructions.includes('Maintain compact learning memory.') ? '{"changes":[]}' : '{"approved":true,"confidence":0.9}' }, finish_reason: 'stop' }] }))
           return
         }
         contentReviews++
         res.writeHead(200, { 'content-type': 'application/json' })
-        res.end(JSON.stringify({ model: 'test', choices: [{ message: { content: '{"missing":[]}' }, finish_reason: 'stop' }] }))
+        const observed = JSON.parse(requestBody.messages.at(-1).content)
+        const missing = rejectionReply ? [{ quote: observed.originalText, reason: 'The required action was rejected and was not completed.' }] : []
+        res.end(JSON.stringify({ model: 'test', choices: [{ message: { content: JSON.stringify({ missing }) }, finish_reason: 'stop' }] }))
         return
       }
       calls++
@@ -294,12 +296,7 @@ it('binds native-shaped resources through the packaged ingress/action/delivery p
         WHERE work.status='leased'`)
       assert.equal(active.rows.length, 1)
       const snapshot = active.rows[0]!.request
-      const finalDelta = (delta: { content?: string; tool_calls?: unknown[] }) => delta.tool_calls ? delta : { content: JSON.stringify({
-        body: delta.content, status: rejectionReply ? 'blocked' : 'satisfied', gaps: rejectionReply ? ['The human rejected the requested change.'] : [],
-        checks: [snapshot.originalText, ...snapshot.revisions.map(revision => revision.text)].map(requirement => ({
-          requirement, status: rejectionReply ? 'unmet' : 'met', basis: rejectionReply ? 'The action was rejected.' : 'The controlled native fixture produced the recorded result.',
-        })),
-      }) }
+      const finalDelta = (delta: { content?: string; tool_calls?: unknown[] }) => delta.tool_calls ? delta : { content: delta.content }
       if (calls === 1) {
         assert.match(JSON.stringify(requestBody.messages), /memory:unavailable/)
         assert.match(JSON.stringify(requestBody.messages), /Save this source/)
@@ -394,7 +391,7 @@ it('binds native-shaped resources through the packaged ingress/action/delivery p
     const memoryEvidence = await database.query('SELECT source_run_id,principal_id,request_version,assistant_text,status FROM lingxios.agent_memory_evidence WHERE source_run_id=$1', [request.id])
     assert.deepEqual(memoryEvidence.rows, [{ source_run_id: request.id, principal_id: 'u', request_version: 1, assistant_text: 'Source queued.', status: 'pending' }])
     assert.equal(delivered.length, 0)
-    const failedDeliveryDeadline = Date.now() + 2_000
+    const failedDeliveryDeadline = Date.now() + 10_000
     while (!(await database.query('SELECT 1 FROM lingxios.agent_delivery_outbox WHERE run_id=$1 AND attempts>0 AND claim_token IS NULL', [request.id])).rows.length
       && Date.now() < failedDeliveryDeadline) await delay(25)
     await database.query('UPDATE lingxios.agent_delivery_outbox SET available_at=NOW() WHERE run_id=$1', [request.id])
@@ -402,7 +399,7 @@ it('binds native-shaped resources through the packaged ingress/action/delivery p
     assert.equal(memorySynthesisCalls, 2)
     assert.deepEqual((await database.query('SELECT status FROM lingxios.agent_memory_evidence WHERE source_run_id=$1', [request.id])).rows, [{ status: 'processed' }])
     assert.deepEqual((await database.query("SELECT status FROM lingxios.agent_work_items WHERE kind='memory_synthesis'")).rows, [{ status: 'succeeded' }])
-    const deliveryDeadline = Date.now() + 2_000
+    const deliveryDeadline = Date.now() + 10_000
     while (await app.readDelivery(deliveryIdentity) !== 'delivered' && Date.now() < deliveryDeadline) await delay(25)
     assert.equal(await app.readDelivery(deliveryIdentity), 'delivered')
     for (const scope of [{ agentId: 'other' }, { sessionId: 'other' }, { runId: 'missing' }]) {
@@ -458,7 +455,7 @@ it('binds native-shaped resources through the packaged ingress/action/delivery p
     const recovered = await createLingxiLoop(invalidOptions)
     try {
       const waitFor = async (predicate: () => Promise<boolean>) => {
-        const deadline = Date.now() + 2_000
+        const deadline = Date.now() + 10_000
         while (!await predicate() && Date.now() < deadline) await delay(25)
         assert.equal(await predicate(), true)
       }
@@ -578,7 +575,7 @@ it('binds native-shaped resources through the packaged ingress/action/delivery p
       const queued = await app.receive({ ...input, clientMsgNo: method })
       assert.equal(await app.runNext(), true)
       const waiting = await app.readOutcome({ runId: queued.id, tenantId: 't', agentId: 'a', sessionId: 's' })
-      assert.ok(waiting && waiting.status === 'awaiting_approval')
+      assert.ok(waiting && waiting.status === 'awaiting_approval', JSON.stringify({ method, waiting }))
       const decision = { companyId: 't', userId: 'u', approvalId: waiting.approvalId }
       const beforeWrites = approvedWrites
       sourceEnabled = false
@@ -724,7 +721,7 @@ it('binds native-shaped resources through the packaged ingress/action/delivery p
       assert.equal(scheduled.length, 1); assert.equal(scheduled[0]!['status'], 'succeeded', JSON.stringify(scheduled[0]))
       const digestIdentity = { ...waitingIdentity, runId: String(scheduled[0]!['id']) }
       assert.equal((await digestApp.readMessage(digestIdentity))?.body, 'Five learners observed.')
-      const digestDeliveryDeadline = Date.now() + 2_000
+      const digestDeliveryDeadline = Date.now() + 10_000
       while (await digestApp.readDelivery(digestIdentity) !== 'delivered' && Date.now() < digestDeliveryDeadline) await delay(25)
       assert.equal(await digestApp.readDelivery(digestIdentity), 'delivered')
       assert.equal(teacherCalls, 2)

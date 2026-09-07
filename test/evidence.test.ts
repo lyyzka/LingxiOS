@@ -155,12 +155,12 @@ it('uses the original evidence across hops and rejects a tampered final envelope
   const contract = createTaskContract(contracted.request!.originalText, 1, { deliverables: ['Explain with sources'], constraints: [], actions: [], acceptance: ['Supported explanation'] })
   contracted.request!.contract = contract
   await service.saveSession(work, contracted)
-  await assert.rejects(service.commitResult(work, messages[0]!), /inconsistent/)
+  await assert.rejects(service.commitResult(work, messages[0]!), /inconsistent|evidence or artifact records/)
   const withContract = structuredClone(messages[0]!)
   withContract.envelope!.taskContract = contract
   const replacedContract = structuredClone(withContract)
   replacedContract.envelope!.taskContract!.deliverables = ['Different deliverable']
-  await assert.rejects(service.commitResult(work, replacedContract), /inconsistent/)
+  await assert.rejects(service.commitResult(work, replacedContract), /inconsistent|evidence or artifact records/)
   assert.equal(messages.length, 1)
   const savedSession = (await sessions.get(sessionKeyOf(work)))!
   const missingSnapshot = t.mock.method(sessions, 'get', async () => null)

@@ -32,7 +32,7 @@ export async function doctor(options: { database?: SqlQueryable; pythonCommand?:
       checks.push({ name, status: 'failed', detail: 'required packaged resource is missing' })
     }
   }
-  checks.push({ name: 'model_configuration', status: env['AGENT_OS_MODEL_API_KEY']?.trim() ? 'passed' : 'failed', detail: 'Checks credential configuration presence only; model defaults to DeepSeek-V4-Flash with high reasoning. Provider access and quality are not tested.' })
+  checks.push({ name: 'model_configuration', status: env['AGENT_OS_MODEL_API_KEY']?.trim() ? 'passed' : 'failed', detail: 'Checks credential configuration presence only; main conversations default to DeepSeek-V4-Flash and small tasks to Qwen3.5-4B. Provider access and quality are not tested.' })
   if (options.database) {
     try {
       await checkStorage(options.database)

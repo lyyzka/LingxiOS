@@ -57,11 +57,11 @@ for (const format of ['object', 'plain text'] as const) it(`preserves ${format} 
     const usage = { available: false, inputTokens: 0, outputTokens: 0 }
     if (++turns === 1) return { usage, text: '', output: [{ type: 'function_call', callId: 'create', name: 'ipython', arguments: '{"code":"create_file()"}' }] }
     const candidate = format === 'plain text' ? 'File created.' : JSON.stringify({ body: 'File created.', status: 'satisfied', checks: [], gaps: [] })
-    return { usage, text: candidate, output: [{ role: 'assistant', content: candidate }], finalCandidate: candidate }
+    return { usage, text: candidate, output: [{ role: 'assistant', content: candidate }], ...(format === 'object' ? { finalCandidate: candidate } : {}) }
   } }
   await new AgentRuntime(host, model, { execute: async () => ({ executionId: 'execution', stdout: '', stderr: '', result: null,
     artifacts: [artifact], directives: [], truncated: false, durationMs: 1 }) }).runWork(work)
-  assert.equal(turns, format === 'object' ? 7 : 2)
+  assert.equal(turns, format === 'object' ? 4 : 2)
   assert.equal(committed, true)
 })
 
@@ -119,7 +119,7 @@ it('drops optional recalled memory before allowing it to crowd out the original 
   const unexpected = async () => { throw new Error('unexpected auxiliary call') }
   const model: ModelDriver = {
     run: async request => {
-      assert.ok(request.items.some(item => 'role' in item && item.content === original))
+      assert.ok(request.items.some(item => 'role' in item && item.content.includes(original)))
       assert.doesNotMatch(JSON.stringify(request.items), /optional memory/)
       return { text: '', output: [], finalCandidate: JSON.stringify({
         body: 'Answer.', status: 'satisfied', gaps: [], checks: [{ requirement: 'Original requirement', status: 'met', basis: 'Answer supplied.' }],
@@ -165,7 +165,7 @@ it('reviews complex candidates against original requirements, bounds corrections
         completion = { status: 'completed', resultText: body, goalOutcome: message.envelope.goalOutcome }
         assert.notEqual(message.envelope?.goalOutcome.verification, 'passed')
         assert.deepEqual(message.envelope?.resourceChecks?.[0], resourceChecks[0])
-        assert.equal(message.envelope?.resourceChecks?.length, mode === 'exhausted' ? 7 : mode === 'fixed' ? 3 : 2)
+        assert.equal(message.envelope?.resourceChecks?.length, mode === 'exhausted' ? 4 : mode === 'fixed' ? 3 : 2)
       },
       completeWork: async (_work, value) => { completion = value }, yieldWork: async () => {},
     }
@@ -186,17 +186,17 @@ it('reviews complex candidates against original requirements, bounds corrections
         assert.equal((request.input as { originalText: string }).originalText, originalText)
         const observations = (request.input as { resourceChecks: typeof resourceChecks }).resourceChecks
         assert.deepEqual(observations[0], resourceChecks[0])
-        assert.equal(observations.length, reviews + 1)
+        assert.equal(observations.length, mode === 'steered' ? 2 : reviews + 1)
         assert.deepEqual(observations.at(-1)?.result.value.observed, { cost: 20 })
         assert.doesNotMatch(request.instructions, /Mission/)
-        return { value: { missing: mode === 'fixed' && reviews === 2 ? []
+        return { value: { missing: (mode === 'fixed' || mode === 'steered') && reviews === 2 ? []
           : [{ quote: mode === 'invalid' ? 'Invented requirement' : 'include costs', reason: 'Costs are missing' }] }, model: 'fixture', usage }
       }, compact: async () => { throw new Error('unexpected compaction') },
     }
     await new AgentRuntime(host, model, { execute: async () => { throw new Error('unexpected kernel') } }).runWork(work)
     assert.equal(completion?.status, 'completed')
     assert.deepEqual(deltas, [body])
-    assert.equal(reviews, mode === 'exhausted' ? 6 : mode === 'fixed' ? 2 : 1)
+    assert.equal(reviews, mode === 'exhausted' ? 3 : mode === 'fixed' || mode === 'steered' ? 2 : 1)
     if (mode === 'fixed') {
       assert.equal(completion?.goalOutcome?.status, 'partial')
       assert.equal(body, 'Comparison with costs.')
@@ -223,11 +223,11 @@ it('preserves history across prompt upgrades and exposes assigned action receipt
     work: { id: 'w', tenantId: 't', agentId: 'a', sessionId: 's', kind: 'turn', lane: 'interactive', triggerRef: 'm', fence: 1, homeEpoch: 1, leaseToken: 'token' },
     persona: { name: 'Assistant', role: 'assistant', instructions: '' }, capabilities: ['files'], messages: [{ ref: 'm', authorId: 'u', authorName: 'User', authorKind: 'human', body: 'Save the requested file.', createdAt: 'now' }],
   }
-  context.promptContextCandidate = { version: 2, epoch: 0, assembledAt: '', systemInstructions: '',
+  context.promptContextCandidate = { version: 3, epoch: 0, assembledAt: '', systemInstructions: '',
     persona: context.persona, capabilities: context.capabilities, sourceVersions: {} }
   const session: SessionRecord = {
     key: '[\"t\",\"a\",\"s\",null]', tenantId: 't', agentId: 'a', sessionId: 's', history: [{ role: 'user', content: 'Preserve this requirement' }], appliedWorkIds: ['w'], revision: 1, compactionEpoch: 0,
-    promptContext: { version: 2, epoch: 0, assembledAt: '', systemInstructions: 'Stale prompt v5', persona: context.persona, capabilities: [], sourceVersions: { promptContract: 'prompt-v5' } },
+    promptContext: { version: 3, epoch: 0, assembledAt: '', systemInstructions: 'Stale prompt v5', persona: context.persona, capabilities: [], sourceVersions: { promptContract: 'prompt-v5' } },
   }
   let completion: WorkCompletion | undefined
   let checkpoint: SessionRecord | undefined
@@ -241,7 +241,7 @@ it('preserves history across prompt upgrades and exposes assigned action receipt
   const model: ModelDriver = {
     run: async (request) => {
       assert.deepEqual(request.items[0], { role: 'user', content: 'Preserve this requirement' })
-      assert.match(request.instructions, /## Instruction and data boundaries/)
+      assert.match(request.instructions, /Runtime authorization/)
       assert.doesNotMatch(request.instructions, /Stale prompt v5/)
       calls++
       const output: ModelItem[] = calls === 1

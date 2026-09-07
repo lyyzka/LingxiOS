@@ -6,12 +6,14 @@ import { snapshotEvidence } from '../src/context/evidence.js'
 import { createResponseEnvelope } from '../src/outcome/envelope.js'
 import type { GoalAssessment } from '../src/outcome/assessment.js'
 import type { AssistantMessage, SessionRecord } from '../src/protocol/types.js'
+import { MemoryStepStore } from '../src/control-plane/steps.js'
+import { candidateHash } from '../src/outcome/verification.js'
 
-it('requires settled actions and a committed assessment, and binds delegation to real scoped child work', async () => {
+it('requires settled actions and a reviewed committed response, and binds delegation to real scoped child work', async () => {
   for (const delegated of [false, true]) {
     const workStore = new MemoryWorkStore(), actions = new MemoryActionLedger()
     let committed: AssistantMessage | null = null
-    const service = new ControlPlaneService({ work: workStore, actions, sessions: new MemorySessionStore(), events: new MemoryEventStore(),
+    const service = new ControlPlaneService({ work: workStore, actions, steps: new MemoryStepStore(), sessions: new MemorySessionStore(), events: new MemoryEventStore(),
       contextProvider: { loadContext: async () => { throw new Error('unexpected') } },
       capabilityResolver: { resolve: async () => [] }, actionExecutor: { execute: async () => { throw new Error('unexpected') } },
       delivery: { onEvent: async () => {}, getMessage: async () => committed,
@@ -48,6 +50,10 @@ it('requires settled actions and a committed assessment, and binds delegation to
       await actions.reserve(action.idempotencyKey, 'fingerprint', { workId: 'w', tenantId: 't', principalId: 'u', agentId: 'a', sessionId: 's', threadId: null, requestVersion: 1, action })
       await assert.rejects(service.commitResult(work, message), /evidence or artifact records/)
       await actions.record(action.idempotencyKey, { ok: true, value: 'saved' })
+      await assert.rejects(service.commitResult(work, message), /evidence or artifact records/)
+      const hash = candidateHash({ body: message.body, requestVersion: 1, artifacts: [] })
+      await service.saveStep(work, { id: 'review', kind: 'runtime.review', requestVersion: 1,
+        input: { workId: work.id, candidateHash: hash }, output: JSON.stringify({ workId: work.id, candidateHash: hash, requestVersion: 1, missing: [] }), artifacts: [] })
     }
     await service.commitResult(work, message)
     if (delegated) await workStore.requestCancel('child')

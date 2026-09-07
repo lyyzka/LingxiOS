@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
 import {
-  DEFAULT_COMPACTION, HardLimitExceededError, compactIfNeeded, estimateTokens, summaryItem,
+  DEFAULT_COMPACTION, HardLimitExceededError, boundSummary, compactIfNeeded, estimateTokens, summaryItem,
 } from '../src/runtime/compaction.js'
 import type {
   CompactionRequest, CompactionResult, ModelDriver, ModelTurnRequest, ModelTurnResult,
@@ -20,7 +20,7 @@ function fakeDriver(overrides: Partial<ModelDriver> = {}): ModelDriver {
     },
     compact(request: CompactionRequest): Promise<CompactionResult> {
       return Promise.resolve({
-        value: `summary of ${request.items.length} items`,
+        value: JSON.stringify({ observedResults: `summary of ${request.items.length} items`, decisions: '', remainingWork: '', uncertainties: '' }),
         model: 'fake-model',
         usage: { available: true, inputTokens: 10, outputTokens: 5 },
       })
@@ -71,10 +71,10 @@ describe('compactIfNeeded', () => {
     const s = session(history, 'old facts')
     const driver = fakeDriver({ compact: async (request) => {
       assert.equal(request.items.filter((item) => 'role' in item && item.content.includes('old facts')).length, 1)
-      return { value: 'new summary', model: 'test', usage: { available: true, inputTokens: 1, outputTokens: 1 } }
+      return { value: JSON.stringify({ observedResults: 'new summary', decisions: '', remainingWork: '', uncertainties: '' }), model: 'test', usage: { available: true, inputTokens: 1, outputTokens: 1 } }
     } })
     await compactIfNeeded(s, '', driver, { ...DEFAULT_COMPACTION, contextWindowTokens: 100, keepTailItems: 2 })
-    assert.deepEqual(s.history, [summaryItem('new summary'), ...history.slice(-3)])
+    assert.deepEqual(s.history, [summaryItem(s.summary!), ...history.slice(-3)])
   })
 
   it('closes a moved boundary over newly included tool results', async () => {
@@ -122,35 +122,21 @@ describe('compactIfNeeded', () => {
     assert.match(s.summary ?? '', /summary of 8 items/)
   })
 
-  it('combines with any prior summary and re-summarizes past maxSummaryChars', async () => {
-    const history = longHistory(10)
-    const s = session(history, 'existing summary')
+  it('bounds each summary field without a second model call or broken JSON', async () => {
+    const history = longHistory(10), s = session(history, 'existing summary')
     let calls = 0
-    const driver = fakeDriver({
-      compact(request: CompactionRequest) {
-        calls += 1
-        if (calls === 1) {
-          return Promise.resolve({
-            value: 'x'.repeat(50),
-            model: 'fake-model',
-            usage: { available: true, inputTokens: 10, outputTokens: 5 },
-          })
-        }
-        // Second call re-summarizes the combined (over-length) summary.
-        assert.equal(request.items.length, 1)
-        return Promise.resolve({
-          value: 'recompacted summary',
-          model: 'fake-model-2',
-          usage: { available: true, inputTokens: 3, outputTokens: 2 },
-        })
-      },
-    })
-    const outcome = await compactIfNeeded(s, 'instructions', driver, { ...smallOptions, maxSummaryChars: 10 })
-    assert.equal(calls, 2)
-    assert.equal(outcome.compacted, true)
-    assert.equal(s.summary, 'recompacte')
-    assert.equal(outcome.usage?.inputTokens, 13)
-    assert.equal(outcome.usage?.outputTokens, 7)
+    const raw = JSON.stringify({ observedResults: 'x'.repeat(500), decisions: 'Keep receipts.', remainingWork: 'Verify file.', uncertainties: 'Unknown write.' })
+    const driver = fakeDriver({ compact: async request => {
+      calls++
+      assert.match(JSON.stringify(request.items), /existing summary/)
+      return { value: raw, model: 'fake-model', usage: { available: true, inputTokens: 10, outputTokens: 5 } }
+    } })
+    const outcome = await compactIfNeeded(s, '', driver, { ...smallOptions, maxSummaryChars: 640 })
+    assert.equal(calls, 1)
+    assert.equal(s.summary, boundSummary(raw, 640))
+    assert.ok(s.summary!.length <= 640)
+    assert.deepEqual(JSON.parse(s.summary!).truncated, ['observedResults'])
+    assert.deepEqual(outcome.usage, { model: 'fake-model', available: true, inputTokens: 10, outputTokens: 5 })
   })
 
   it('tolerates compaction failure below the hard limit', async () => {

@@ -22,13 +22,19 @@ const children = []
 let modelCalls = 0
 let heldCompletion = false
 let holdCompletion = true
-const model = createServer((req, res) => {
-  req.resume()
+const model = createServer(async (req, res) => {
+  const chunks = []
+  for await (const chunk of req) chunks.push(chunk)
+  const request = JSON.parse(Buffer.concat(chunks).toString())
+  if (!request.stream) {
+    res.writeHead(200, { 'content-type': 'application/json' })
+    res.end(JSON.stringify({ model: 'fixture', choices: [{ message: { content: '{"missing":[]}' }, finish_reason: 'stop' }] }))
+    return
+  }
   modelCalls++
   const delta = modelCalls === 1 ? { tool_calls: [{ index: 0, id: 'write-file', type: 'function',
     function: { name: 'ipython', arguments: JSON.stringify({ code: 'with open("answer.txt", "w") as f:\n    f.write("4")\nattach_file("answer.txt")' }) } }] }
-    : { content: JSON.stringify({ body: '4', status: 'satisfied', gaps: [],
-      checks: [{ requirement: 'Write answer.txt containing 4 and attach it.', status: 'met', basis: 'The Python cell created the file and returned its artifact.' }] }) }
+    : { content: '4' }
   res.writeHead(200, { 'content-type': 'text/event-stream' })
   res.end(`data: ${JSON.stringify({ model: 'fixture', choices: [{ index: 0, delta, finish_reason: modelCalls === 1 ? 'tool_calls' : 'stop' }] })}\n\ndata: [DONE]\n\n`)
 })
@@ -36,15 +42,15 @@ let controlPort
 const proxy = createServer(async (req, res) => {
   const chunks = []
   for await (const chunk of req) chunks.push(chunk)
-  if (holdCompletion && req.url.endsWith('/complete')) {
-    heldCompletion = true
-    return // Simulate a lost completion request after durable message commit.
-  }
   try {
     const response = await fetch(`http://127.0.0.1:${controlPort}${req.url}`, {
       method: req.method, headers: { authorization: req.headers.authorization ?? '', 'content-type': 'application/json' },
       ...(chunks.length ? { body: Buffer.concat(chunks) } : {}),
     })
+    if (holdCompletion && req.url.endsWith('/result') && response.ok) {
+      heldCompletion = true
+      return // Lose the acknowledgement after atomic message/work commit.
+    }
     res.writeHead(response.status, { 'content-type': 'application/json' }).end(await response.text())
   } catch { res.writeHead(502).end('{}') }
 })
@@ -92,12 +98,13 @@ try {
   await pool.query("UPDATE lingxios.agent_os_session_leases SET expires_at=NOW()-INTERVAL '1 minute'")
   await pool.query("UPDATE lingxios.agent_os_workers SET last_seen_at=NOW()-INTERVAL '1 day'")
   const replacement = worker('replacement')
-  await until(async () => (await pool.query('SELECT status FROM lingxios.agent_work_items WHERE id=$1', [identity.runId])).rows[0].status === 'completed')
+  await until(async () => (await pool.query('SELECT 1 FROM lingxios.agent_os_workers WHERE worker_id=$1', ['replacement'])).rows.length === 1)
+  assert.equal((await pool.query('SELECT status FROM lingxios.agent_work_items WHERE id=$1', [identity.runId])).rows[0].status, 'succeeded')
   assert.deepEqual(await app.readMessage(identity), committed)
-  assert.deepEqual(await app.readOutcome(identity), { status: 'satisfied', verification: 'not_run', requestVersion: 1 })
+  assert.deepEqual(await app.readOutcome(identity), { status: 'satisfied', verification: 'inconclusive', requestVersion: 1 })
   assert.equal((await app.readArtifact(identity, 'answer.txt'))?.bytes.toString(), '4')
   assert.equal(modelCalls, 2, 'recovery must not regenerate the committed response or file')
-  assert.equal((await pool.query("SELECT count(*)::int AS count FROM lingxios.agent_run_events WHERE run_id=$1 AND kind='response.recovered'", [identity.runId])).rows[0].count, 1)
+  assert.equal((await pool.query("SELECT count(*)::int AS count FROM lingxios.agent_run_events WHERE run_id=$1 AND kind='response.recovered'", [identity.runId])).rows[0].count, 0, 'an atomically committed work item needs no execution replay')
   // Windows kill() does not deliver a POSIX signal to the JS shutdown handler.
   replacement.child.kill(process.platform === 'win32' ? 'SIGKILL' : 'SIGTERM')
   assert.deepEqual(await replacement.exit, process.platform === 'win32' ? [null, 'SIGKILL'] : [0, null], replacement.stderr)

@@ -128,7 +128,7 @@ try {
   await db.query('INSERT INTO lingxios.agent_os_sessions(session_key,tenant_id,agent_id,session_id,request_snapshot) VALUES($1,$2,$3,$4,$5::jsonb)', [JSON.stringify(['t', 'agent', 'room', null]), 't', 'agent', 'room', JSON.stringify(request)])
   const pending = await requestDocumentApproval(pool, services, work, action)
   await db.query('INSERT INTO lingxios.agent_action_ledger(idempotency_key,result) VALUES($1,$2::jsonb)', ['delete', JSON.stringify(pending)])
-  await db.query("UPDATE lingxios.agent_work_items SET status='completed',goal_outcome=$1::jsonb WHERE id='work'", [JSON.stringify({ status: 'awaiting_approval', verification: 'not_run', requestVersion: 1, approvalId: pending.approval.id })])
+  await db.query("UPDATE lingxios.agent_work_items SET status='waiting',goal_outcome=$1::jsonb WHERE id='work'", [JSON.stringify({ status: 'awaiting_approval', verification: 'not_run', requestVersion: 1, approvalId: pending.approval.id })])
   const decision = { companyId: 't', userId: 'human', approvalId: pending.approval.id }
   await db.exec("UPDATE users SET suspended_at=NOW() WHERE id='human'")
   await assert.rejects(approveDocument(pool, services, decision), error => error.reason === 'ACTOR_INACTIVE')

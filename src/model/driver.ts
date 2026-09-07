@@ -12,7 +12,7 @@ export interface ModelUsage {
 
 export interface ModelTurnResult {
   callId?: string
-  /** Structured final response; the runtime validates it against the captured request. */
+  /** Optional explicit structured self-assessment from a driver; plain answers use text. */
   finalCandidate?: string
   /** Items to append to session history (assistant text and/or tool calls). */
   output: ModelItem[]
@@ -57,6 +57,7 @@ export interface CompactionResult {
 }
 
 export interface ModelDriver {
+  readonly maxThinkingTokens?: number
   /** Runtime owns retries so each outbound request reserves and settles its own budget. */
   singleAttempt?(): ModelDriver
   nextCallId?(): string

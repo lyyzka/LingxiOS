@@ -81,9 +81,14 @@ const modelServer = http.createServer((request, response) => {
   let body = ''
   request.on('data', chunk => { body += chunk })
   request.on('end', () => {
+    if (!JSON.parse(body).stream) {
+      response.writeHead(200, { 'content-type': 'application/json' })
+      response.end(JSON.stringify({ model: 'test', choices: [{ message: { content: '{"missing":[]}' }, finish_reason: 'stop' }] }))
+      return
+    }
     modelCalls++
     assert.match(body, /Calculate six times seven/)
-    const delta = modelCalls === 1 ? { tool_calls: [{ index: 0, id: 'calculate', function: { name: 'ipython', arguments: JSON.stringify({ code: 'print(6 * 7)' }) } }] } : { content: JSON.stringify({ body: '42', status: 'satisfied', gaps: [], checks: [{ requirement: 'Calculate six times seven using Python.', status: 'met', basis: 'Python returned 42.' }] }) }
+    const delta = modelCalls === 1 ? { tool_calls: [{ index: 0, id: 'calculate', function: { name: 'ipython', arguments: JSON.stringify({ code: 'print(6 * 7)' }) } }] } : { content: '42' }
     response.writeHead(200, { 'content-type': 'text/event-stream' })
     response.end('data: ' + JSON.stringify({ choices: [{ delta, finish_reason: modelCalls === 1 ? 'tool_calls' : 'stop' }] }) + '\\n\\ndata: [DONE]\\n\\n')
   })

@@ -1,5 +1,7 @@
 # 首发 Harness / AgentOS 开发状态
 
+以下内容保留为 v2 历史记录。当前通用提示词、纯文本完成和独立复核规则以 [Harness v3](harness-v3.md) 为准；产品架构迁移在另一工作树进行。
+
 以 2026-09-06 用户最新要求为准：继续对照当前 LingxiLoop 补齐全部产品能力。当前不存在生产数据，交付单一首发架构；仅提供初始 schema version 1，不提供历史数据导入、schema 升级、旧协议兼容或双写路径。
 
 邮件原生能力已重新接入：`whoami/contacts/inbox/show` 使用 Agent 邮箱身份并先校验持久化人类的当前会话读取权限；`send/reply` 绑定收件人、主题、正文及当前会话已提交附件到版本化人工审批，批准时重新授权和复核预览，以动作键调用原生幂等投递，执行回执落库后才恢复任务。演示文稿 `approve_outline` 已接通原生 schema，并把标题、完整 outline 与 expected revision 绑定到版本化人工审批；批准时重新读取并拒绝陈旧 outline，原生幂等执行回执落库后才恢复任务。邮件真实 PostgreSQL/provider 执行检查仍待补齐。

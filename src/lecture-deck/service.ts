@@ -1,3 +1,4 @@
+import { auxiliaryInstructions } from '../context/compiler.js'
 import { createHash, randomUUID } from 'node:crypto'
 import type { ModelDriver } from '../model/driver.js'
 import type { WorkProcessor } from '../runtime/runtime.js'
@@ -321,6 +322,7 @@ export class ModelLectureAuthor implements LectureAuthor {
       value => parseSlideSpec(value, { id: input.pageId, order: input.order, chapterId: input.chapter.id, evidence: input.evidence }), signal)
   }
   private async generate<T>(instructions: string, input: unknown, parse: (value: unknown) => T, signal?: AbortSignal): Promise<T> {
+    instructions = auxiliaryInstructions(instructions)
     let correction: unknown
     for (let attempt = 0; attempt < 3; attempt++) {
       const result = await this.model.structured({ instructions, input: correction ? { input, correction } : input, signal })
@@ -342,7 +344,7 @@ export class ModelLectureReviewer implements LectureReviewer {
       }
       let remaining = 40
       const evidence = deck.evidence.map(snapshot => { const items = snapshot.items.filter(item => used.get(snapshot.id)?.has(item.marker)).slice(0, remaining).map(item => ({ ...item, excerpt: item.excerpt.slice(0, 2_000) })); remaining -= items.length; return { ...snapshot, items } }).filter(snapshot => snapshot.items.length)
-      const result = await this.model.structured({ instructions: 'Independently review these lecture pages for citation support, teaching continuity, meaningful visuals, skipped prerequisites, and professional readability. Return strict JSON {"passed":boolean,"issues":[{"code":"string","message":"string","pageId":"optional","objectId":"optional"}]}. Do not claim browser geometry was checked.', input: { course: deck.course, slides, evidence }, signal })
+      const result = await this.model.structured({ instructions: auxiliaryInstructions('Independently review these lecture pages for citation support, teaching continuity, meaningful visuals, skipped prerequisites, and professional readability. Return strict JSON {"passed":boolean,"issues":[{"code":"string","message":"string","pageId":"optional","objectId":"optional"}]}. Do not claim browser geometry was checked.'), input: { course: deck.course, slides, evidence }, signal })
       const report = result.value as ValidationReport
       if (!report || typeof report.passed !== 'boolean' || !Array.isArray(report.issues) || report.issues.some(issue => !issue || typeof issue.code !== 'string' || typeof issue.message !== 'string')) throw new Error('lecture reviewer returned an invalid report')
       if (!report.passed && report.issues.length === 0) issues.push({ code: 'review.rejected', message: 'Reviewer rejected these slides without a detailed issue' })

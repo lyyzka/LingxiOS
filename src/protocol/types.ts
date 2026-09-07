@@ -241,7 +241,9 @@ export function sessionKeyOf(work: Pick<WorkItem, 'tenantId' | 'agentId' | 'sess
  * stay warm across turns.
  */
 export interface PromptContext {
-  version: 2
+  version: 3
+  fingerprint?: string
+  blocks?: import('../context/compiler.js').ContextBlock[]
   epoch: number
   assembledAt: string
   systemInstructions: string
@@ -271,6 +273,8 @@ export interface ContextMessage {
  * into the session.
  */
 export interface TurnContext {
+  executionSteps?: import('../control-plane/steps.js').ExecutionStep[]
+  productRules?: string
   executionCheckpoint?: import('../runtime/corrections.js').ProgressCheckpoint
   dependencies?: Array<{ id: string; status: string; resultText: string | null; goalOutcome: import('./outcome.js').GoalOutcome | null | undefined }>
   grants?: CapabilityGrant[]
