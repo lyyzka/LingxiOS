@@ -6,7 +6,7 @@
  */
 import type { ModelDriver } from '../model/driver.js'
 import type { ModelItem, SessionRecord } from '../protocol/types.js'
-import { COMPACTION_INSTRUCTIONS } from '../context/compiler.js'
+import { COMPACTION_PROMPT } from '../context/compiler.js'
 
 export function boundSummary(raw: string, maxChars: number): string {
   const value = JSON.parse(raw) as Record<string, unknown>
@@ -109,7 +109,7 @@ export async function compactIfNeeded(
     summarize.unshift(summaryItem(priorSummary))
   }
   try {
-    const call = await model.compact({ instructions: COMPACTION_INSTRUCTIONS, items: summarize, signal })
+    const call = await model.compact({ instructions: COMPACTION_PROMPT.instructions, prompt: COMPACTION_PROMPT.manifest, items: summarize, signal })
     const combined = boundSummary(call.value, options.maxSummaryChars)
     const usage = { model: call.model, ...call.usage }
     session.summary = combined

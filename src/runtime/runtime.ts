@@ -1,5 +1,6 @@
 import { appendResearchEvidence } from '../context/research-evidence.js'
-import { compileContext, fingerprint, observationItems, type ContextBlock } from '../context/compiler.js'
+import { contextItem, observationItems } from '../context/compiler.js'
+import { buildPromptContext, PROMPT_CONTRACT_VERSION } from '../prompts/provider.js'
 import { requiresReview } from '../outcome/completion.js'
 import { appendResourceCheck } from '../context/resource-checks.js'
 import { createTaskContract } from '../context/task-contract.js'
@@ -38,7 +39,7 @@ import type { ModelDriver } from '../model/driver.js'
 import { RUN_SEQUENCE_SPAN } from '../protocol/constants.js'
 import {
   sessionKeyOf, actionKeyOf,
-  type AssistantMessage, type ModelItem, type PromptContext, type RunEvent,
+  type AssistantMessage, type ModelItem, type RunEvent,
   type SessionRecord, type SteerInput, type TurnContext, type WorkItem,
 } from '../protocol/types.js'
 import { compactIfNeeded, DEFAULT_COMPACTION, estimateTokens, HardLimitExceededError, type CompactionOptions } from './compaction.js'
@@ -124,7 +125,7 @@ export class AgentRuntime {
       options.smallModel?.contextWindowTokens ?? model.contextWindowTokens ?? DEFAULT_COMPACTION.contextWindowTokens)
     this.compaction = { ...DEFAULT_COMPACTION, contextWindowTokens, ...options.compaction }
     this.logger = options.logger ?? nullLogger
-    this.promptContractVersion = options.promptContractVersion ?? 'prompt-v3.0'
+    this.promptContractVersion = options.promptContractVersion ?? PROMPT_CONTRACT_VERSION
     this.recordModelPayloads = options.recordModelPayloads ?? false
     this.modelTrace = { sampleRate: options.modelTrace?.sampleRate ?? 1,
       retentionDays: options.modelTrace?.retentionDays ?? 30, ...(options.modelTrace?.redact ? { redact: options.modelTrace.redact } : {}) }
@@ -328,8 +329,8 @@ export class AgentRuntime {
       // Dynamic context stays outside conversational history; memory snapshots
       // are recorded separately with the model call for traceability.
       const liveContext = hop === 0 ? context : await this.host.loadContext(work)
-      session.promptContext = this.freezePromptContext(liveContext.promptContextCandidate ?? session.promptContext!, session.compactionEpoch, liveContext)
-      const preferenceItems = compileContext(session.promptContext.blocks ?? []).items
+      session.promptContext = buildPromptContext(liveContext, this.policy, session.compactionEpoch, this.promptContractVersion)
+      const preferenceItems = (session.promptContext.blocks ?? []).filter(block => block.trust !== 'platform' && block.trust !== 'product').map(contextItem)
       const dynamicItems = [...preferenceItems, ...this.policy.dynamicContextItems(liveContext)]
       const instructions = session.promptContext.systemInstructions
       if (budget.rediagnose && protocolCorrection && 'role' in protocolCorrection) protocolCorrection = { ...protocolCorrection, content: 'Repeated failure without new observations: diagnose the cause and change the approach before another attempt. ' + protocolCorrection.content }
@@ -349,6 +350,7 @@ export class AgentRuntime {
       }
       const compacted = await compactIfNeeded(session, instructions, model, this.compaction, signals.lifecycle.signal, overheadTokens)
       if (compacted.compacted) {
+        session.promptContext.epoch = session.compactionEpoch
         await this.host.saveSession(work, session)
         await this.event(work, runId, {
           kind: 'session.compacted', stage: 'completed', visibility: 'internal',
@@ -372,6 +374,7 @@ export class AgentRuntime {
         model: model.modelId ?? 'unknown', providerConfigSha256: model.configurationFingerprint ?? 'unknown', inputSha256,
         ...(this.recordModelPayloads && sample ? { input: tracePayload(modelInput) } : {}), traceExpiresAt,
         sessionRevision: session.revision, compactionEpoch: session.compactionEpoch,
+        prompt: session.promptContext.manifest, promptFingerprint: session.promptContext.fingerprint,
         promptContractVersion: this.promptContractVersion, toolProtocol: 'ipython-v1', decision: protocolCorrection ? 'correction' : hop === 0 ? 'initial' : 'continue',
       } })
       let turn
@@ -379,6 +382,7 @@ export class AgentRuntime {
         protocolCorrection = null
         turn = await model.run({
           instructions,
+          ...(session.promptContext.manifest ? { prompt: session.promptContext.manifest } : {}),
           items: modelItems,
           ...(liveContext.tools ? { tools: liveContext.tools } : {}),
           signal: signals.lifecycle.signal,
@@ -981,10 +985,7 @@ export class AgentRuntime {
       session.request = snapshotRequest(context)
     }
 
-    const candidate = context.promptContextCandidate ?? { version: 3, epoch: 0, assembledAt: '', systemInstructions: '',
-      persona: context.persona, capabilities: context.capabilities, sourceVersions: {} }
-    const compiled = this.freezePromptContext(candidate, session.compactionEpoch, context)
-    if (session.promptContext?.fingerprint !== compiled.fingerprint) session.promptContext = compiled
+    session.promptContext = buildPromptContext(context, this.policy, session.compactionEpoch, this.promptContractVersion)
 
     if (!session.appliedWorkIds.includes(work.id)) {
       session.history.push(...this.policy.turnInputItems(context, session.history.length > 0))
@@ -1001,26 +1002,6 @@ export class AgentRuntime {
       session.appliedWorkIds = [...session.appliedWorkIds, work.id].slice(-200)
     }
     return session
-  }
-
-  private freezePromptContext(candidate: PromptContext, epoch: number, context: TurnContext): PromptContext {
-    const blocks: ContextBlock[] = [
-      { source: 'product:rules', version: this.promptContractVersion, trust: 'product', truncated: false,
-        content: this.policy.productRules(candidate, context) },
-      { source: 'runtime:authorization', version: fingerprint(this.policy.kernelCapabilities(context)), trust: 'platform', truncated: false,
-        content: JSON.stringify({ grants: this.policy.kernelCapabilities(context) }) },
-      { source: 'persona', version: fingerprint(context.persona), trust: 'preference', truncated: false, content: JSON.stringify(context.persona) },
-    ]
-    const compiled = compileContext(blocks)
-    return {
-      ...structuredClone(candidate),
-      epoch,
-      assembledAt: new Date().toISOString(),
-      sourceVersions: { ...candidate.sourceVersions, promptContract: this.promptContractVersion },
-      version: 3, blocks,
-      fingerprint: fingerprint({ compiled: compiled.fingerprint, schemas: context.tools, versions: candidate.sourceVersions }),
-      systemInstructions: compiled.instructions,
-    }
   }
 
   // -------------------------------------------------------------------------

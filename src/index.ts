@@ -22,3 +22,6 @@ export type { KernelExecutor, ManagedKernelExecutor, KernelHostBridge } from './
 export { DefaultRuntimePolicy, type RuntimePolicy } from './runtime/policy.js'
 export type { ModelCallObservation, ModelCallObserver } from './runtime/runtime.js'
 export type { CapabilityGrant, ContextMessage, ModelItem, PromptContext, TurnContext, WorkItem } from './protocol/types.js'
+
+export { buildPromptContext, PROMPT_CONTRACT_VERSION } from './prompts/provider.js'
+export { compileContext, compileAuxiliaryPrompt, type ContextBlock, type CompiledContext, type PromptManifest } from './context/compiler.js'

@@ -1,4 +1,5 @@
 import { snapshotEvidence } from '../src/context/evidence.js'
+import { textSha256 } from '../src/context/compiler.js'
 import { createTaskContract } from '../src/context/task-contract.js'
 import assert from 'node:assert/strict'
 import { it } from 'node:test'
@@ -29,6 +30,7 @@ it('reports every processor model call to the product ledger with durable work s
   await runtime.runWork(work)
   assert.equal(completed?.status, 'completed')
   assert.deepEqual(observations.map(({ latencyMs: _latencyMs, ...value }) => value), [{
+    instructionsSha256: textSha256('i'),
     callId: 'ledger-work:3:model:1', purpose: 'structured', workId: 'ledger-work', tenantId: 'tenant',
     agentId: 'agent', sessionId: 'room', threadId: 'thread', principalId: 'human', model: 'model-v1',
     usage: { available: true, inputTokens: 11, outputTokens: 7 }, status: 'succeeded',

@@ -26,6 +26,8 @@ export interface ModelTurnResult {
 export interface ModelTurnRequest {
   tools?: readonly import('../tools/catalog.js').ToolDefinition[]
   instructions: string
+  /** Local diagnostics, never sent as provider request fields. */
+  prompt?: import('../context/compiler.js').PromptManifest
   items: readonly ModelItem[]
   signal?: AbortSignal | undefined
   /** Called as assistant text streams; used for latency, not for delivery. */
@@ -34,6 +36,8 @@ export interface ModelTurnRequest {
 
 export interface StructuredCallRequest {
   instructions: string
+  /** Local diagnostics, never sent as provider request fields. */
+  prompt?: import('../context/compiler.js').PromptManifest
   input: unknown
   signal?: AbortSignal | undefined
 }
@@ -46,6 +50,8 @@ export interface StructuredCallResult {
 
 export interface CompactionRequest {
   instructions: string
+  /** Local diagnostics, never sent as provider request fields. */
+  prompt?: import('../context/compiler.js').PromptManifest
   items: readonly ModelItem[]
   signal?: AbortSignal | undefined
 }
