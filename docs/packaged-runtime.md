@@ -12,7 +12,7 @@ The consuming product owns authentication, authorization policy, native services
 
 `packageResources()` returns the package schema and Python runner. Apply the schema in an explicit product migration while holding that product's migration lock. Application startup must call its own migration-readiness check before `createLingxiOS()` and must not execute package DDL.
 
-Every public entry uses runtime version `2.0.0`, schema `7`, control-plane protocol `5`, Kernel protocol `2`, and assistant message `2`. Consumers should pin the exact npm version and verify the installed schema marker.
+Every public entry uses runtime version `2.1.0`, schema `7`, control-plane protocol `5`, Kernel protocol `2`, and assistant message `2`. Consumers should pin the exact npm version and verify the installed schema marker.
 
 The package exports only:
 

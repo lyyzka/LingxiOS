@@ -1,3 +1,4 @@
+import { COMPACTION_PROMPT, textSha256, type PromptManifest } from '../context/compiler.js'
 import { setTimeout as delay } from 'node:timers/promises'
 import { createHash } from 'node:crypto'
 import { ModelBudgetExceededError, ModelDriverError, errorMessage } from '../errors.js'
@@ -19,6 +20,8 @@ export function modelPricing(limits: Pick<Required<RootModelBudgetOptions>, 'inp
 
 export interface ModelCallObservation {
   cost?: { amountMicros: number; usage: 'measured' | 'estimated'; pricing: ModelPricing }
+  prompt?: PromptManifest
+  instructionsSha256?: string
   callId: string
   logicalCallId?: string
   purpose: 'agent-turn' | 'structured' | 'compaction' | 'embedding'
@@ -57,9 +60,12 @@ export function modelExecution(host: Pick<HostPort, 'reserveModelCall' | 'record
   let sequence = 0, calls = 0, tokens = 0, cost = 0
   const started = Date.now()
   const invoke = async <T extends { model?: string; usage: ModelUsage }>(purpose: ModelCallObservation['purpose'],
-    request: { signal?: AbortSignal | undefined; input?: unknown }, operation: (signal: AbortSignal) => Promise<T>, callModel = model): Promise<T> => {
+    request: { signal?: AbortSignal | undefined; input?: unknown; instructions?: string; prompt?: PromptManifest }, operation: (signal: AbortSignal) => Promise<T>, callModel = model): Promise<T> => {
+    const instructionsSha256 = request.instructions === undefined ? undefined : textSha256(request.instructions)
+    if (request.prompt && request.prompt.instructionsSha256 !== instructionsSha256) throw new Error('prompt manifest does not match model instructions')
     const logicalCallId = `${work.id}:${work.fence}:${namespace}:${++sequence}`
-    const input = Buffer.byteLength(JSON.stringify(request)) + (callModel.toolDefinitionTokens ?? 0)
+    const { prompt: _prompt, ...providerRequest } = request
+    const input = Buffer.byteLength(JSON.stringify(providerRequest)) + (callModel.toolDefinitionTokens ?? 0)
     const output = (callModel.maxOutputTokens ?? 8192) + (callModel.maxThinkingTokens ?? 0)
     const reservedCost = Math.ceil((input * limits.inputCostMicrosPerMillion + output * limits.outputCostMicrosPerMillion) / 1_000_000)
     for (let attempt = 1; ; attempt++) {
@@ -83,7 +89,8 @@ export function modelExecution(host: Pick<HostPort, 'reserveModelCall' | 'record
       const began = Date.now()
       await emit?.({
         kind: 'model.request.started', stage: 'started', visibility: 'internal',
-        data: { callId, logicalCallId, purpose, model: callModel.modelId ?? 'unknown' } })
+        data: { callId, logicalCallId, purpose, model: callModel.modelId ?? 'unknown',
+          ...(request.prompt ? { prompt: request.prompt } : {}), ...(instructionsSha256 ? { instructionsSha256 } : {}) } })
       let result: T | undefined, failure: unknown
       try { result = await abortable(operation(signal), signal) } catch (error) { failure = error }
       const usage = result?.usage
@@ -92,6 +99,7 @@ export function modelExecution(host: Pick<HostPort, 'reserveModelCall' | 'record
       const costMicros = Math.ceil((inputTokens * limits.inputCostMicrosPerMillion + outputTokens * limits.outputCostMicrosPerMillion) / 1_000_000)
       tokens += inputTokens + outputTokens - input - output; cost += costMicros - reservedCost
       const observation: ModelCallObservation = {
+        ...(request.prompt ? { prompt: request.prompt } : {}), ...(instructionsSha256 ? { instructionsSha256 } : {}),
         callId, ...(attempt > 1 ? { logicalCallId } : {}), purpose,
         workId: work.id, tenantId: work.tenantId, agentId: work.agentId, sessionId: work.sessionId,
         ...(work.threadId !== undefined ? { threadId: work.threadId } : {}), ...(work.principalId ? { principalId: work.principalId } : {}),
@@ -134,6 +142,9 @@ export function executionModel(host: Pick<HostPort, 'reserveModelCall' | 'record
     ...(model.toolDefinitionTokens === undefined ? {} : { toolDefinitionTokens: model.toolDefinitionTokens }),
     run: request => invoke('agent-turn', request, signal => model.run({ ...request, signal })),
     structured: request => invoke('structured', request, signal => reviewer.structured({ ...request, signal }), reviewer),
-    compact: request => invoke('compaction', request, signal => small.compact({ ...request, signal }), small),
+    compact: request => {
+      const compiled = { ...request, instructions: COMPACTION_PROMPT.instructions, prompt: COMPACTION_PROMPT.manifest }
+      return invoke('compaction', compiled, signal => small.compact({ ...compiled, signal }), small)
+    },
   }
 }

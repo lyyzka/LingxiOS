@@ -1,5 +1,5 @@
 import type { WorkProcessor } from '../runtime/runtime.js'
-import { auxiliaryInstructions } from '../context/compiler.js'
+import { compileAuxiliaryPrompt } from '../context/compiler.js'
 import { parseMemoryChanges, type MemoryBatch } from './synthesis.js'
 import { evolutionCaseKey, parseEvolutionCandidates, type EvolutionPlan, type EvolutionReport, type EvolutionCase, type EvolutionCandidate } from './evolution.js'
 import { abortable } from '../deadline.js'
@@ -27,13 +27,14 @@ export const memorySynthesisProcessor: WorkProcessor = {
     if (!batch) return
     const signal = AbortSignal.any([context.signal, AbortSignal.timeout(90_000)])
     const call = async (purpose: string, instructions: string, input: unknown) => {
-      instructions = auxiliaryInstructions(instructions)
+      const prompt = compileAuxiliaryPrompt(purpose, instructions)
+      instructions = prompt.instructions
       const size = Buffer.byteLength(instructions) + Buffer.byteLength(JSON.stringify(input)) + (context.model.maxOutputTokens ?? 8192) + (context.model.maxThinkingTokens ?? 0)
       if (size > Math.floor((context.model.contextWindowTokens ?? 128_000) * 0.9)) throw new Error('memory synthesis exceeds model input budget')
       signal.throwIfAborted()
       const started = Date.now()
       await context.emit({ kind: 'model.started', stage: 'started', visibility: 'internal', data: { purpose } })
-      const result = await context.model.structured({ instructions, input, signal })
+      const result = await context.model.structured({ instructions, prompt: prompt.manifest, input, signal })
       signal.throwIfAborted()
       await context.emit({ kind: 'model.completed', stage: 'completed', visibility: 'internal',
         data: { purpose, model: result.model, usage: result.usage, latencyMs: Date.now() - started } })

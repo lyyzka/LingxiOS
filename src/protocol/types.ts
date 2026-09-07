@@ -238,13 +238,13 @@ export function sessionKeyOf(work: Pick<WorkItem, 'tenantId' | 'agentId' | 'sess
 }
 
 /**
- * The cache-stable prefix of the model conversation. Frozen into the session
- * and only rebuilt when a source version changes, so provider prompt caches
- * stay warm across turns.
+ * Live compiled prompt snapshot. Stable instructions lead dynamic authorization;
+ * restore always recompiles from trusted configuration, never persisted text.
  */
 export interface PromptContext {
   version: 3
   fingerprint?: string
+  manifest?: import('../context/compiler.js').PromptManifest
   blocks?: import('../context/compiler.js').ContextBlock[]
   epoch: number
   assembledAt: string

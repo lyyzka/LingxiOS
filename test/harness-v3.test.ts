@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { durableProtocol } from './protocol-fixture.js'
 import { it } from 'node:test'
-import { compileContext, observationItems } from '../src/context/compiler.js'
+import { compileContext, observationItems, textSha256 } from '../src/context/compiler.js'
 import { CorrectionBudget, progressFacts } from '../src/runtime/corrections.js'
 import { AgentRuntime } from '../src/runtime/runtime.js'
 import type { ModelDriver } from '../src/model/driver.js'
@@ -60,6 +60,8 @@ it('answers ordinary JSON verbatim with one model call and injects the current r
   const original = 'Reply with the JSON object {"city":"Hangzhou"}.'
   const result = await fixture(original, { structured: unexpected, compact: unexpected, run: async request => {
     calls++
+    assert.equal(request.prompt?.purpose, 'execution')
+    assert.equal(request.prompt?.instructionsSha256, textSha256(request.instructions))
     const content = request.items.filter(item => 'role' in item && item.role === 'user').map(item => JSON.parse((item as { content: string }).content))
     assert.equal(content.filter(block => block.content === original).length, 1)
     return { text: '{"city":"Hangzhou"}', output: [], usage }
@@ -76,6 +78,8 @@ it('independently reviews omitted requirements without relying on a model-author
     run: async () => ({ text: ++calls === 1 ? 'A and B.' : 'A costs 10; B costs 20.', output: [], usage }),
     structured: async request => {
       reviews++
+      assert.equal(request.prompt?.purpose, 'content-review')
+      assert.equal(request.prompt?.instructionsSha256, textSha256(request.instructions))
       assert.equal((request.input as { originalText: string }).originalText, 'Name both options and include their costs.')
       assert.match(request.instructions, /derived checklist can omit requirements/)
       return { model: 'reviewer', value: { missing: reviews === 1 ? [{ quote: 'include their costs', reason: 'Both prices are missing.' }] : [] }, usage }

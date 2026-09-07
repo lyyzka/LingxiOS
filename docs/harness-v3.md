@@ -16,7 +16,7 @@
 
 ## 指令职责
 
-`compileContext()` 是统一的纯函数入口。主执行、内容复核、历史压缩、记忆生成/审查共用该入口；隔离的辅助调用使用独立目的规则，不继承用户 persona。
+`buildPromptContext()` 每轮从实时配置收集产品规则、授权和偏好，`compileContext()` 负责纯函数编译。主执行和辅助调用共用该编译器；`compileAuxiliaryPrompt()` 声明独立目的，现有 `auxiliaryInstructions()` 保留兼容，不继承用户 persona。装配、缓存与审计契约见 [Prompt runtime](prompt-runtime.md)。
 
 | 层 | 来源 | 发送方式与边界 |
 | --- | --- | --- |
@@ -26,7 +26,7 @@
 | 默认偏好、派生计划 | persona、任务清单、委派说明 | 普通数据消息，不能替换原始请求或授予权限 |
 | 观察 | 工具结果、附件、记忆、历史摘要 | 普通数据消息；历史里的 system 角色会降为观察 |
 
-`ContextBlock` 保存 `source`、`version`、`trust`、`content` 与 `truncated`。`PromptContext.version` 为 3；指纹包括平台/产品内容、persona、授权方法、工具 schema 和产品来源版本，每轮重新编译。编译器不把标签当作安全边界；可信产品回调必须由应用代码配置，不能接收未经校验的模型输出作为规则。
+`ContextBlock` 保存 `source`、`version`、`trust`、`content`、`truncated` 与可选 `cache`。`PromptContext.version` 保持 3，默认提示词契约升级到 `prompt-v3.1`，新增不含正文的 `manifest`。指纹包括平台/产品内容、persona、授权方法、工具 schema 和产品来源版本，每轮重新编译。稳定指令必须位于动态指令之前；重复来源、截断的可信指令、数据声明指令缓存前缀均拒绝编译。编译器不把标签当作安全边界；可信产品回调必须由应用代码配置，不能接收未经校验的模型输出作为规则。
 
 当前原始请求及修订独立于可压缩历史。旧任务进入历史时保留来源。上下文预算使用保守 UTF-8 字节估算，包括实际业务工具定义以及正文、思考输出预留；先削减可选记忆，再压缩旧历史。必要内容超限时停止，不截断当前要求。压缩输出固定为观察结果、决定、剩余工作和不确定性四个字段，逐字段限长并标记截断，保持工具调用/结果配对。
 

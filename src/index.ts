@@ -35,3 +35,5 @@ export type { CapabilityGrant, ContextMessage, ModelItem, PromptContext, TurnCon
 export { recallMemories, readMemory, writeMemory, type MemoryScope, type MemoryMutation } from './memory/store.js'
 export type { MemoryOptions } from './memory/runtime.js'
 export type { EvolutionBenchmark, EvolutionCase, EvolutionCandidate, EvolutionReport, EvolutionReference } from './memory/evolution.js'
+export { buildPromptContext, PROMPT_CONTRACT_VERSION } from './prompts/provider.js'
+export { compileContext, compileAuxiliaryPrompt, type ContextBlock, type CompiledContext, type PromptManifest } from './context/compiler.js'
