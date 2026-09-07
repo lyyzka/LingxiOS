@@ -42,7 +42,7 @@ it('approves routines separately from activation, fences stale previews, and sco
       [candidate.idempotencyKey, 'fingerprint', JSON.stringify({ workId: 'w', tenantId: 't', agentId: 'a', sessionId: 's', threadId: 'thread', principalId: 'u', requestVersion: 1, action: candidate })])
     const result = await requestRoutineApproval(database, services, work, candidate)
     assert.ok(result.approval)
-    await database.query("UPDATE lingxios.agent_work_items SET status='completed',goal_outcome=$1 WHERE id='w'", [JSON.stringify({ status: 'awaiting_approval', approvalId: result.approval.id, requestVersion: 1 })])
+    await database.query("UPDATE lingxios.agent_work_items SET status='waiting',goal_outcome=$1 WHERE id='w'", [JSON.stringify({ status: 'awaiting_approval', approvalId: result.approval.id, requestVersion: 1 })])
     await database.query('INSERT INTO lingxios.agent_action_ledger(idempotency_key,result) VALUES($1,$2)', [candidate.idempotencyKey, JSON.stringify(result)])
     return { companyId: 't', userId: 'reviewer', approvalId: result.approval.id }
   }
@@ -130,7 +130,7 @@ it('approves routines separately from activation, fences stale previews, and sco
       ALTER TABLE participants ADD COLUMN name text DEFAULT 'Assistant', ADD COLUMN role text DEFAULT 'assistant', ADD COLUMN system_prompt text DEFAULT '';
       ALTER TABLE approvals ADD CONSTRAINT approvals_work_id_fkey FOREIGN KEY(work_id) REFERENCES lingxios.agent_work_items(id) ON DELETE CASCADE`)
     await approveRoutine(database, services, await prepare(action('activate', { routineId: id })))
-    await database.query("UPDATE lingxios.agent_work_items SET status='completed' WHERE id='w'")
+    await database.query("UPDATE lingxios.agent_work_items SET status='succeeded' WHERE id='w'")
     await due()
     const directory = await mkdtemp(join(tmpdir(), 'lingxios-routines-'))
     let calls = 0, deliveries = 0, failDelivery = false
@@ -169,12 +169,16 @@ it('approves routines separately from activation, fences stale previews, and sco
         return { messageId: message.clientMsgNo, messageSeq: deliveries }
       } }),
     }, worker: { id: 'routine-test' }, model: { id: 'test', apiKey: 'test', baseUrl: `http://127.0.0.1:${address.port}` }, kernel: { homesRoot: directory },
-    policy: new LingxiLoopRuntimePolicy({ capabilityMethods: LINGXILOOP_CAPABILITY_METHODS, requireIdentityDisclosure: false }) })
+    policy: new LingxiLoopRuntimePolicy({ capabilityMethods: LINGXILOOP_CAPABILITY_METHODS }) })
     try {
-      assert.equal(await app.runNext(), true)
+      const deadline = Date.now() + 2_000
+      while (!await app.runNext() && Date.now() < deadline) await delay(25)
+      assert.equal(calls > 0, true)
       assert.equal(calls, 2, JSON.stringify(await jobs()))
+      const deliveryDeadline = Date.now() + 2_000
+      while (deliveries === 0 && Date.now() < deliveryDeadline) await delay(25)
       assert.equal(deliveries, 1)
-      const completed = (await jobs()).find(row => row['status'] === 'completed')!
+      const completed = (await jobs()).find(row => row['status'] === 'succeeded')!
       const runIdentity = { runId: String(completed['id']), tenantId: 't', agentId: 'a', sessionId: 's', threadId: 'thread' }
       assert.equal((await app.readMessage(runIdentity))?.body, 'Scheduled summary.')
       assert.equal(await app.readDelivery(runIdentity), 'delivered')

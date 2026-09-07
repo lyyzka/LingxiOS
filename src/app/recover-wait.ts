@@ -25,7 +25,7 @@ export async function recoverWait(database: SqlPool, service: ControlPlaneServic
       AND intent.intent->>'threadId' IS NOT DISTINCT FROM $6
       AND intent.intent->'action'->>'cellId'=$7 AND (intent.intent->>'requestVersion')::integer=$8
     ORDER BY (intent.intent->'action'->>'callIndex')::integer LIMIT 101`,
-  [work.id, work.tenantId, work.agentId, work.sessionId, work.principalId ?? null, work.threadId ?? null, call.callId, requestVersion])
+  [work.id, work.tenantId, work.agentId, work.sessionId, work.principalId ?? null, work.threadId ?? null, call.stepId ?? call.callId, requestVersion])
   if (!rows.length) return false
   if (rows.length > 100 || rows.some(row => !row['result'])) {
     const goalOutcome: GoalOutcome = { status: 'blocked', verification: 'inconclusive', requestVersion,

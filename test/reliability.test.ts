@@ -1,0 +1,88 @@
+import assert from 'node:assert/strict'
+import { readFile } from 'node:fs/promises'
+import { it } from 'node:test'
+import { PGlite } from '@electric-sql/pglite'
+import { sweepLingxiLoopWatchdog } from '../src/integrations/lingxiloop/watchdog.js'
+import type { SqlPool } from '../src/control-plane/pg-store.js'
+import { AgentRuntime } from '../src/runtime/runtime.js'
+import type { HostPort } from '../src/host/port.js'
+import type { AssistantMessage, WorkItem } from '../src/protocol/types.js'
+import { toolCatalog } from '../src/tools/catalog.js'
+import { setTimeout as delay } from 'node:timers/promises'
+import { executionModel, DEFAULT_MODEL_BUDGET } from '../src/model/execution.js'
+import { ModelDriverError } from '../src/errors.js'
+
+it('continues beyond twelve steps, bounds concurrent reads, and stops an unstarted write at approval', async () => {
+  const work: WorkItem = { id: 'long', tenantId: 't', agentId: 'a', sessionId: 's', principalId: 'u', kind: 'turn',
+    lane: 'interactive', triggerRef: 'm', fence: 1, homeEpoch: 1, leaseToken: 'token' }
+  const tools = toolCatalog('data', { read: ['query'], write: ['body'] }, ['read'])
+  let calls = 0, active = 0, peak = 0, reads = 0, writes = 0, message: AssistantMessage | undefined
+  const stepIds = new Set<string>()
+  const host: HostPort = { claimWork: async () => null, heartbeat: async () => ({ ok: true }),
+    loadContext: async () => ({ work, persona: { name: 'A', role: '', instructions: '' }, capabilities: ['data'], tools,
+      messages: [{ ref: 'm', authorId: 'u', authorName: 'U', authorKind: 'human', body: 'Read the requested data.', createdAt: 'now' }] }),
+    loadSession: async () => null, saveSession: async () => {}, emitEvent: async () => {}, yieldWork: async () => {},
+    saveStep: async (_work, step) => { if (step.kind === 'data__read') stepIds.add(step.id) },
+    executeAction: async (_work, action) => {
+      if (action.action === 'task.inspect') return { ok: true, value: { requestVersion: 1, pending: [], truncated: false } }
+      assert.match(action.cellId, /^step:/)
+      assert.notEqual(action.cellId, 'provider-call')
+      if (action.action === 'data.write') { writes++; return { ok: false, approval: { id: 'approval', status: 'PENDING' } } }
+      active++; peak = Math.max(peak, active); await delay(1); active--; reads++
+      return { ok: true, value: { query: action.args['query'] } }
+    }, commitResult: async (_work, value) => { message = value }, completeWork: async (_work, value) => {
+      assert.equal(value.goalOutcome?.status, 'awaiting_approval')
+    } }
+  const unexpected = async (): Promise<never> => { throw new Error('unexpected auxiliary call') }
+  await new AgentRuntime(host, { structured: unexpected, compact: unexpected, run: async () => {
+    calls++
+    return calls <= 15 ? { text: '', output: Array.from({ length: 7 }, (_, i) => ({ type: 'function_call' as const,
+      callId: `provider-${i}`, name: 'data__read', arguments: JSON.stringify({ query: `${calls}:${i}` }) })), usage: { available: true, inputTokens: 1, outputTokens: 1 } }
+      : { text: 'Done.', output: [], usage: { available: true, inputTokens: 1, outputTokens: 1 } }
+  } }, { execute: unexpected }).runWork(work)
+  assert.deepEqual({ calls, reads, peak, steps: stepIds.size, body: message?.body }, { calls: 16, reads: 105, peak: 4, steps: 105, body: 'Done.' })
+  await new AgentRuntime(host, { structured: unexpected, compact: unexpected, run: async () => ({ text: '',
+    output: [0, 1].map(i => ({ type: 'function_call' as const, callId: `write-${i}`, name: 'data__write', arguments: '{"body":"save"}' })),
+    usage: { available: true, inputTokens: 1, outputTokens: 1 } }) }, { execute: unexpected }).runWork(work)
+  assert.equal(writes, 1)
+})
+
+it('reserves each provider attempt and settles an issued call after cancellation', async () => {
+  const work: WorkItem = { id: 'usage', tenantId: 't', agentId: 'a', sessionId: 's', threadId: '', principalId: 'u', kind: 'turn',
+    lane: 'interactive', triggerRef: 'm', fence: 2, homeEpoch: 1, leaseToken: 'token' }
+  const controller = new AbortController(), reserved: string[] = [], settled: string[] = []
+  let requests = 0
+  const model = executionModel({ reserveModelCall: async (_work, id) => {
+    reserved.push(id); return { allowed: true, remainingCalls: 9, remainingTokens: 99999, remainingCostMicros: 99999, deadlineAt: new Date(Date.now() + 5000).toISOString() }
+  }, recordModelUsage: async (_work, id, usage, observation) => {
+    settled.push(id); assert.equal(observation?.threadId, '')
+    if (requests === 2) { assert.equal(controller.signal.aborted, true); assert.equal(usage.inputTokens, 9) }
+  } }, { compact: async () => { throw new Error('unused') }, structured: async () => { throw new Error('unused') },
+    run: async () => {
+      if (++requests === 1) throw new ModelDriverError('unavailable', { kind: 'provider', status: 503, finishReasons: [] })
+      controller.abort()
+      return { text: 'done', output: [], usage: { available: true, inputTokens: 9, outputTokens: 2 } }
+    } }, work, DEFAULT_MODEL_BUDGET)
+  await model.run({ instructions: '', items: [], signal: controller.signal })
+  assert.deepEqual(reserved, ['usage:2:model:1', 'usage:2:model:1:retry:2'])
+  assert.deepEqual(settled, reserved)
+})
+
+it('preempts a healthy lower-priority lease and fences it after the grace period using real SQL', async () => {
+  const db = new PGlite()
+  const pool: SqlPool = {
+    query: async (sql, args) => { const result = await db.query<Record<string, unknown>>(sql, args); return { rows: result.rows, rowCount: result.affectedRows ?? result.rows.length } },
+    connect: async () => ({ query: pool.query, release() {} }),
+  }
+  try {
+    await db.exec(await readFile(new URL('../../db/schema.sql', import.meta.url), 'utf8'))
+    await db.exec(`INSERT INTO lingxios.agent_work_items(id,tenant_id,agent_id,session_id,kind,lane,trigger_ref,status,created_at,available_at,updated_at,lease_expires_at)
+      VALUES ('active','t','a','s','routine','background','m','leased',NOW()-INTERVAL '10 minutes',NOW()-INTERVAL '10 minutes',NOW(),NOW()+INTERVAL '45 seconds'),
+      ('waiting','t','a','s','turn','interactive','m2','queued',NOW()-INTERVAL '5 minutes',NOW()-INTERVAL '5 minutes',NOW(),NULL)`)
+    const now = new Date()
+    assert.deepEqual(await sweepLingxiLoopWatchdog(pool, now, 120_000, 30_000), { tripped: 1, fenced: 0 })
+    assert.deepEqual(await sweepLingxiLoopWatchdog(pool, new Date(now.getTime() + 31_000), 120_000, 30_000), { tripped: 0, fenced: 1 })
+    assert.deepEqual((await db.query('SELECT status,fence,preemptions FROM lingxios.agent_work_items WHERE id=$1', ['active'])).rows,
+      [{ status: 'queued', fence: 1, preemptions: 1 }])
+  } finally { await db.close() }
+})

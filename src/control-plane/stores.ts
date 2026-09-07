@@ -66,6 +66,9 @@ export interface WorkStoreOptions {
 }
 
 export interface WorkStore {
+  children?(parent: Omit<WorkItem, 'leaseToken'>): Promise<Array<{ id: string; status: string; resultText: string | null; goalOutcome: WorkCompletion['goalOutcome'] | null }>>
+  /** An issued proof identifies prior usage, never grants permission to perform new work. */
+  getAttempt?(id: string, fence: number, leaseTokenHash: string): Promise<Omit<WorkItem, 'leaseToken'> | null>
   hasPendingChild(parent: Omit<WorkItem, 'leaseToken'>, childId: string, requestVersion: number): Promise<boolean>
   ownsBudgetRoot(work: Omit<WorkItem, 'leaseToken'>, rootWorkId: string): Promise<boolean>
   enqueue(input: EnqueueWorkInput): Promise<EnqueueResult>
@@ -109,7 +112,10 @@ export interface StoreLeaseProof {
 }
 
 export interface ModelBudgetLimits {
+  maxExecutionMs?: number
   reservedTokens?: number
+  reservedInputTokens?: number
+  reservedOutputTokens?: number
   reservedCostMicros?: number
   maxModelCalls: number
   maxTokens: number
@@ -127,8 +133,9 @@ export interface ModelBudgetReservation {
 
 /** Durable budget shared by every attempt and delegated child of one root work item. */
 export interface ModelBudgetStore {
-  reserve(rootWorkId: string, callId: string, limits: ModelBudgetLimits): Promise<ModelBudgetReservation>
-  record(rootWorkId: string, callId: string, inputTokens: number, outputTokens: number, costMicros: number): Promise<void>
+  reserve(rootWorkId: string, callId: string, limits: ModelBudgetLimits, proof?: StoreLeaseProof): Promise<ModelBudgetReservation>
+  record(rootWorkId: string, callId: string, inputTokens: number, outputTokens: number, costMicros: number,
+    proof?: StoreLeaseProof, observation?: import('../model/execution.js').ModelCallObservation): Promise<void>
 }
 
 export interface SessionStore {
@@ -152,7 +159,7 @@ export interface StoredRunEvent extends RunEvent {
 
 export interface EventStore {
   /** Append with (runId, seq) dedupe. Returns false for a duplicate. */
-  append(event: StoredRunEvent, proof?: StoreLeaseProof): Promise<boolean>
+  append(event: StoredRunEvent, proof?: StoreLeaseProof, work?: Omit<WorkItem, 'leaseToken'>): Promise<boolean>
   /** Events of one attempt range, ordered by seq. */
   listRange(runId: string, fromSeqExclusive: number, toSeqInclusive: number, kinds?: readonly string[]): Promise<StoredRunEvent[]>
 }
@@ -227,6 +234,9 @@ export interface ContextProvider {
 /** Executes one granted host action against the product. */
 export interface ActionExecutor {
   execute(work: Omit<WorkItem, 'leaseToken'>, action: import('../protocol/types.js').HostAction): Promise<HostActionResult>
+  /** Independent current resource observation; a native return value alone is not a verification. */
+  verifyResult?(work: Omit<WorkItem, 'leaseToken'>, action: import('../protocol/types.js').HostAction,
+    value: unknown): Promise<Omit<import('../outcome/verification.js').VerificationRecord, 'checker'>>
   /** Package-owned, explicit read-only allowlist; never route unknown methods to execute. */
   readResource?(work: Omit<WorkItem, 'leaseToken'>, action: import('../protocol/types.js').HostAction): Promise<unknown>
 }

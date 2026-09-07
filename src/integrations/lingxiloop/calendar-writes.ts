@@ -1,3 +1,4 @@
+import { lockAction, recordActionResult } from '../../control-plane/action-transaction.js'
 import { isDeepStrictEqual } from 'node:util'
 import { flushEventOutbox } from './event-outbox.js'
 import { withTransaction, type SqlPool, type SqlQueryable } from '../../control-plane/pg-store.js'
@@ -19,15 +20,7 @@ export async function updateCalendar(database: SqlPool, services: Pick<LingxiLoo
   return withTransaction(database, async client => {
     await client.query("SET LOCAL lock_timeout='5s'")
     await client.query("SET LOCAL statement_timeout='10s'")
-    const live = await client.query(`SELECT work.id FROM lingxios.agent_work_items work
-      JOIN lingxios.agent_action_intents intent ON intent.idempotency_key=$3
-      WHERE work.id=$1 AND work.fence=$2 AND work.status='leased' AND work.lease_expires_at>NOW()
-        AND work.cancel_requested_at IS NULL AND work.tenant_id=$4 AND work.principal_id=$5
-        AND intent.intent->>'workId'=work.id AND intent.intent->'action'->'args'=$6::jsonb
-        AND intent.intent->'action'->>'action'='calendar.update'
-        AND (intent.intent->>'requestVersion')::integer=jsonb_array_length(work.steer_inputs)+1
-      FOR UPDATE OF work`, [work.id, work.fence, action.idempotencyKey, work.tenantId, work.principalId, JSON.stringify(action.args)])
-    if (live.rows.length !== 1) throw new Error('calendar update requires the current live action intent')
+    await lockAction(client, work, action)
     await assertCalendarAgent(client, work)
     const permissions = api.createPermissionService(client, { lockDependencies: true })
     await permissions.assertCan({ actorUserId: work.principalId!, companyId: work.tenantId,
@@ -52,7 +45,7 @@ export async function updateCalendar(database: SqlPool, services: Pick<LingxiLoo
     if (!notification || notification.type !== 'calendar.changed' || notification.kind !== 'event.updated'
       || notification.eventId !== eventId || notification.companyId !== work.tenantId || notification.workspaceId !== projectId) throw new Error('calendar update notification is invalid')
     await queueCalendarEvent(client, work, action, { ...notification, actorId: work.agentId })
-    return { event, notification: 'queued' as const }
+    return recordActionResult(client, action, { event, notification: 'queued' as const })
   })
 }
 

@@ -1,3 +1,4 @@
+import { lockAction, recordActionResult } from '../../control-plane/action-transaction.js'
 import { withTransaction, type SqlPool } from '../../control-plane/pg-store.js'
 import type { HostAction, WorkItem } from '../../protocol/types.js'
 import type { LingxiLoopServices } from './service-contracts.js'
@@ -11,8 +12,9 @@ export async function renameDocument(database: SqlPool, services: Pick<LingxiLoo
   if (typeof documentId !== 'string' || !documentId.trim() || documentId.length > 2000) throw new Error('documentId is required')
   if (typeof expectedTitle !== 'string' || expectedTitle.length > 2000) throw new Error('expectedTitle is required')
   const { title } = api.renameDocumentRequestSchema.parse({ title: action.args['title'] })
-  const projectId = await withTransaction(database, async client => {
+  return withTransaction(database, async client => {
     await client.query("SET LOCAL statement_timeout='10s'")
+    await lockAction(client, work, action)
     const permissions = api.createPermissionService(client, { lockDependencies: true })
     await permissions.assertCan({ actorUserId: work.principalId!, companyId: work.tenantId,
       action: 'conversation:read', resource: { type: 'conversation', id: work.sessionId } })
@@ -30,12 +32,9 @@ export async function renameDocument(database: SqlPool, services: Pick<LingxiLoo
       action: 'document:write', resource: { type: 'document', id: documentId } })
     if (current.rows[0]!['title'] !== expectedTitle) throw new Error('document title changed; read it again before renaming')
     if (!await api.renameDocument(client, work.tenantId, projectId, documentId, title)) throw new Error('document rename did not update a row')
-    return projectId
+    await client.query('INSERT INTO lingxios.agent_document_outbox(id,event) VALUES($1,$2::jsonb)',
+      [action.idempotencyKey, JSON.stringify({ type: 'doc.changed', kind: 'document.updated', companyId: work.tenantId,
+        workspaceId: projectId, documentId, actorId: work.agentId })])
+    return recordActionResult(client, action, { documentId, title, notification: 'queued' as const })
   })
-  let notification: 'published' | 'unconfirmed' = 'published'
-  try {
-    await api.publish(api.CH_DOCS, { type: 'doc.changed', kind: 'document.updated', companyId: work.tenantId,
-      workspaceId: projectId, documentId, actorId: work.agentId })
-  } catch { notification = 'unconfirmed' }
-  return { documentId, title, notification }
 }

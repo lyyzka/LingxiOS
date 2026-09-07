@@ -1,3 +1,4 @@
+import { cancelRoutineRuns, scheduleRoutineKind } from './routine-scheduler.js'
 import { createHash } from 'node:crypto'
 import { withTransaction, type SqlPool, type SqlQueryable } from '../../control-plane/pg-store.js'
 import type { WorkItem } from '../../protocol/types.js'
@@ -38,13 +39,6 @@ async function nextRun(database: SqlQueryable, value: ReturnType<typeof schedule
   const parsed = instant(rows[0]?.['next_run_at'])
   if (!Number.isFinite(parsed.getTime()) || parsed <= now) throw new Error('digest schedule did not return a future instant')
   return parsed.toISOString()
-}
-
-export async function cancelRoutineRuns(database: SqlQueryable, id: string) {
-  await database.query(`UPDATE lingxios.agent_work_items work SET cancel_requested_at=COALESCE(cancel_requested_at,NOW()),
-    status=CASE WHEN status='queued' THEN 'cancelled' ELSE status END,updated_at=NOW()
-    FROM lingxios.agent_routine_runs run WHERE run.routine_id=$1 AND run.work_id=work.id
-      AND (work.status IN ('queued','leased') OR EXISTS(SELECT 1 FROM lingxios.agent_delivery_outbox outbox WHERE outbox.run_id=work.id AND outbox.delivered_at IS NULL))`, [id])
 }
 
 export async function getTeacherDigest(database: SqlQueryable, work: Pick<WorkItem, 'tenantId' | 'agentId' | 'sessionId'>, context: Context): Promise<Record<string, unknown>> {
@@ -100,50 +94,18 @@ export async function assertTeacherDigestWork(database: SqlQueryable, work: Omit
 
 export async function scheduleTeacherDigests(database: SqlPool, services: Services): Promise<number> {
   if (!services.teacher) return 0
-  return withTransaction(database, async client => {
-    await client.query("SET LOCAL lock_timeout='2s'")
-    await client.query("SET LOCAL statement_timeout='5s'")
-    const { rows } = await client.query(`SELECT routine.*,NOW() AS clock,
-      EXISTS(SELECT 1 FROM lingxios.agent_routine_runs run JOIN lingxios.agent_work_items work ON work.id=run.work_id
-        WHERE run.routine_id=routine.id AND work.cancel_requested_at IS NULL
-          AND (work.status IN ('queued','leased') OR EXISTS(SELECT 1 FROM lingxios.agent_delivery_outbox outbox WHERE outbox.run_id=work.id AND outbox.delivered_at IS NULL))) AS pending
-      FROM lingxios.agent_routines routine WHERE routine.status='active' AND routine.kind='teacher_digest' AND routine.next_run_at<=NOW()
-      ORDER BY routine.next_run_at,routine.id LIMIT 8 FOR UPDATE OF routine SKIP LOCKED`)
-    let enqueued = 0
-    for (const row of rows) {
-      const identity = { tenantId: String(row['tenant_id']), agentId: String(row['agent_id']), sessionId: String(row['session_id']), principalId: String(row['principal_id']), kind: 'teacher_digest' }
-      try {
-        const context = await teacherContext(identity, services, client)
-        if (context.course.id !== row['course_id'] || context.agent.projectId !== row['project_id']) throw new TeacherScopeError('scheduled course binding changed')
-      } catch (error) {
-        if (!(error instanceof TeacherScopeError) && !(error instanceof Error && error.name === 'ForbiddenError' && [403, 404].includes(Reflect.get(error, 'status')))) throw error
-        await client.query("UPDATE lingxios.agent_routines SET status='paused',next_run_at=NULL,version=version+1,pause_reason=$2,updated_at=NOW() WHERE id=$1",
-          [row['id'], error instanceof TeacherScopeError ? 'scope_changed' : 'authorization_revoked'])
-        await cancelRoutineRuns(client, String(row['id']))
-        continue
-      }
-      const scheduledAt = instant(row['next_run_at']).toISOString()
-      const id = 'digest-run-' + createHash('sha256').update(JSON.stringify([row['id'], row['version'], scheduledAt])).digest('hex')
-      let value: ReturnType<typeof schedule>
-      try { value = schedule({ ...(row['schedule'] as Record<string, unknown>), timezone: row['timezone'] }) }
-      catch {
-        await client.query("UPDATE lingxios.agent_routines SET status='paused',next_run_at=NULL,version=version+1,pause_reason='invalid_schedule',updated_at=NOW() WHERE id=$1", [row['id']])
-        await cancelRoutineRuns(client, String(row['id']))
-        continue
-      }
-      const next = await nextRun(client, value, instant(row['clock']))
-      const existing = await client.query('SELECT work_id FROM lingxios.agent_routine_runs WHERE routine_id=$1 AND routine_version=$2 AND scheduled_at=$3', [row['id'], row['version'], scheduledAt])
-      if (row['pending'] || existing.rows.length) {
-        await client.query('UPDATE lingxios.agent_routines SET next_run_at=$2,updated_at=NOW() WHERE id=$1', [row['id'], next])
-        continue
-      }
-      await client.query(`INSERT INTO lingxios.agent_work_items(id,tenant_id,agent_id,session_id,principal_id,kind,lane,trigger_ref,priority,meta)
-        VALUES($1,$2,$3,$4,$5,'teacher_digest','background',$1,-10,$6::jsonb)`,
-        [id, identity.tenantId, identity.agentId, identity.sessionId, identity.principalId, JSON.stringify({ text: instruction, authorName: 'Scheduled teacher digest', routineId: row['id'], routineVersion: row['version'], scheduledAt })])
-      await client.query('INSERT INTO lingxios.agent_routine_runs(routine_id,routine_version,scheduled_at,work_id) VALUES($1,$2,$3,$4)', [row['id'], row['version'], scheduledAt, id])
-      await client.query('UPDATE lingxios.agent_routines SET next_run_at=$2,updated_at=NOW() WHERE id=$1', [row['id'], next])
-      enqueued++
+  return scheduleRoutineKind(database, 'teacher_digest', async (client, row) => {
+    const identity = { tenantId: String(row['tenant_id']),agentId: String(row['agent_id']),sessionId: String(row['session_id']),principalId: String(row['principal_id']),kind: 'teacher_digest' }
+    try {
+      const context = await teacherContext(identity, services, client)
+      if (context.course.id !== row['course_id'] || context.agent.projectId !== row['project_id']) throw new TeacherScopeError('scheduled course binding changed')
+    } catch (error) {
+      if (!(error instanceof TeacherScopeError) && !(error instanceof Error && error.name === 'ForbiddenError' && [403,404].includes(Reflect.get(error, 'status')))) throw error
+      return { pauseReason: error instanceof TeacherScopeError ? 'scope_changed' : 'authorization_revoked' }
     }
-    return enqueued
+    let value: ReturnType<typeof schedule>
+    try { value = schedule({ ...(row['schedule'] as Record<string, unknown>),timezone: row['timezone'] }) }
+    catch { return { pauseReason: 'invalid_schedule' } }
+    return { next: await nextRun(client, value, instant(row['clock'])),text: instruction,authorName: 'Scheduled teacher digest' }
   })
 }

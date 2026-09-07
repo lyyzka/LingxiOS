@@ -94,7 +94,7 @@ it('persists scoped teacher approval previews only for a live matching action in
       INSERT INTO courses VALUES('course','t','p');
       INSERT INTO learning_course_teacher_rooms VALUES('t','course','s');
       INSERT INTO learning_knowledge_units VALUES('objective','t','p','DRAFT');`)
-    await db.query("UPDATE lingxios.agent_work_items SET status='completed',goal_outcome=$1", [JSON.stringify({ status: 'awaiting_approval', approvalId, requestVersion: 1 })])
+    await db.query("UPDATE lingxios.agent_work_items SET status='waiting',goal_outcome=$1", [JSON.stringify({ status: 'awaiting_approval', approvalId, requestVersion: 1 })])
     await db.query('INSERT INTO lingxios.agent_os_sessions(session_key,tenant_id,agent_id,session_id,request_snapshot) VALUES($1,$2,$3,$4,$5)', ['session', 't', 'a', 's', JSON.stringify({ workId: 'w', tenantId: 't', sessionId: 's', authorId: 'u', originalText: 'Publish objective', revisions: [] })])
     await db.query('INSERT INTO lingxios.agent_action_ledger(idempotency_key,result) VALUES($1,$2)', ['key', JSON.stringify(result)])
     const decision = { companyId: 't', userId: 'reviewer', approvalId }
@@ -123,7 +123,7 @@ it('persists scoped teacher approval previews only for a live matching action in
     await assert.rejects(approveTeacher(database, services, decision), /injected resume failure/)
     assert.deepEqual((await db.query('SELECT status FROM learning_knowledge_units')).rows, [{ status: 'PUBLISHED' }])
     assert.deepEqual((await db.query('SELECT status,resolved_by,result FROM approvals')).rows, [{ status: 'EXECUTED', resolved_by: 'reviewer', result: { ok: true } }])
-    assert.deepEqual((await db.query('SELECT status FROM lingxios.agent_work_items')).rows, [{ status: 'completed' }])
+    assert.deepEqual((await db.query('SELECT status FROM lingxios.agent_work_items')).rows, [{ status: 'waiting' }])
     const executed = await inspectApproval(database, services, decision)
     await db.query("UPDATE lingxios.agent_action_intents SET intent=jsonb_set(intent,'{agentId}','\"other-agent\"'::jsonb)")
     await assert.rejects(resumeApproved(database, decision, executed), /matching durable recovery records/)
@@ -139,7 +139,7 @@ it('persists scoped teacher approval previews only for a live matching action in
       await db.query("UPDATE approvals SET action=$1,args=$2,preview=$3,status='PENDING',resumed_at=NULL,result=NULL", [action.action, JSON.stringify(action.args), JSON.stringify(metadata.preview)])
       await db.query("UPDATE lingxios.agent_action_intents SET intent=jsonb_set(intent,'{action}',$1)", [JSON.stringify(action)])
       await db.query('UPDATE lingxios.agent_action_ledger SET result=$1', [JSON.stringify(result)])
-      await db.query("UPDATE lingxios.agent_work_items SET status='completed',goal_outcome=$1", [JSON.stringify({ status: 'awaiting_approval', approvalId, requestVersion: 1 })])
+      await db.query("UPDATE lingxios.agent_work_items SET status='waiting',goal_outcome=$1", [JSON.stringify({ status: 'awaiting_approval', approvalId, requestVersion: 1 })])
       await db.exec("UPDATE learning_evaluations SET status='PENDING'")
       execution = 'success'
       assert.deepEqual(await approveTeacher(database, services, decision), { status: 'resumed', workId: 'w' })
@@ -154,7 +154,7 @@ it('persists scoped teacher approval previews only for a live matching action in
       await db.query("UPDATE approvals SET action=$1,args=$2,preview=$3,status='PENDING',resumed_at=NULL,result=NULL", [action.action, JSON.stringify(action.args), JSON.stringify(metadata.preview)])
       await db.query("UPDATE lingxios.agent_action_intents SET intent=jsonb_set(intent,'{action}',$1)", [JSON.stringify(action)])
       await db.query('UPDATE lingxios.agent_action_ledger SET result=$1', [JSON.stringify(result)])
-      await db.query("UPDATE lingxios.agent_work_items SET status='completed',goal_outcome=$1", [JSON.stringify({ status: 'awaiting_approval', approvalId, requestVersion: 1 })])
+      await db.query("UPDATE lingxios.agent_work_items SET status='waiting',goal_outcome=$1", [JSON.stringify({ status: 'awaiting_approval', approvalId, requestVersion: 1 })])
       execution = 'forbidden'
       failEnqueue = true
       await assert.rejects(approveTeacher(database, services, decision), /injected effect failure/)
@@ -175,7 +175,7 @@ it('persists scoped teacher approval previews only for a live matching action in
       await db.query("UPDATE approvals SET action=$1,args=$2,preview=$3,status='PENDING',resumed_at=NULL,result=NULL", [action.action, JSON.stringify(action.args), JSON.stringify(metadata.preview)])
       await db.query("UPDATE lingxios.agent_action_intents SET intent=jsonb_set(intent,'{action}',$1)", [JSON.stringify(action)])
       await db.query('UPDATE lingxios.agent_action_ledger SET result=$1', [JSON.stringify(result)])
-      await db.query("UPDATE lingxios.agent_work_items SET status='completed',goal_outcome=$1", [JSON.stringify({ status: 'awaiting_approval', approvalId, requestVersion: 1 })])
+      await db.query("UPDATE lingxios.agent_work_items SET status='waiting',goal_outcome=$1", [JSON.stringify({ status: 'awaiting_approval', approvalId, requestVersion: 1 })])
       await db.exec("UPDATE projects SET status='ACTIVE'; UPDATE learning_course_teacher_rooms SET status='active'")
       const fence = command === 'END' ? 1 : command === 'ENTER_READ_ONLY' ? 2 : 3
       await db.query('UPDATE lingxios.agent_work_items SET fence=$1', [fence])
@@ -208,7 +208,7 @@ it('persists scoped teacher approval previews only for a live matching action in
         assert.deepEqual(await approveTeacher(database, services, decision), expected)
         assert.deepEqual(await approveTeacher(database, services, decision), expected)
         const stopped = (await db.query<{ status: string; outcome: { status: string; verification: string; requestVersion: number; gaps: string[] } }>('SELECT status,goal_outcome AS outcome FROM lingxios.agent_work_items')).rows[0]!
-        assert.equal(stopped.status, 'completed')
+        assert.equal(stopped.status, 'blocked')
         assert.deepEqual([stopped.outcome.status, stopped.outcome.verification, stopped.outcome.requestVersion], ['blocked', 'inconclusive', 1])
         assert.match(stopped.outcome.gaps[0]!, /closed the teacher room/)
         const events = (await db.query<{ seq: number }>('SELECT seq FROM lingxios.agent_run_events ORDER BY seq')).rows

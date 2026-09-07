@@ -1,3 +1,4 @@
+import { seedAction } from './action-fixture.js'
 import assert from 'node:assert/strict'
 import { readFile } from 'node:fs/promises'
 import { it } from 'node:test'
@@ -23,10 +24,11 @@ it('persists scoped memory provenance, filters expiry and rejects stale or unaut
   let denied = false
   const services = { permissionService: { assertCan: async () => { if (denied) throw new Error('permission denied') } } }
   let index = 0
-  const run = (method: string, args: Record<string, unknown>, scope = work) => {
+  const run = async (method: string, args: Record<string, unknown>, scope = work) => {
     const cellId = `c${index++}`
-    return executeMemory(scope, { runId: scope.id, cellId, callIndex: 0, idempotencyKey: JSON.stringify([scope.id, cellId, 0]),
-      action: `memory.${method}`, args }, services, pool)
+    const action = { runId: scope.id, cellId, callIndex: 0, idempotencyKey: JSON.stringify([scope.id, cellId, 0]), action: `memory.${method}`, args }
+    await seedAction(pool, scope, action)
+    return executeMemory(scope, action, services, pool)
   }
   try {
     await db.exec(await readFile(new URL('../../db/schema.sql', import.meta.url), 'utf8'))
@@ -122,7 +124,7 @@ it('persists scoped memory provenance, filters expiry and rejects stale or unaut
     assert.equal(await evidenceStatus(), 'superseded')
     await db.exec('ROLLBACK')
     // Ordinary completion and a later request's session snapshot do not revoke a valid source.
-    await db.exec("UPDATE lingxios.agent_work_items SET status='completed' WHERE id='w'")
+    await db.exec("UPDATE lingxios.agent_work_items SET status='succeeded' WHERE id='w'")
     await db.exec(`INSERT INTO lingxios.agent_work_items(id,tenant_id,agent_id,principal_id,session_id,kind,lane,trigger_ref)
       VALUES('later-work','t','a','u','s','turn','interactive','later')`)
     await db.exec(`UPDATE lingxios.agent_os_sessions SET request_snapshot=jsonb_set(request_snapshot,'{workId}','"later-work"')`)
@@ -130,7 +132,7 @@ it('persists scoped memory provenance, filters expiry and rejects stale or unaut
     await db.exec("UPDATE lingxios.agent_work_items SET status='leased' WHERE id='w'")
     await db.exec("UPDATE lingxios.agent_work_items SET cancel_requested_at=NOW() WHERE id='w'")
     assert.equal(await evidenceStatus(), 'superseded')
-    await assert.rejects(run('note', { body: 'Cancelled write' }), /current leased request/)
+    await assert.rejects(run('note', { body: 'Cancelled write' }), /current live action intent/)
     assert.equal((await db.query('SELECT id FROM lingxios.agent_memories')).rows.length, 3)
     await checkStorage(pool)
     await db.exec('ALTER TABLE lingxios.agent_memories DISABLE TRIGGER agent_memory_version_history')

@@ -1,6 +1,6 @@
 {
   "name": "lingxios",
-  "version": "1.1.0",
+  "version": "2.0.0",
   "description": "LingxiOS — a purpose-built, production-grade Agent OS: durable work orchestration, sandboxed code-act kernels, and a policy-extensible agent runtime.",
   "type": "module",
   "license": "MIT",

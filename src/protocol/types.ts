@@ -25,7 +25,17 @@ export const WORK_LANE_PRIORITY: Readonly<Record<WorkLane, number>> = Object.fre
   background: 1,
 })
 
-export type WorkStatus = 'queued' | 'leased' | 'completed' | 'failed' | 'cancelled'
+export type WorkStatus = 'queued' | 'leased' | 'waiting' | 'succeeded' | 'partial' | 'blocked' | 'failed' | 'cancelled'
+
+export function workStatusOf(completion: WorkCompletion): WorkStatus {
+  if (completion.status !== 'completed') return completion.status
+  switch (completion.goalOutcome?.status) {
+    case 'awaiting_input': case 'awaiting_approval': case 'delegated': return 'waiting'
+    case 'partial': return 'partial'
+    case 'blocked': return 'blocked'
+    default: return 'succeeded'
+  }
+}
 
 /**
  * A durable unit of agent work, claimed under a fenced lease.
@@ -196,7 +206,7 @@ export interface RunEvent {
 
 export type ModelItem =
   | { role: 'user' | 'assistant' | 'system'; content: string }
-  | { type: 'function_call'; callId: string; name: string; arguments: string }
+  | { type: 'function_call'; callId: string; name: string; arguments: string; stepId?: string }
   | { type: 'function_call_output'; callId: string; output: string }
 
 /**
@@ -261,6 +271,10 @@ export interface ContextMessage {
  * into the session.
  */
 export interface TurnContext {
+  executionCheckpoint?: import('../runtime/corrections.js').ProgressCheckpoint
+  dependencies?: Array<{ id: string; status: string; resultText: string | null; goalOutcome: import('./outcome.js').GoalOutcome | null | undefined }>
+  grants?: CapabilityGrant[]
+  tools?: import('../tools/catalog.js').ToolDefinition[]
   memory?: import('../memory/store.js').MemorySnapshot
   /** Prior attempt records only; files must be rechecked before current delivery. */
   priorArtifacts?: KernelArtifact[]

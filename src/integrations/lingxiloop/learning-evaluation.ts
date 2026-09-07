@@ -1,3 +1,4 @@
+import { lockAction, recordActionResult } from '../../control-plane/action-transaction.js'
 import { withTransaction, type SqlPool } from '../../control-plane/pg-store.js'
 import type { HostAction, WorkItem } from '../../protocol/types.js'
 import type { LingxiLoopServices } from './service-contracts.js'
@@ -28,6 +29,7 @@ export async function proposeEvaluation(database: SqlPool, services: Pick<Lingxi
     // Native evaluation reads state before taking its state locks; concurrent changes must abort this snapshot.
     await client.query('SET TRANSACTION ISOLATION LEVEL SERIALIZABLE')
     await client.query("SET LOCAL statement_timeout='10s'")
+    await lockAction(client, work, action)
     const room = await api.findLearningRoomState(client, { companyId: work.tenantId, channelId: work.sessionId })
     if (!room || room.companyId !== work.tenantId) throw new Error('conversation is not bound to a learning project')
     await api.createPermissionService(client, { lockDependencies: true }).assertCan({ actorUserId: work.principalId!, companyId: work.tenantId,
@@ -43,12 +45,13 @@ export async function proposeEvaluation(database: SqlPool, services: Pick<Lingxi
       const evidence = await client.query('SELECT id FROM evidence_records WHERE id=$1 AND company_id=$2 AND project_id=$3', [evidenceId, work.tenantId, room.projectId])
       if (evidence.rows.length !== 1) throw new Error('evaluation evidence is outside this project')
     }
-    return api.proposeLearningEvaluation(client, teacherTransaction(client), (name, labels) => {
+    const value = await api.proposeLearningEvaluation(client, teacherTransaction(client), (name, labels) => {
       if (name !== 'learning.state.changed' && name !== 'learning.evaluation.proposed') throw new Error('unexpected evaluation metric')
       if (metrics.length >= 1000) throw new Error('evaluation exceeds metric limit')
       metrics.push({ name, ...(labels ? { labels } : {}) })
     }, { companyId: work.tenantId, channelId: work.sessionId, agentId: work.agentId, attemptId, demonstratedLevel, confidence, rubricResults,
       ...(feedback === undefined ? {} : { feedback }), ...(sourceEvidenceId ? { sourceEvidenceId } : {}), ...(verifierEvidenceId ? { verifierEvidenceId } : {}) })
+    return recordActionResult(client, action, value)
   })
   for (const metric of metrics) api.inc(metric.name, metric.labels)
   return result

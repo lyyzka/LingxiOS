@@ -1,12 +1,35 @@
-import { createHash } from 'node:crypto'
+import { modelExecution, DEFAULT_MODEL_BUDGET, type RootModelBudgetOptions } from '../model/execution.js'
+import { PgModelBudgetStore, PgWorkStore } from '../control-plane/pg-store.js'
+import { createHash, randomUUID } from 'node:crypto'
 import { OpenAIEmbeddingDriver, type EmbeddingOptions } from '../model/embeddings.js'
 import { withTransaction, type SqlPool } from '../control-plane/pg-store.js'
 import type { WorkItem } from '../protocol/types.js'
 import { recallMemories, type MemoryScope } from './store.js'
 
 /** Package-owned semantic index; no extension or embedding callback is required from the consumer. */
-export function createSemanticMemory(database: SqlPool, options: EmbeddingOptions) {
+export function createSemanticMemory(database: SqlPool, options: EmbeddingOptions, budget: RootModelBudgetOptions = {}) {
   const driver = new OpenAIEmbeddingDriver(options)
+  const limits = { ...DEFAULT_MODEL_BUDGET, ...budget,
+    inputCostMicrosPerMillion: options.inputCostMicrosPerMillion ?? budget.inputCostMicrosPerMillion ?? 0,
+    outputCostMicrosPerMillion: 0 }
+  const budgets = new PgModelBudgetStore(database), works = new PgWorkStore(database)
+  const embed = async (work: Omit<WorkItem, 'leaseToken'>, input: readonly string[], signal?: AbortSignal) => {
+    const { rows } = await database.query(`SELECT lease_token_hash FROM lingxios.agent_work_items WHERE id=$1 AND fence=$2
+      AND status='leased' AND lease_expires_at>NOW() AND cancel_requested_at IS NULL`, [work.id, work.fence])
+    if (typeof rows[0]?.['lease_token_hash'] !== 'string') throw new Error('embedding requires an active attempt')
+    const proof = { workId: work.id, fence: work.fence, leaseTokenHash: rows[0]['lease_token_hash'] }
+    const root = typeof work.meta?.['rootWorkId'] === 'string' ? work.meta['rootWorkId'] : work.id
+    if (!await works.ownsBudgetRoot(work, root)) throw new Error('embedding root is outside the work lineage')
+    const { invoke } = modelExecution({
+      reserveModelCall: (_work, callId, reserved) => budgets.reserve(root, callId, reserved, proof),
+      recordModelUsage: (_work, callId, usage, observation) => budgets.record(root, callId, usage.inputTokens, usage.outputTokens, usage.costMicros, proof, observation),
+    }, { modelId: options.id, maxOutputTokens: 0, toolDefinitionTokens: 0 }, { ...work, leaseToken: '' }, limits,
+    undefined, undefined, `embedding:${randomUUID()}`)
+    return invoke('embedding', { input, signal }, async requestSignal => {
+      const result = await driver.embed(input, requestSignal)
+      return { ...result, usage: { ...result.usage, outputTokens: 0 } }
+    })
+  }
   const queries = new Map<string, { expires: number; value: ReturnType<OpenAIEmbeddingDriver['embed']> }>()
   return {
     async recall(work: Omit<WorkItem, 'leaseToken'>, scope: MemoryScope, query: string, limit: number): Promise<Array<Record<string, unknown>>> {
@@ -31,7 +54,7 @@ export function createSemanticMemory(database: SqlPool, options: EmbeddingOption
       let cached = queries.get(key)
       if (!cached || cached.expires <= Date.now()) {
         if (queries.size >= 64) queries.delete(queries.keys().next().value!)
-        const value = driver.embed([query], AbortSignal.timeout(3000))
+        const value = embed(work, [query], AbortSignal.timeout(3000))
         cached = { expires: Date.now() + 60_000, value }
         queries.set(key, cached)
       }
@@ -69,7 +92,7 @@ export function createSemanticMemory(database: SqlPool, options: EmbeddingOption
       await authorize()
       const initial = (await read(database, false)).rows[0]
       if (!initial) return { outcome: 'stale' }
-      const result = await driver.embed([String(initial['body'])])
+      const result = await embed(work, [String(initial['body'])])
       if (typeof work.meta?.['expectedModel'] === 'string' && work.meta['expectedModel'] !== result.model) return { outcome: 'obsolete' }
       await authorize()
       return withTransaction(database, async client => {

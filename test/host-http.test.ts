@@ -54,13 +54,13 @@ it('preserves goal outcomes and enforces session leases over real HTTP', async (
   const client = new HttpHostClient({ baseUrl: `http://127.0.0.1:${port}`, serviceToken: 'test-secret', workerId: 'worker', maxAttempts: 1 })
   try {
     for (const body of ['null', '[]', '42', 'true', '"text"']) {
-      const response = await fetch(`http://127.0.0.1:${port}/v3/work/claim`, { method: 'POST',
+      const response = await fetch(`http://127.0.0.1:${port}/v4/work/claim`, { method: 'POST',
         headers: { authorization: 'Bearer test-secret', 'content-type': 'application/json' }, body })
       assert.equal(response.status, 400)
       assert.deepEqual(await response.json(), { error: 'request body must be a JSON object' })
     }
     for (const workerId of [123, true, ['worker'], null]) {
-      const response = await fetch(`http://127.0.0.1:${port}/v3/work/claim`, { method: 'POST',
+      const response = await fetch(`http://127.0.0.1:${port}/v4/work/claim`, { method: 'POST',
         headers: { authorization: 'Bearer test-secret', 'content-type': 'application/json' }, body: JSON.stringify({ workerId, workKinds: ['turn'] }) })
       assert.equal(response.status, 400)
       assert.deepEqual(await response.json(), { error: 'workerId must be a string' })
@@ -73,7 +73,7 @@ it('preserves goal outcomes and enforces session leases over real HTTP', async (
       sha256: createHash('sha256').update(artifactBytes).digest('hex') }, artifactBytes)
     assert.equal(staged, 'artifact')
     for (const fence of ['1', true, [1], 0, 1.5]) {
-      const response = await fetch(`http://127.0.0.1:${port}/v3/work/${work.id}/heartbeat`, { method: 'POST',
+      const response = await fetch(`http://127.0.0.1:${port}/v4/work/${work.id}/heartbeat`, { method: 'POST',
         headers: { authorization: 'Bearer test-secret', 'content-type': 'application/json' }, body: JSON.stringify({ fence, leaseToken: work.leaseToken }) })
       assert.equal(response.status, 400)
       assert.deepEqual(await response.json(), { error: 'fence must be a positive safe integer' })
@@ -222,7 +222,7 @@ it('preserves goal outcomes and enforces session leases over real HTTP', async (
     assert.equal(await service.requestCancel(cancelled.id), true)
     await assert.rejects(client.completeWork(cancelled, { status: 'completed' }),
       (error: unknown) => error instanceof HostRequestError && error.responseCode === 'work_state_conflict')
-    await assert.rejects(client.commitMessage(cancelled, { version: 2, runId: cancelled.id, agentId: 'a', sessionId: 's', body: 'Must not be delivered' } as AssistantMessage), /cancelled/)
+    await assert.rejects(client.commitResult(cancelled, { version: 2, runId: cancelled.id, agentId: 'a', sessionId: 's', body: 'Must not be delivered' } as AssistantMessage), /cancelled/)
     await client.completeWork(cancelled, { status: 'cancelled' })
     assert.equal(workStore.inspect(cancelled.id)?.status, 'cancelled')
   } finally {

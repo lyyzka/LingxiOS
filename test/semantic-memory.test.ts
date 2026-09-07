@@ -51,8 +51,8 @@ it('indexes scoped memories durably and ranks old semantic matches without trust
   }
   try {
     await db.exec(await readFile(new URL('../../db/schema.sql', import.meta.url), 'utf8'))
-    await db.exec(`INSERT INTO lingxios.agent_work_items(id,tenant_id,agent_id,principal_id,session_id,kind,lane,trigger_ref,status,fence,lease_expires_at)
-      VALUES('turn','t','a','u','s','turn','interactive','m','leased',1,NOW()+INTERVAL '1 hour')`)
+    await db.exec(`INSERT INTO lingxios.agent_work_items(id,tenant_id,agent_id,principal_id,session_id,kind,lane,trigger_ref,status,fence,lease_expires_at,lease_token_hash)
+      VALUES('turn','t','a','u','s','turn','interactive','m','leased',1,NOW()+INTERVAL '1 hour','${createHash('sha256').update(work.leaseToken).digest('hex')}')`)
     for (let i = 0; i < 40; i++) await db.query(`INSERT INTO lingxios.agent_memories(tenant_id,id,scope_type,scope_id,body,kind,origin,source_refs,updated_at)
       VALUES('t',$1,'learner','u',$2,'observation','explicit','[{"workId":"turn"}]',NOW()+$3*INTERVAL '1 second')`,
     [`m${i}`, i === 0 ? 'Prefers diagrams' : `Unrelated ${i}`, i])

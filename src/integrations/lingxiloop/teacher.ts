@@ -1,3 +1,4 @@
+import { lockAction, recordActionResult } from '../../control-plane/action-transaction.js'
 import { teacherContext } from './teacher-context.js'
 import { withTransaction, type SqlQueryable, type SqlPool } from '../../control-plane/pg-store.js'
 import type { HostAction, WorkItem } from '../../protocol/types.js'
@@ -72,6 +73,7 @@ export async function executeTeacher(work: Omit<WorkItem, 'leaseToken'>, action:
   if (method === 'update_course' || method === 'draft_objectives' || method === 'draft_activity' || method === 'set_room_binding' || method === 'set_learner_membership') {
     if (!database) throw new Error('teacher updates require a database transaction')
     return withTransaction(database, async client => {
+      await lockAction(client, work, action)
       const context = await teacherContext(work, services, client)
       const teacher = services.teacher!
       const transaction = teacherTransaction(client)
@@ -102,17 +104,17 @@ export async function executeTeacher(work: Omit<WorkItem, 'leaseToken'>, action:
       }
       if (method === 'set_learner_membership') {
         if (!result || typeof result !== 'object' || Reflect.get(result, 'ok') !== true) throw new Error('teacher membership change was not acknowledged')
-        return result
+        return recordActionResult(client, action, result)
       }
       if (method === 'set_room_binding') {
         if (!result || typeof result !== 'object' || Reflect.get(result, 'ok') !== true
           || Reflect.get(result, 'enabled') !== action.args['enabled']) throw new Error('teacher room binding did not acknowledge the requested change')
-        return result
+        return recordActionResult(client, action, result)
       }
       if (method === 'draft_activity') {
         if (!result || typeof result !== 'object' || Reflect.get(result, 'courseId') !== context.course.id
           || typeof Reflect.get(result, 'id') !== 'string' || !Reflect.get(result, 'id') || Reflect.get(result, 'status') !== 'DRAFT') throw new Error('teacher activity creation did not return a scoped draft')
-        return result
+        return recordActionResult(client, action, result)
       }
       if (method === 'draft_objectives') {
         // Native creation returns the whole course inventory, including existing published objectives.
@@ -120,14 +122,14 @@ export async function executeTeacher(work: Omit<WorkItem, 'leaseToken'>, action:
           || result.some(item => !item || typeof item !== 'object' || item.courseId !== context.course.id
             || typeof item.id !== 'string' || !item.id.trim())
           || new Set(result.map(item => item.id)).size !== result.length) throw new Error('teacher draft creation did not return scoped objectives')
-        return result
+        return recordActionResult(client, action, result)
       }
       if (!result || typeof result !== 'object' || !('id' in result) || result.id !== context.agent.projectId
         || !('company_id' in result) || result.company_id !== work.tenantId) throw new Error('teacher update did not return the scoped project')
       for (const [key, value] of Object.entries(action.args)) {
         if (Reflect.get(result, key === 'title' ? 'name' : 'description') !== (value as string).trim()) throw new Error('teacher update did not return the requested metadata')
       }
-      return result
+      return recordActionResult(client, action, result)
     })
   }
 

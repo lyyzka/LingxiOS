@@ -71,11 +71,10 @@ function toWireMessages(instructions: string, items: readonly ModelItem[]): Wire
       continue
     }
     if (item.type === 'function_call') {
-      messages.push({
-        role: 'assistant',
-        content: null,
-        tool_calls: [{ id: item.callId, type: 'function', function: { name: item.name, arguments: item.arguments } }],
-      })
+      let assistant = messages.at(-1)!
+      if (assistant.role !== 'assistant') { assistant = { role: 'assistant', content: null }; messages.push(assistant) }
+      assistant.tool_calls ??= []
+      assistant.tool_calls.push({ id: item.callId, type: 'function', function: { name: item.name, arguments: item.arguments } })
       continue
     }
     messages.push({ role: 'tool', tool_call_id: item.callId, content: item.output })
@@ -149,6 +148,7 @@ export async function* sseDataEvents(body: ReadableStream<Uint8Array>): AsyncGen
 }
 
 export class OpenAIChatDriver implements ModelDriver {
+  singleAttempt(): ModelDriver { return new OpenAIChatDriver(this.modelId, { ...this.options, maxAttempts: 1 }) }
   readonly configurationFingerprint: string
   readonly contextWindowTokens: number
   readonly maxOutputTokens: number
@@ -206,21 +206,17 @@ export class OpenAIChatDriver implements ModelDriver {
       }
       if (response.ok) return response
       const status = response.status
-      let detail = ''
-      if (response.body) for await (const chunk of bodyText(response.body)) {
-        detail += chunk.slice(0, 2_000 - detail.length)
-        if (detail.length === 2_000) break
-      }
+      await response.body?.cancel()
       if ((status === 429 || status >= 500) && attempt < this.maxAttempts) {
         const retryAfter = Number(response.headers.get('retry-after'))
         const delay = Number.isFinite(retryAfter) && retryAfter > 0
           ? Math.min(retryAfter * 1_000, 30_000)
           : this.backoffMs(attempt)
         await this.sleep(delay, signal)
-        lastError = new ModelDriverError(`model provider returned ${status}: ${detail}`, { status, finishReasons: [], attempts: attempt })
+        lastError = new ModelDriverError(`model provider returned ${status}`, { status, finishReasons: [], attempts: attempt })
         continue
       }
-      throw new ModelDriverError(`model provider returned ${status}: ${detail}`, { status, finishReasons: [], attempts: attempt })
+      throw new ModelDriverError(`model provider returned ${status}`, { status, finishReasons: [], attempts: attempt })
     }
     throw new ModelDriverError(
       `model request failed after ${this.maxAttempts} attempts`,
@@ -292,9 +288,9 @@ export class OpenAIChatDriver implements ModelDriver {
     const response = await this.request({
       model: this.modelId,
       messages: toWireMessages(request.instructions, request.items),
-      tools: [IPYTHON_TOOL],
+      tools: [IPYTHON_TOOL, ...(request.tools ?? []).map(tool => ({ type: 'function', function: { name: tool.name, description: tool.description, parameters: tool.parameters } }))],
       tool_choice: 'auto',
-      parallel_tool_calls: false,
+      parallel_tool_calls: true,
       stream: true,
       stream_options: { include_usage: true },
     }, request.signal)
@@ -306,7 +302,7 @@ export class OpenAIChatDriver implements ModelDriver {
     const text = accumulator.text
     if (text.trim()) output.push({ role: 'assistant', content: text })
     for (const [, call] of [...accumulator.toolCalls.entries()].sort(([a], [b]) => a - b)) {
-      if (!call.id.trim() || call.name !== IPYTHON_TOOL_NAME) throw new ModelDriverError('model returned an invalid tool identity', { kind: 'protocol', finishReasons: accumulator.finishReasons })
+      if (!call.id.trim() || call.name !== IPYTHON_TOOL_NAME && !request.tools?.some(tool => tool.name === call.name)) throw new ModelDriverError('model returned an invalid tool identity', { kind: 'protocol', finishReasons: accumulator.finishReasons })
       output.push({
         type: 'function_call',
         callId: call.id,

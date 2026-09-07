@@ -1,3 +1,5 @@
+import { seedAction } from './action-fixture.js'
+import { readFile } from 'node:fs/promises'
 import assert from 'node:assert/strict'
 import { it } from 'node:test'
 import { PGlite } from '@electric-sql/pglite'
@@ -40,6 +42,8 @@ it('scopes evaluation to the human and emits native metrics only after commit', 
     },
   }
   try {
+    await db.exec(await readFile(new URL('../../db/schema.sql', import.meta.url), 'utf8'))
+    await seedAction(database, work, action)
     await db.exec(`CREATE TABLE participants(id text,company_id text,kind text,departed_at timestamptz);
       CREATE TABLE learning_attempts(id text,company_id text,project_id text,learner_id text);
       CREATE TABLE evidence_records(id text,company_id text,project_id text);

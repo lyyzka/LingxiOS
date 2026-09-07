@@ -1,3 +1,4 @@
+import { workStatusOf, type WorkStatus } from '../protocol/types.js'
 /**
  * In-memory store implementation. Serves three purposes: local development,
  * the test suite, and the executable specification of the lease state
@@ -32,7 +33,7 @@ interface WorkRow {
   triggerRef: string
   principalId?: string
   priority: number
-  status: 'queued' | 'leased' | 'completed' | 'failed' | 'cancelled'
+  status: WorkStatus
   createdAt: string
   availableAt: string
   attempts: number
@@ -60,15 +61,29 @@ interface SessionLease {
 }
 
 export class MemoryWorkStore implements WorkStore {
+  async children(parent: Omit<WorkItem, 'leaseToken'>) {
+    return [...this.rows.values()].filter(row => row.meta?.['parentWorkId'] === parent.id
+      && row.tenantId === parent.tenantId && row.principalId === parent.principalId).slice(0, 64)
+      .map(row => ({ id: row.id, status: row.status, resultText: row.resultText, goalOutcome: row.goalOutcome ?? null }))
+  }
   async ownsBudgetRoot(work: Omit<WorkItem, 'leaseToken'>, rootWorkId: string): Promise<boolean> {
     if (rootWorkId === work.id) return true
-    const root = this.rows.get(rootWorkId)
-    return Boolean(root && work.meta?.['rootWorkId'] === rootWorkId && typeof work.meta?.['parentWorkId'] === 'string'
-      && root.tenantId === work.tenantId && root.principalId === work.principalId)
+    if (work.meta?.['rootWorkId'] !== rootWorkId) return false
+    const seen = new Set([work.id])
+    let parentId = work.meta?.['parentWorkId']
+    for (let depth = 0; typeof parentId === 'string' && depth < 64; depth++) {
+      if (seen.has(parentId)) return false
+      seen.add(parentId)
+      const parent = this.rows.get(parentId)
+      if (!parent || parent.tenantId !== work.tenantId || parent.principalId !== work.principalId) return false
+      if (parent.id === rootWorkId) return true
+      parentId = parent.meta?.['parentWorkId']
+    }
+    return false
   }
   async hasPendingChild(parent: Omit<WorkItem, 'leaseToken'>, childId: string, requestVersion: number): Promise<boolean> {
     const child = this.rows.get(childId)
-    return Boolean(child && ['queued', 'leased'].includes(child.status) && !child.cancelRequestedAt
+    return Boolean(child && ['queued', 'leased', 'waiting'].includes(child.status) && !child.cancelRequestedAt
       && child.tenantId === parent.tenantId && child.sessionId === parent.sessionId && child.principalId === parent.principalId
       && child.meta?.['parentWorkId'] === parent.id && child.meta?.['parentRequestVersion'] === requestVersion)
   }
@@ -279,7 +294,7 @@ export class MemoryWorkStore implements WorkStore {
     if (completion.status === 'completed' && row.cancelRequestedAt !== null) return false
     if (completion.status === 'completed' && typeof row.meta?.['text'] === 'string' && !completion.goalOutcome) return false
     if (completion.status === 'completed' && completion.goalOutcome && completion.goalOutcome.requestVersion !== row.steerInputs.length + 1) return false
-    row.status = completion.status
+    row.status = workStatusOf(completion)
     row.resultText = completion.resultText ?? null
     row.error = completion.error ?? null
     if (completion.goalOutcome) row.goalOutcome = structuredClone(completion.goalOutcome)
@@ -297,10 +312,26 @@ export class MemoryWorkStore implements WorkStore {
 
   async requestCancel(id: string): Promise<boolean> {
     const row = this.rows.get(id)
-    if (!row || row.status === 'completed' || row.status === 'failed' || row.status === 'cancelled') return false
-    row.cancelRequestedAt = new Date(this.now()).toISOString()
-    if (row.status === 'queued') {
-      row.status = 'cancelled'
+    if (!row || !['queued','leased','waiting'].includes(row.status)) return false
+    const descendants = new Set([id])
+    for (let depth = 0; depth < 64; depth++) {
+      let added = false
+      for (const child of this.rows.values()) {
+        if (child.tenantId === row.tenantId && child.principalId === row.principalId
+          && descendants.has(String(child.meta?.['parentWorkId'])) && !descendants.has(child.id)) {
+          descendants.add(child.id); added = true
+        }
+      }
+      if (!added) break
+    }
+    for (const target of descendants) {
+      const child = this.rows.get(target)!
+      if (!['queued','leased','waiting'].includes(child.status)) continue
+      child.cancelRequestedAt = new Date(this.now()).toISOString()
+      if (child.status !== 'leased') {
+        child.status = 'cancelled'
+        child.goalOutcome = { status: 'blocked', verification: 'not_run', requestVersion: child.steerInputs.length + 1, gaps: ['Cancelled by user'] }
+      }
     }
     return true
   }

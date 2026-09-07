@@ -1,13 +1,19 @@
+import { DEFAULT_MODEL_BUDGET } from '../model/execution.js'
+import { flushOutbox } from '../control-plane/outbox.js'
+import { resumeDependents } from '../control-plane/dependencies.js'
+import { candidateHash } from '../outcome/verification.js'
+import { candidateActions, inspectActions } from '../outcome/action-check.js'
+import { workStatusOf } from '../protocol/types.js'
 import { ControlPlaneServer } from '../control-plane/http-server.js'
 import { checkStorage } from './storage.js'
 import { captureMemoryEvidence, retryMemorySynthesis } from '../memory/evidence.js'
 import { registerProcessors } from '../worker/processors.js'
-import { readArtifact, persistArtifacts, stageArtifact } from './artifacts.js'
+import { readArtifact, persistArtifacts, stageArtifact, inspectArtifacts } from './artifacts.js'
 import { resolve } from 'node:path'
 import { snapshotAttachments, type RequestAttachment } from '../context/attachments.js'
 import { recoverWait } from './recover-wait.js'
 import { continueInput, type InputContinuation } from './input.js'
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { ConfigError } from '../errors.js'
 import { ControlPlaneService } from '../control-plane/service.js'
 import { withTransaction, PgWorkStore, PgSessionStore, PgEventStore, PgActionLedger, PgModelBudgetStore, type SqlPool } from '../control-plane/pg-store.js'
@@ -33,6 +39,7 @@ import { createLogger, type Logger } from '../logging.js'
 import { MetricsRegistry } from '../metrics.js'
 import { loadModelBudget } from '../config.js'
 import { maintainStorage } from './maintenance.js'
+import { PgStepStore } from '../control-plane/steps.js'
 
 export interface LingxiOSOptions {
   logger?: Logger
@@ -97,7 +104,7 @@ export async function createLingxiOS(options: LingxiOSOptions) {
 }
 
 /** Package-internal assembly hook; never exposed as consumer configuration. */
-export async function assembleApp(options: LingxiOSOptions, integration?: Pick<ControlPlaneDeps, 'contextProvider' | 'capabilityResolver' | 'actionExecutor' | 'delivery'> & { beforeClaim?(): Promise<void> }) {
+export async function assembleApp(options: LingxiOSOptions, integration?: Pick<ControlPlaneDeps, 'contextProvider' | 'capabilityResolver' | 'actionExecutor' | 'delivery'> & { tools?: readonly import('../tools/catalog.js').ToolDefinition[]; backgroundJobs?: Record<string, () => Promise<unknown>> }) {
   if (!options.database?.query || !options.database.connect) throw new ConfigError('a PostgreSQL pool is required')
   if (options.lectureDeck && !options.lectureDeck.dependencies.publisher.read) throw new ConfigError('lecture publisher must support reading committed artifacts for recovery')
   if (options.model && ((options.model.id !== undefined && !options.model.id.trim()) || !options.model.apiKey?.trim())) throw new ConfigError('model apiKey is required and any explicit model id must be non-empty')
@@ -107,53 +114,59 @@ export async function assembleApp(options: LingxiOSOptions, integration?: Pick<C
   const logger = options.logger ?? createLogger()
   const metrics = options.metrics ?? new MetricsRegistry()
   const homesRoot = resolve(options.kernel?.homesRoot ?? process.env['AGENT_OS_HOMES_ROOT'] ?? '.agent-os/homes')
-  const modelBudget = { ...loadModelBudget(), ...options.modelBudget }
+  const modelBudget = { ...DEFAULT_MODEL_BUDGET, ...loadModelBudget(), ...options.modelBudget }
+  if (process.env['NODE_ENV'] === 'production' && !(modelBudget.inputCostMicrosPerMillion > 0 || modelBudget.outputCostMicrosPerMillion > 0)) {
+    throw new ConfigError('production requires configured model token prices')
+  }
   metrics.gauge('agentos_cost_budget_enabled', 'Configured prices make the cost budget effective').set(
     modelBudget.inputCostMicrosPerMillion! > 0 || modelBudget.outputCostMicrosPerMillion! > 0 ? 1 : 0)
   let lastContactAt = 0
-  let lastMaintenanceAt = 0
-  let maintenance: Promise<unknown> | undefined
   const persona = options.persona ?? { name: 'Assistant', role: 'assistant', instructions: 'Follow the current user request. Clearly distinguish verified results from remaining work.' }
   const workerId = options.worker?.id ?? `lingxios-${randomUUID()}`
   const sessions = new PgSessionStore(options.database)
-  async function flushDeliveries(runId?: string) {
+  async function flushDeliveries() {
     if (!integration) return
-    const claimToken = randomUUID()
-    const { rows } = await options.database.query(
-      `WITH candidate AS (
-         SELECT outbox.run_id,messages.message
-         FROM lingxios.agent_delivery_outbox outbox
-         JOIN lingxios.agent_messages messages ON messages.run_id=outbox.run_id
-         JOIN lingxios.agent_work_items current ON current.id=outbox.run_id
-        WHERE outbox.delivered_at IS NULL AND outbox.available_at <= NOW()
-          AND ($1::text IS NULL OR outbox.run_id=$1)
-          AND current.cancel_requested_at IS NULL
-          AND (messages.message->'envelope'->>'requestVersion')::integer=jsonb_array_length(current.steer_inputs)+1
-        ORDER BY outbox.available_at,messages.committed_at LIMIT 1 FOR UPDATE OF outbox SKIP LOCKED)
-       UPDATE lingxios.agent_delivery_outbox outbox
-          SET claim_token=$2,available_at=NOW()+INTERVAL '60 seconds',attempts=LEAST(outbox.attempts+1,30)
-         FROM candidate WHERE outbox.run_id=candidate.run_id
-       RETURNING outbox.run_id,outbox.work,candidate.message`, [runId ?? null, claimToken])
-    for (const row of rows) {
-      // Native delivery uses a stable message ID; sends exceeding the claim window may overlap.
-      try {
-        await integration.delivery.deliverMessage(row['work'] as Omit<WorkItem, 'leaseToken'>, row['message'] as AssistantMessage)
-        await options.database.query('UPDATE lingxios.agent_delivery_outbox SET delivered_at=NOW(),claim_token=NULL WHERE run_id=$1 AND claim_token=$2', [row['run_id'], claimToken])
-      } catch {
-        await options.database.query(`UPDATE lingxios.agent_delivery_outbox SET claim_token=NULL,
-          available_at=NOW()+LEAST(300,5*power(2,LEAST(attempts-1,6)))*INTERVAL '1 second'
-          WHERE run_id=$1 AND claim_token=$2`, [row['run_id'], claimToken])
-        // The committed answer survives transport failure; the outbox owns retry.
-      }
-    }
+    await flushOutbox(options.database, 'agent_delivery_outbox', row => integration.delivery.deliverMessage(
+      row['work'] as Omit<WorkItem, 'leaseToken'>, row['message'] as AssistantMessage))
+  }
+  async function flushEvents() {
+    if (!integration) return
+    await flushOutbox(options.database, 'agent_run_events', row => integration.delivery.onEvent(
+      row['delivery_work'] as Omit<WorkItem, 'leaseToken'>, { runId: String(row['run_id']), seq: Number(row['seq']),
+        kind: String(row['kind']), stage: row['stage'] as RunEvent['stage'], visibility: row['visibility'] as RunEvent['visibility'],
+        data: row['data'] as RunEvent['data'] }))
+  }
+  async function flushModelUsage() {
+    if (!options.onModelCall) return
+    await flushOutbox(options.database, 'agent_model_budget_calls', row => options.onModelCall!(
+      row['observation'] as import('../model/execution.js').ModelCallObservation))
   }
 
   const service = new ControlPlaneService({
+    ...(integration?.tools ? { tools: integration.tools } : {}),
+    steps: new PgStepStore(options.database),
+    verifyCandidate: async (work, candidate) => {
+      const records = [...await inspectArtifacts(homesRoot, work, candidate.artifacts),
+        ...await inspectActions(options.database, work, candidate.requestVersion, integration?.tools ?? [], integration?.actionExecutor)]
+      const hash = candidateHash(candidate)
+      await withTransaction(options.database, async client => {
+        const current = await client.query(`SELECT id FROM lingxios.agent_work_items WHERE id=$1 AND fence=$2
+          AND status='leased' AND lease_expires_at>NOW() AND cancel_requested_at IS NULL
+          AND jsonb_array_length(steer_inputs)+1=$3 FOR UPDATE`, [work.id,work.fence,candidate.requestVersion])
+        if (!current.rows.length) throw new Error('candidate request changed while checking files')
+        for (const record of records) await client.query(`INSERT INTO lingxios.agent_verifications
+          (work_id,request_version,candidate_hash,checker,status,evidence) VALUES($1,$2,$3,$4,$5,$6::jsonb)
+          ON CONFLICT(work_id,request_version,candidate_hash,checker) DO UPDATE SET
+            status=EXCLUDED.status,evidence=EXCLUDED.evidence,observed_at=NOW()`,
+          [work.id,candidate.requestVersion,hash,record.checker,record.status,JSON.stringify(record.evidence)])
+      })
+      return { requestVersion: candidate.requestVersion, candidateHash: hash, records }
+    },
     logger, metrics,
     ...(options.lectureDeck ? { lecture: lectureControl(options.database, options.lectureDeck) } : {}),
     work: new PgWorkStore(options.database), sessions,
-    events: new PgEventStore(options.database), actions: new PgActionLedger(options.database),
-    modelBudgets: new PgModelBudgetStore(options.database),
+    events: new PgEventStore(options.database, Boolean(integration)), actions: new PgActionLedger(options.database),
+    modelBudgets: new PgModelBudgetStore(options.database), modelBudget,
     artifactStager: { stage: (work, artifact, bytes) => stageArtifact(
       resolve(options.kernel?.homesRoot ?? process.env['AGENT_OS_HOMES_ROOT'] ?? '.agent-os/homes'), work, artifact, bytes) },
     contextProvider: integration?.contextProvider ?? options.contextProvider ?? { loadContext: async (work) => {
@@ -173,7 +186,7 @@ export async function assembleApp(options: LingxiOSOptions, integration?: Pick<C
           [work.id, work.tenantId, work.agentId, work.sessionId])
         return (result.rows[0]?.['message'] as AssistantMessage | undefined) ?? null
       },
-      onEvent: async (work, event) => { await integration?.delivery.onEvent(work, event) },
+      onEvent: async () => { background('events', flushEvents) },
       deliverMessage: async (work, message) => {
         const recordMemory = integration && (await integration.capabilityResolver.resolve(work)).some(grant => grant.name === 'memory')
         await persistArtifacts(resolve(options.kernel?.homesRoot ?? process.env['AGENT_OS_HOMES_ROOT'] ?? '.agent-os/homes'), work, message)
@@ -188,74 +201,88 @@ export async function assembleApp(options: LingxiOSOptions, integration?: Pick<C
           const { rows } = await client.query(
             `INSERT INTO lingxios.agent_messages (run_id, tenant_id, agent_id, session_id, message, home_epoch)
              VALUES ($1,$2,$3,$4,$5::jsonb,$6)
-             ON CONFLICT (run_id) DO UPDATE SET message=EXCLUDED.message
-             WHERE lingxios.agent_messages.message=EXCLUDED.message
+             ON CONFLICT (run_id) DO UPDATE SET message=EXCLUDED.message,home_epoch=EXCLUDED.home_epoch,committed_at=NOW()
+             WHERE (lingxios.agent_messages.message=EXCLUDED.message OR lingxios.agent_messages.message->'envelope'->'goalOutcome'->>'status' IN ('delegated','awaiting_input','awaiting_approval'))
                AND lingxios.agent_messages.tenant_id=EXCLUDED.tenant_id
                AND lingxios.agent_messages.agent_id=EXCLUDED.agent_id
                AND lingxios.agent_messages.session_id=EXCLUDED.session_id
-               AND lingxios.agent_messages.home_epoch=EXCLUDED.home_epoch
              RETURNING run_id`, [work.id, work.tenantId, work.agentId, work.sessionId, JSON.stringify(message), work.homeEpoch],
           )
           if (rows.length !== 1) throw new Error('a different response is already committed for this run')
-          if (recordMemory) await captureMemoryEvidence(client, work, message)
-          if (integration) await client.query('INSERT INTO lingxios.agent_delivery_outbox(run_id,work) VALUES($1,$2::jsonb) ON CONFLICT(run_id) DO NOTHING', [work.id, JSON.stringify(work)])
+          if (message.envelope.goalOutcome.status === 'satisfied') {
+            const hash = candidateHash({ body: message.body, requestVersion: message.envelope.requestVersion, artifacts: message.envelope.artifacts })
+            const checks = await client.query(`SELECT checker,status FROM lingxios.agent_verifications
+              WHERE work_id=$1 AND request_version=$2 AND candidate_hash=$3`, [work.id,message.envelope.requestVersion,hash])
+            if (message.envelope.artifacts.some(artifact => !checks.rows.some(check => check['checker'] === `artifact:${artifact.path}` && check['status'] === 'passed'))) throw new Error('candidate files require current authoritative checks')
+            const actions = await candidateActions(client, work.id, message.envelope.requestVersion, integration?.tools ?? [])
+            if (actions.length > 1024 || actions.some(action => !checks.rows.some(check => check['checker'] === `action:${action.key}` && check['status'] === 'passed'))) throw new Error('candidate writes require current authoritative checks')
+            const unresolved = await client.query(`SELECT 1 FROM lingxios.agent_action_intents intent
+              LEFT JOIN lingxios.agent_action_ledger receipt USING(idempotency_key)
+              LEFT JOIN LATERAL (SELECT resolution->'result' AS result FROM lingxios.agent_action_resolutions
+                WHERE idempotency_key=intent.idempotency_key ORDER BY resolution_seq DESC LIMIT 1) resolved ON TRUE
+              WHERE intent.intent->>'workId'=$1 AND (COALESCE(resolved.result,receipt.result) IS NULL
+                OR COALESCE(resolved.result,receipt.result)->>'executionState'='unknown'
+                OR COALESCE(resolved.result,receipt.result)->'approval'->>'status'='PENDING') LIMIT 1`, [work.id])
+            if (unresolved.rows.length) throw new Error('unresolved effects prevent successful completion')
+          }
+          await client.query(`INSERT INTO lingxios.agent_results(work_id,candidate_hash,request_version,fence,message)
+            VALUES($1,$2,$3,$4,$5::jsonb) ON CONFLICT DO NOTHING`,
+            [work.id,createHash('sha256').update(JSON.stringify(message)).digest('hex'),message.envelope.requestVersion,work.fence,JSON.stringify(message)])
+          if (recordMemory && !['awaiting_input','awaiting_approval','delegated'].includes(message.envelope.goalOutcome.status)) await captureMemoryEvidence(client, work, message)
+          const status = workStatusOf({ status: 'completed', goalOutcome: message.envelope.goalOutcome })
+          await client.query(`UPDATE lingxios.agent_work_items SET status=$3,result_text=$4,goal_outcome=$5::jsonb,
+            lease_token_hash=NULL,lease_expires_at=NULL,finished_at=CASE WHEN $3='waiting' THEN NULL ELSE NOW() END,
+            last_progress_at=NOW(),updated_at=NOW() WHERE id=$1 AND fence=$2`,
+            [work.id, work.fence, status, message.body, JSON.stringify(message.envelope.goalOutcome)])
+          await client.query('DELETE FROM lingxios.agent_os_session_leases WHERE work_id=$1 AND fence=$2', [work.id, work.fence])
+          if (integration) await client.query('INSERT INTO lingxios.agent_delivery_outbox(run_id,work) VALUES($1,$2::jsonb) ON CONFLICT(run_id) DO UPDATE SET work=EXCLUDED.work,delivered_at=NULL,available_at=NOW(),claim_token=NULL,attempts=0', [work.id, JSON.stringify(work)])
         })
-        await flushDeliveries(work.id)
       },
     },
   })
   async function claimWork(claimingWorkerId: string, requestId?: string, workKinds?: readonly string[]) {
-    if (!maintenance && Date.now() - lastMaintenanceAt > 60_000) {
-      lastMaintenanceAt = Date.now()
-      maintenance = maintainStorage(options.database, homesRoot).catch(error => logger.error('maintenance failed', { error })).finally(() => { maintenance = undefined })
-    }
-    await flushDeliveries()
-    if (integration) await retryMemorySynthesis(options.database)
-    await integration?.beforeClaim?.()
     const work = await service.claim(claimingWorkerId, requestId, workKinds)
     lastContactAt = Date.now()
     if (!work) return null
-    const { rows } = await options.database.query(
-      'SELECT message FROM lingxios.agent_messages WHERE run_id=$1 AND tenant_id=$2 AND agent_id=$3 AND session_id=$4',
-      [work.id, work.tenantId, work.agentId, work.sessionId])
-    const committed = rows[0]?.['message'] as AssistantMessage | undefined
-    if (committed) {
-      if (!committed.envelope) throw new Error('committed response envelope is missing')
-      // A durable response is the recovery checkpoint; do not regenerate it.
-      const session = await service.getSession(work, sessionKeyOf(work))
-      if (!session?.request || session.request.workId !== work.id
-        || session.request.revisions.length + 1 !== committed.envelope.requestVersion) throw new Error('committed response request snapshot is stale or missing')
-      const last = session.history.at(-1)
-      if (!last || !('role' in last) || last.role !== 'assistant' || last.content !== committed.body) {
-        session.history.push({ role: 'assistant', content: committed.body })
-        await service.saveSession(work, session)
-      }
-      await service.recordEvent(work, {
-        runId: work.id, seq: (work.fence - 1) * RUN_SEQUENCE_SPAN + 1,
-        kind: 'response.recovered', stage: 'completed', visibility: 'internal',
-        data: { requestVersion: committed.envelope.requestVersion, evidenceSnapshotId: committed.envelope.evidenceSnapshotId },
-      })
-      await service.complete(work, { status: 'completed', resultText: committed.body, goalOutcome: committed.envelope.goalOutcome })
-      return null
-    }
     if (await recoverWait(options.database, service, work)) return null
     return work
   }
   const host: HostPort = {
+    verifyCandidate: (work, candidate) => service.verifyCandidate(work, candidate),
+    saveStep: (work, step) => service.saveStep(work, step),
     lecture: (work, command) => service.lecture(work, command),
     claimWork: () => claimWork(workerId, undefined, local?.runtime.workKinds), heartbeat: async (work) => { const result = await service.heartbeat(work); lastContactAt = Date.now(); return result },
     loadContext: (work) => service.loadContext(work), executeAction: (work, action) => service.executeAction(work, action),
     reserveModelCall: (work, callId, limits) => service.reserveModelCall(work, callId, limits),
-    recordModelUsage: (work, callId, usage) => service.recordModelUsage(work, callId, usage),
+    recordModelUsage: (work, callId, usage, observation) => service.recordModelUsage(work, callId, usage, observation),
     recoverCell: (work, cellId) => service.recoverCell(work, cellId),
     recoverStep: (work, cellId) => service.recoverStep(work, cellId),
     stageArtifact: (work, artifact, bytes) => stageArtifact(
       resolve(options.kernel?.homesRoot ?? process.env['AGENT_OS_HOMES_ROOT'] ?? '.agent-os/homes'), work, artifact, bytes),
     emitEvent: (work, event) => service.recordEvent(work, event), loadSession: (work, key) => service.getSession(work, key),
     saveSession: async (work, session) => { session.revision = (await service.saveSession(work, session)).revision },
-    commitMessage: (work, message) => service.commitMessage(work, message), completeWork: (work, completion) => service.complete(work, completion),
+    commitResult: (work, message) => service.commitResult(work, message), completeWork: (work, completion) => service.complete(work, completion),
     yieldWork: (work) => service.yieldWork(work),
   }
+  const jobs = new Map<string, Promise<unknown>>()
+  const background = (name: string, operation: () => Promise<unknown>) => {
+    if (jobs.has(name) || stopped) return
+    const running = operation().catch(error => logger.warn(`${name} failed`, { error: error instanceof Error ? error.message : String(error) }))
+      .finally(() => { jobs.delete(name) })
+    jobs.set(name, running)
+  }
+  const deliveryTimer = setInterval(() => {
+    background('delivery', () => flushDeliveries())
+    background('events', flushEvents)
+    background('billing', () => flushModelUsage())
+    background('dependencies', () => resumeDependents(options.database))
+    for (const [name, operation] of Object.entries(integration?.backgroundJobs ?? {})) background(name, operation)
+    if (integration) background('memory synthesis', () => retryMemorySynthesis(options.database))
+  }, 1_000)
+  const maintenanceTimer = setInterval(() => {
+    background('storage maintenance', () => maintainStorage(options.database, homesRoot))
+  }, 60_000)
+  deliveryTimer.unref(); maintenanceTimer.unref()
   let stopped = false
   let stopPromise: Promise<void> | undefined
   let listening: Promise<number> | undefined
@@ -324,16 +351,10 @@ export async function assembleApp(options: LingxiOSOptions, integration?: Pick<C
     /** Trusted server boundary: use the authenticated original principal. */
     async cancel(identity: MessageIdentity & Pick<RequestInput, 'principalId' | 'threadId'>): Promise<boolean> {
       if (!identity || !identity.principalId?.trim()) throw new Error('authenticated principalId is required')
-      const { rows } = await options.database.query(`UPDATE lingxios.agent_work_items
-        SET cancel_requested_at=NOW(),status=CASE WHEN status='leased' THEN status ELSE 'cancelled' END,
-          finished_at=CASE WHEN status='leased' THEN finished_at ELSE NOW() END,
-          goal_outcome=jsonb_build_object('status','blocked','verification','inconclusive','requestVersion',jsonb_array_length(steer_inputs)+1,
-            'gaps',jsonb_build_array('Execution was cancelled')),updated_at=NOW()
+      const { rows } = await options.database.query(`SELECT id FROM lingxios.agent_work_items
         WHERE id=$1 AND tenant_id=$2 AND agent_id=$3 AND session_id=$4 AND principal_id=$5
-          AND thread_id IS NOT DISTINCT FROM $6 AND cancel_requested_at IS NULL
-          AND (status IN ('queued','leased') OR (status='completed' AND goal_outcome->>'status' IN ('awaiting_input','awaiting_approval')))
-        RETURNING id`, [identity.runId, identity.tenantId, identity.agentId, identity.sessionId, identity.principalId, identity.threadId ?? null])
-      return rows.length === 1
+          AND thread_id IS NOT DISTINCT FROM $6`, [identity.runId, identity.tenantId, identity.agentId, identity.sessionId, identity.principalId, identity.threadId ?? null])
+      return rows.length === 1 && service.requestCancel(identity.runId)
     },
     async enqueue(input: RequestInput) {
       if (typeof input.text !== 'string' || !input.text.trim() || typeof input.principalId !== 'string' || !input.principalId.trim()) {
@@ -426,9 +447,10 @@ export async function assembleApp(options: LingxiOSOptions, integration?: Pick<C
     start: async () => localExecution().worker.start(),
     stop() {
       stopped = true
+      clearInterval(deliveryTimer); clearInterval(maintenanceTimer)
       stopPromise ??= (async () => {
         await local?.worker.stop()
-        await maintenance
+        await Promise.race([Promise.allSettled([...jobs.values()]), new Promise(resolve => { const timer = setTimeout(resolve, 5_000); timer.unref() })])
         // The listen caller receives startup errors; shutdown still releases any listener.
         await listening?.catch(() => {})
         if (controlPlane) {

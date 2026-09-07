@@ -64,7 +64,7 @@ export async function executeMemorySynthesis(database: SqlPool, work: Omit<WorkI
         AND job.kind='memory_synthesis' AND job.tenant_id=$3 AND job.agent_id=$4 AND job.principal_id=$5 AND job.session_id=$6
         AND source.tenant_id=job.tenant_id AND source.agent_id=job.agent_id AND source.principal_id=job.principal_id
         AND source.session_id=job.session_id AND source.thread_id IS NOT DISTINCT FROM job.thread_id
-        AND source.status='completed' AND source.cancel_requested_at IS NULL
+        AND source.status IN ('succeeded','partial') AND source.cancel_requested_at IS NULL
         AND e.tenant_id=job.tenant_id AND e.agent_id=job.agent_id AND e.principal_id=job.principal_id AND e.session_id=job.session_id
         AND e.request_version=jsonb_array_length(source.steer_inputs)+1
       FOR UPDATE OF job,source,e`, [work.id, work.fence, work.tenantId, work.agentId, work.principalId, work.sessionId])

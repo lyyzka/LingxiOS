@@ -7,7 +7,7 @@
  */
 
 /** Control-plane HTTP API and worker claim protocol. */
-export const AGENT_OS_PROTOCOL_VERSION = 3 as const
+export const AGENT_OS_PROTOCOL_VERSION = 4 as const
 
 /** Kernel stdio (NDJSON) protocol between the manager and `kernel/runner.py`. */
 export const KERNEL_PROTOCOL_VERSION = 2 as const
@@ -24,7 +24,7 @@ export const RUN_SEQUENCE_SPAN = 100_000 as const
 /** Upper bound applied to any single tool/host payload surfaced to the model. */
 export const MAX_TOOL_OUTPUT_CHARS = 8_000 as const
 
-/** Name of the single tool exposed to the model. */
+/** Name of the Python execution tool alongside structured business tools. */
 export const IPYTHON_TOOL_NAME = 'ipython' as const
 
 /** Name of the in-kernel SDK module the model calls (`host.<capability>.<method>`). */

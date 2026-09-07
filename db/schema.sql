@@ -1,4 +1,4 @@
--- LingxiOS Agent OS — control-plane schema (protocol v3)
+-- LingxiOS Agent OS — control-plane schema (protocol v4)
 --
 -- Apply with: psql -f db/schema.sql
 -- All tables are owned by the control plane; workers never touch the database.
@@ -25,7 +25,10 @@ CREATE TABLE lingxios.agent_work_items (
   principal_id         TEXT,
   priority             INT NOT NULL DEFAULT 0,
   status               TEXT NOT NULL DEFAULT 'queued'
-                       CHECK (status IN ('queued','leased','completed','failed','cancelled')),
+                       CHECK (status IN ('queued','leased','waiting','succeeded','partial','blocked','failed','cancelled')),
+  started_at           TIMESTAMPTZ,
+  heartbeat_at         TIMESTAMPTZ,
+  last_progress_at     TIMESTAMPTZ,
   created_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   available_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   attempts             INT NOT NULL DEFAULT 0,
@@ -48,12 +51,69 @@ CREATE INDEX agent_work_items_claim_idx
   ON lingxios.agent_work_items (status, available_at)
   WHERE status IN ('queued','leased');
 
+CREATE TABLE lingxios.agent_attempts (
+  work_id TEXT NOT NULL REFERENCES lingxios.agent_work_items(id) ON DELETE CASCADE,
+  fence BIGINT NOT NULL,
+  lease_token_hash TEXT,
+  worker_id TEXT,
+  started_at TIMESTAMPTZ NOT NULL,
+  heartbeat_at TIMESTAMPTZ NOT NULL,
+  lease_expires_at TIMESTAMPTZ,
+  ended_at TIMESTAMPTZ,
+  reason TEXT,
+  PRIMARY KEY(work_id,fence)
+);
+
+CREATE FUNCTION lingxios.track_attempt() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  IF TG_OP='UPDATE' AND OLD.status='leased' AND (NEW.status<>'leased' OR NEW.fence<>OLD.fence) THEN
+    UPDATE lingxios.agent_attempts SET ended_at=LEAST(NOW(),COALESCE(OLD.lease_expires_at,NOW())),
+      reason=CASE WHEN NEW.status='leased' THEN 'lease_expired' ELSE NEW.status END
+      WHERE work_id=OLD.id AND fence=OLD.fence AND ended_at IS NULL;
+  END IF;
+  IF NEW.status='leased' THEN
+    INSERT INTO lingxios.agent_attempts(work_id,fence,lease_token_hash,worker_id,started_at,heartbeat_at,lease_expires_at)
+      VALUES(NEW.id,NEW.fence,NEW.lease_token_hash,NEW.leased_by,NOW(),COALESCE(NEW.heartbeat_at,NOW()),NEW.lease_expires_at)
+      ON CONFLICT(work_id,fence) DO UPDATE SET heartbeat_at=EXCLUDED.heartbeat_at,lease_expires_at=EXCLUDED.lease_expires_at;
+  END IF;
+  RETURN NEW;
+END $$;
+CREATE TRIGGER agent_work_attempt AFTER INSERT OR UPDATE ON lingxios.agent_work_items
+  FOR EACH ROW EXECUTE FUNCTION lingxios.track_attempt();
+
+CREATE TABLE lingxios.agent_steps (
+  step_seq BIGINT GENERATED ALWAYS AS IDENTITY,
+  work_id TEXT NOT NULL REFERENCES lingxios.agent_work_items(id) ON DELETE CASCADE,
+  step_id TEXT NOT NULL,
+  request_version INT NOT NULL CHECK(request_version>0),
+  kind TEXT NOT NULL,
+  input_hash TEXT NOT NULL,
+  input JSONB NOT NULL,
+  output JSONB,
+  artifacts JSONB NOT NULL DEFAULT '[]',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  completed_at TIMESTAMPTZ,
+  PRIMARY KEY(work_id,step_id)
+);
+
+CREATE TABLE lingxios.agent_verifications (
+  work_id TEXT NOT NULL REFERENCES lingxios.agent_work_items(id) ON DELETE CASCADE,
+  request_version INT NOT NULL,
+  candidate_hash TEXT NOT NULL,
+  checker TEXT NOT NULL,
+  status TEXT NOT NULL CHECK(status IN ('passed','failed','inconclusive')),
+  evidence JSONB NOT NULL,
+  observed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  PRIMARY KEY(work_id,request_version,candidate_hash,checker)
+);
+
 CREATE TABLE lingxios.agent_model_budgets (
   root_work_id       TEXT PRIMARY KEY REFERENCES lingxios.agent_work_items(id),
   max_model_calls    INT NOT NULL CHECK (max_model_calls > 0),
   max_tokens         BIGINT NOT NULL CHECK (max_tokens > 0),
   max_cost_micros    BIGINT NOT NULL CHECK (max_cost_micros > 0),
   deadline_at        TIMESTAMPTZ NOT NULL,
+  max_execution_ms   BIGINT NOT NULL DEFAULT 1800000 CHECK(max_execution_ms>0),
   model_calls        INT NOT NULL DEFAULT 0,
   tokens             BIGINT NOT NULL DEFAULT 0,
   cost_micros        BIGINT NOT NULL DEFAULT 0,
@@ -63,6 +123,14 @@ CREATE TABLE lingxios.agent_model_budgets (
 CREATE TABLE lingxios.agent_model_budget_calls (
   root_work_id TEXT NOT NULL REFERENCES lingxios.agent_model_budgets(root_work_id) ON DELETE CASCADE,
   call_id      TEXT NOT NULL,
+  work_id TEXT REFERENCES lingxios.agent_work_items(id),
+  fence BIGINT,
+  lease_token_hash TEXT,
+  observation JSONB,
+  delivered_at TIMESTAMPTZ,
+  available_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  claim_token TEXT,
+  attempts INT NOT NULL DEFAULT 0,
   reserved_tokens BIGINT NOT NULL DEFAULT 0 CHECK (reserved_tokens >= 0),
   reserved_cost_micros BIGINT NOT NULL DEFAULT 0 CHECK (reserved_cost_micros >= 0),
   input_tokens BIGINT,
@@ -201,8 +269,14 @@ CREATE TABLE lingxios.agent_run_events (
   data        JSONB NOT NULL DEFAULT '{}'::jsonb,
   recorded_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   expires_at  TIMESTAMPTZ,
+  delivery_work JSONB,
+  delivered_at TIMESTAMPTZ,
+  available_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  claim_token TEXT,
+  attempts INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (run_id, seq)
 );
+CREATE INDEX agent_run_events_delivery_idx ON lingxios.agent_run_events(available_at,run_id,seq) WHERE delivery_work IS NOT NULL AND delivered_at IS NULL;
 CREATE INDEX agent_run_events_expiry_idx ON lingxios.agent_run_events(expires_at) WHERE expires_at IS NOT NULL;
 
 -- An intent without a receipt is uncertain, never automatically re-executed.
@@ -228,6 +302,16 @@ CREATE TABLE lingxios.agent_messages (
   message JSONB NOT NULL,
   home_epoch BIGINT NOT NULL DEFAULT 1 CHECK (home_epoch > 0),
   committed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE lingxios.agent_results (
+  work_id TEXT NOT NULL REFERENCES lingxios.agent_work_items(id),
+  candidate_hash TEXT NOT NULL,
+  request_version INT NOT NULL,
+  fence BIGINT NOT NULL,
+  message JSONB NOT NULL,
+  committed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  PRIMARY KEY(work_id,candidate_hash)
 );
 
 CREATE TABLE lingxios.agent_delivery_outbox (
@@ -422,5 +506,5 @@ CREATE TRIGGER agent_work_memory_evidence
     OR OLD.status IS DISTINCT FROM NEW.status OR OLD.steer_inputs IS DISTINCT FROM NEW.steer_inputs)
   EXECUTE FUNCTION lingxios.supersede_memory_evidence();
 
-INSERT INTO lingxios.schema_version(singleton, version) VALUES(TRUE, 5);
+INSERT INTO lingxios.schema_version(singleton, version) VALUES(TRUE, 6);
 COMMIT;

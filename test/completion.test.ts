@@ -40,16 +40,16 @@ it('requires settled actions and a committed assessment, and binds delegation to
       data: { body: message.body, assessment, goalOutcome: outcome } })
     await assert.rejects(service.complete(work, { status: 'completed', resultText: message.body, goalOutcome: outcome }), /committed assessed response/)
     if (delegated) {
-      await assert.rejects(service.commitMessage(work, message), /delegated task is not pending/)
+      await assert.rejects(service.commitResult(work, message), /delegated task is not pending/)
       await workStore.enqueue({ id: 'child', tenantId: 't', principalId: 'u', agentId: 'child-agent', sessionId: 's', triggerRef: 'm', kind: 'turn', lane: 'collaboration',
         meta: { parentWorkId: 'w', parentRequestVersion: 1 } })
     } else {
       const action = { runId: 'w', cellId: 'c', callIndex: 0, action: 'files.save', args: {}, idempotencyKey: '["w","c",0]' }
       await actions.reserve(action.idempotencyKey, 'fingerprint', { workId: 'w', tenantId: 't', principalId: 'u', agentId: 'a', sessionId: 's', threadId: null, requestVersion: 1, action })
-      await assert.rejects(service.commitMessage(work, message), /evidence or artifact records/)
+      await assert.rejects(service.commitResult(work, message), /evidence or artifact records/)
       await actions.record(action.idempotencyKey, { ok: true, value: 'saved' })
     }
-    await service.commitMessage(work, message)
+    await service.commitResult(work, message)
     if (delegated) await workStore.requestCancel('child')
     await service.complete(work, { status: 'completed', resultText: message.body, goalOutcome: outcome })
     assert.deepEqual(workStore.inspect('w')?.goalOutcome, outcome)

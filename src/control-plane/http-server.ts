@@ -127,11 +127,11 @@ export class ControlPlaneServer {
     const body = parsed as Record<string, unknown>
 
     // Route table -----------------------------------------------------------
-    if (method === 'POST' && path === '/v3/work') {
+    if (method === 'POST' && path === '/v4/work') {
       json(res, 200, await service.enqueue(body as unknown as EnqueueWorkInput))
       return
     }
-    if (method === 'POST' && path === '/v3/work/claim') {
+    if (method === 'POST' && path === '/v4/work/claim') {
       if (body['requestId'] !== undefined && typeof body['requestId'] !== 'string') {
         throw new ControlPlaneError(400, 'requestId must be a string')
       }
@@ -142,7 +142,7 @@ export class ControlPlaneServer {
       return
     }
 
-    const workMatch = /^\/v3\/work\/([^/]+)\/([a-z-]+)$/.exec(path)
+    const workMatch = /^\/v4\/work\/([^/]+)\/([a-z-]+)$/.exec(path)
     if (workMatch) {
       const id = decodeURIComponent(workMatch[1]!)
       const operation = workMatch[2]!
@@ -165,7 +165,7 @@ export class ControlPlaneServer {
           case 'model-budget':
             json(res, 200, await service.reserveModelCall(proof, stringField(body, 'callId'), body['limits'] as never)); return
           case 'model-usage':
-            await service.recordModelUsage(proof, stringField(body, 'callId'), body['usage'] as never)
+            await service.recordModelUsage(proof, stringField(body, 'callId'), body['usage'] as never, body['observation'] as never)
             json(res, 200, { ok: true }); return
           case 'session':
             json(res, 200, { session: await service.getSession(proof, stringField(body, 'key')) }); return
@@ -177,13 +177,17 @@ export class ControlPlaneServer {
             json(res, 200, await service.recoverCell(proof, stringField(body, 'cellId'))); return
           case 'step':
             json(res, 200, await service.recoverStep(proof, stringField(body, 'cellId'))); return
+          case 'verify':
+            json(res, 200, await service.verifyCandidate(proof, body['candidate'] as never)); return
+          case 'checkpoint':
+            await service.saveStep(proof, body['step'] as never); json(res, 200, { ok: true }); return
           case 'artifacts':
             await service.stageArtifact(proof, body['artifact'] as never, stringField(body, 'contentBase64'))
             json(res, 200, { ok: true }); return
           case 'events':
             await service.recordEvent(proof, body['event'] as RunEvent); json(res, 200, { ok: true }); return
-          case 'messages':
-            await service.commitMessage(proof, body['message'] as AssistantMessage); json(res, 200, { ok: true }); return
+          case 'result':
+            await service.commitResult(proof, body['message'] as AssistantMessage); json(res, 200, { ok: true }); return
           case 'complete':
             await service.complete(proof, {
               status: body['status'] as WorkCompletion['status'],
@@ -202,7 +206,7 @@ export class ControlPlaneServer {
       }
     }
 
-    if (method === 'PUT' && path === '/v3/sessions') {
+    if (method === 'PUT' && path === '/v4/sessions') {
       const proof = leaseProofOf(stringField(body, 'workId'), body)
       json(res, 200, await service.saveSession(proof, body['session'] as SessionRecord))
       return

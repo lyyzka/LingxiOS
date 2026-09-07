@@ -1,3 +1,4 @@
+import { MemoryStepStore } from '../src/control-plane/steps.js'
 import { appendResearchEvidence } from '../src/context/research-evidence.js'
 import { createTaskContract } from '../src/context/task-contract.js'
 import assert from 'node:assert/strict'
@@ -30,8 +31,9 @@ it('delivers the latest recorded version of each artifact path', () => {
 it('restores prior artifact records without silently adding them to current delivery', async () => {
   let now = Date.now()
   const workStore = new MemoryWorkStore({}, () => now)
+  const steps = new MemoryStepStore()
   const messages: AssistantMessage[] = []
-  const service = new ControlPlaneService({ work: workStore, sessions: new MemorySessionStore(), events: new MemoryEventStore(), actions: new MemoryActionLedger(),
+  const service = new ControlPlaneService({ work: workStore, steps, sessions: new MemorySessionStore(), events: new MemoryEventStore(), actions: new MemoryActionLedger(),
     contextProvider: { loadContext: async () => ({ persona: { name: 'A', role: 'assistant', instructions: '' }, capabilities: [],
       messages: [{ ref: 'm', authorId: 'u', authorName: 'U', authorKind: 'human', body: 'Deliver the report', createdAt: 'now' }] }) },
     capabilityResolver: { resolve: async () => [] }, actionExecutor: { execute: async () => ({ ok: false }) },
@@ -43,6 +45,7 @@ it('restores prior artifact records without silently adding them to current deli
     data: { artifacts: [{ ...artifact, path: '../outside' }] } }), /invalid kernel artifact event/)
   await service.recordEvent(first, { runId: first.id, seq: 1, kind: 'ipython.completed', stage: 'completed', visibility: 'internal',
     data: { callId: 'prior-cell', requestVersion: 1, output: 'prior output', artifacts: [artifact] } })
+  await steps.save({ workId: first.id, fence: first.fence, leaseTokenHash: 'test' }, { id: 'prior-cell', kind: 'ipython', requestVersion: 1, input: { code: 'create()' }, output: 'prior output', artifacts: [artifact] })
   assert.deepEqual((await service.loadContext(first)).priorArtifacts, [])
   await workStore.requestPreempt(first.id)
   await service.yieldWork(first)
@@ -55,7 +58,7 @@ it('restores prior artifact records without silently adding them to current deli
     claimWork: async () => null, heartbeat: work => service.heartbeat(work), loadContext: work => service.loadContext(work),
     executeAction: (work, action) => service.executeAction(work, action), emitEvent: (work, event) => service.recordEvent(work, event),
     loadSession: (work, key) => service.getSession(work, key), saveSession: async (work, session) => { session.revision = (await service.saveSession(work, session)).revision },
-    commitMessage: (work, message) => service.commitMessage(work, message), completeWork: (work, completion) => service.complete(work, completion), yieldWork: work => service.yieldWork(work),
+    commitResult: (work, message) => service.commitResult(work, message), completeWork: (work, completion) => service.complete(work, completion), yieldWork: work => service.yieldWork(work),
   }
   const model: ModelDriver = {
     run: async request => {
@@ -110,7 +113,7 @@ it('uses the original evidence across hops and rejects a tampered final envelope
     claimWork: async () => null, heartbeat: (item) => service.heartbeat(item), loadContext: (item) => service.loadContext(item),
     executeAction: (item, action) => service.executeAction(item, action), emitEvent: (item, event) => service.recordEvent(item, event),
     loadSession: (item, key) => service.getSession(item, key), saveSession: async (item, session) => { session.revision = (await service.saveSession(item, session)).revision },
-    commitMessage: (item, message) => service.commitMessage(item, message), completeWork: async () => {}, yieldWork: async () => {},
+    commitResult: (item, message) => service.commitResult(item, message), completeWork: async () => {}, yieldWork: async () => {},
   }
   let calls = 0
   const model: ModelDriver = {
@@ -125,20 +128,20 @@ it('uses the original evidence across hops and rejects a tampered final envelope
   await new AgentRuntime(host, model, { execute: async () => { throw new Error('unexpected') } }).runWork(work)
   assert.equal(calls, 2)
   assert.equal(messages.length, 1)
-  await assert.rejects(service.commitMessage(work, { ...messages[0]!, threadId: 'another-thread' }), /stream identity/)
+  await assert.rejects(service.commitResult(work, { ...messages[0]!, threadId: 'another-thread' }), /stream identity/)
   assert.equal(messages.length, 1)
   assert.equal(messages[0]!.envelope?.citations[0]?.sources[0]?.sourceVersion, 'v1')
   const unverified = structuredClone(messages[0]!)
   unverified.envelope!.goalOutcome = { status: 'satisfied', verification: 'passed', requestVersion: 1 }
-  await assert.rejects(service.commitMessage(work, unverified), /authoritative acceptance evidence/)
+  await assert.rejects(service.commitResult(work, unverified), /authoritative acceptance evidence/)
   assert.equal(messages.length, 1)
   assert.equal(messages[0]!.threadId, '')
   const tampered = structuredClone(messages[0]!)
   tampered.envelope!.citations[0]!.sources[0]!.sourceVersion = 'forged'
-  await assert.rejects(service.commitMessage(work, tampered), /inconsistent/)
+  await assert.rejects(service.commitResult(work, tampered), /inconsistent/)
   const { envelope: _envelope, ...withoutEnvelope } = messages[0]!
-  await assert.rejects(service.commitMessage(work, withoutEnvelope as AssistantMessage), /envelope is required/)
-  await assert.rejects(service.commitMessage(work, { ...messages[0]!, data: { goalOutcome: messages[0]!.envelope.goalOutcome } } as AssistantMessage), /stream identity/)
+  await assert.rejects(service.commitResult(work, withoutEnvelope as AssistantMessage), /envelope is required/)
+  await assert.rejects(service.commitResult(work, { ...messages[0]!, data: { goalOutcome: messages[0]!.envelope.goalOutcome } } as AssistantMessage), /stream identity/)
   assert.equal(messages.length, 1)
   const session = (await sessions.get(sessionKeyOf(work)))!
   assert.deepEqual(await service.getSession(work, session.key), session)
@@ -152,22 +155,22 @@ it('uses the original evidence across hops and rejects a tampered final envelope
   const contract = createTaskContract(contracted.request!.originalText, 1, { deliverables: ['Explain with sources'], constraints: [], actions: [], acceptance: ['Supported explanation'] })
   contracted.request!.contract = contract
   await service.saveSession(work, contracted)
-  await assert.rejects(service.commitMessage(work, messages[0]!), /inconsistent/)
+  await assert.rejects(service.commitResult(work, messages[0]!), /inconsistent/)
   const withContract = structuredClone(messages[0]!)
   withContract.envelope!.taskContract = contract
   const replacedContract = structuredClone(withContract)
   replacedContract.envelope!.taskContract!.deliverables = ['Different deliverable']
-  await assert.rejects(service.commitMessage(work, replacedContract), /inconsistent/)
+  await assert.rejects(service.commitResult(work, replacedContract), /inconsistent/)
   assert.equal(messages.length, 1)
   const savedSession = (await sessions.get(sessionKeyOf(work)))!
   const missingSnapshot = t.mock.method(sessions, 'get', async () => null)
-  await assert.rejects(service.commitMessage(work, withContract), /saved request and evidence snapshot/)
+  await assert.rejects(service.commitResult(work, withContract), /saved request and evidence snapshot/)
   const { evidence: _evidence, ...requestWithoutEvidence } = savedSession.request!
   missingSnapshot.mock.mockImplementation(async () => ({ ...savedSession, request: requestWithoutEvidence as NonNullable<typeof savedSession.request> }))
-  await assert.rejects(service.commitMessage(work, withContract), /saved request and evidence snapshot/)
+  await assert.rejects(service.commitResult(work, withContract), /saved request and evidence snapshot/)
   missingSnapshot.mock.restore()
   await service.addSteer(work.id, 'Updated requirement before delivery')
-  await assert.rejects(service.commitMessage(work, withContract), /version is stale/)
+  await assert.rejects(service.commitResult(work, withContract), /version is stale/)
   assert.equal(messages.length, 1)
 })
 
@@ -186,7 +189,7 @@ it('promotes recorded research text into the next model input and validates fina
     claimWork: async () => null, heartbeat: work => service.heartbeat(work), loadContext: work => service.loadContext(work),
     executeAction: (work, action) => service.executeAction(work, action), emitEvent: (work, event) => service.recordEvent(work, event),
     loadSession: (work, key) => service.getSession(work, key), saveSession: async (work, session) => { session.revision = (await service.saveSession(work, session)).revision },
-    commitMessage: (work, message) => service.commitMessage(work, message), completeWork: (work, result) => { completion = result; return service.complete(work, result) }, yieldWork: work => service.yieldWork(work),
+    commitResult: (work, message) => service.commitResult(work, message), completeWork: (work, result) => { completion = result; return service.complete(work, result) }, yieldWork: work => service.yieldWork(work),
   }
   let calls = 0
   const model: ModelDriver = {

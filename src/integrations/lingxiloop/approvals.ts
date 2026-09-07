@@ -43,16 +43,7 @@ export async function approveRoutine(database: SqlPool, services: Pick<LingxiLoo
   await withTransaction(database, async client => {
     await client.query("SET LOCAL lock_timeout='5s'")
     await client.query("SET LOCAL statement_timeout='15s'")
-    const pending = await client.query(`SELECT approval.id FROM approvals approval
-      JOIN lingxios.agent_work_items work ON work.id=approval.work_id AND work.tenant_id=approval.company_id
-      WHERE approval.id=$1 AND approval.company_id=$2 AND approval.status='PENDING' AND approval.expires_at>NOW()
-        AND approval.idempotency_key=$3 AND approval.args=$4::jsonb AND approval.preview=$5::jsonb
-        AND work.status='completed' AND work.cancel_requested_at IS NULL
-        AND work.goal_outcome->>'status'='awaiting_approval' AND work.goal_outcome->>'approvalId'=$1
-        AND (work.goal_outcome->>'requestVersion')::integer=$6 AND jsonb_array_length(work.steer_inputs)+1=$6
-      FOR UPDATE OF approval,work`, [input.approvalId, input.companyId, reviewed.action.idempotencyKey,
-      JSON.stringify(reviewed.action.args), JSON.stringify(reviewed.preview), reviewed.requestVersion])
-    if (pending.rows.length !== 1) throw new Error('routine approval expired or changed before execution')
+    await lockPendingApproval(client, input, reviewed)
     const native = await approvalNativeWork(client, input.companyId, reviewed.action.idempotencyKey)
     const work = { tenantId: native.companyId, agentId: native.agentId, sessionId: native.channelId,
       principalId: native.authorizationUserId!, ...(native.threadRootClientMsgNo !== undefined ? { threadId: native.threadRootClientMsgNo } : {}) }
@@ -60,14 +51,44 @@ export async function approveRoutine(database: SqlPool, services: Pick<LingxiLoo
     const preview = await routinePreview(client, services, work, reviewed.action)
     if (!isDeepStrictEqual(preview, reviewed.preview)) throw new Error('routine approval preview is stale')
     const value = await applyRoutineApproval(client, services, work, reviewed.action, preview)
-    await client.query(`UPDATE approvals SET status='EXECUTED',resolved_at=NOW(),resolved_by=$2,executed_at=NOW(),result=$3::jsonb,error=NULL WHERE id=$1`,
-      [input.approvalId, input.userId, JSON.stringify(value)])
-    const receipt = await client.query(`UPDATE lingxios.agent_action_ledger SET result=$2::jsonb
-      WHERE idempotency_key=$1 AND result->'approval'->>'id'=$3 RETURNING idempotency_key`,
-      [reviewed.action.idempotencyKey, JSON.stringify({ ok: true, value }), input.approvalId])
-    if (receipt.rows.length !== 1) throw new Error('routine approval receipt is missing')
+    await recordExecutedApproval(client, input, reviewed, value, 'PENDING')
   })
   return resumeApproved(database, input, reviewed)
+}
+
+/** Lock the pending request, intent and approval together before a transactional domain mutation. */
+export async function lockPendingApproval(database: SqlQueryable, input: { companyId: string; approvalId: string },
+  reviewed: Awaited<ReturnType<typeof inspectApproval>>): Promise<ActionIntent> {
+  const pending = await database.query(`SELECT intent.intent FROM approvals approval
+    JOIN lingxios.agent_work_items work ON work.id=approval.work_id AND work.tenant_id=approval.company_id
+    JOIN lingxios.agent_action_intents intent ON intent.idempotency_key=approval.idempotency_key
+    JOIN lingxios.agent_os_sessions session ON session.tenant_id=work.tenant_id AND session.agent_id=work.agent_id
+      AND session.session_id=work.session_id AND session.thread_id IS NOT DISTINCT FROM work.thread_id
+    WHERE approval.id=$1 AND approval.company_id=$2 AND approval.status='PENDING' AND approval.expires_at>NOW()
+      AND approval.idempotency_key=$3 AND approval.args=$4::jsonb AND approval.preview=$5::jsonb AND approval.action=$7
+      AND work.status='waiting' AND work.cancel_requested_at IS NULL
+      AND work.goal_outcome->>'status'='awaiting_approval' AND work.goal_outcome->>'approvalId'=$1
+      AND (work.goal_outcome->>'requestVersion')::integer=$6 AND jsonb_array_length(work.steer_inputs)+1=$6
+      AND EXISTS (SELECT 1 FROM lingxios.agent_request_snapshots snapshot WHERE snapshot.work_id=work.id
+        AND snapshot.session_key=session.session_key AND snapshot.request_snapshot->'revisions'=work.steer_inputs)
+    FOR UPDATE OF approval,work,session,intent`, [input.approvalId,input.companyId,reviewed.action.idempotencyKey,
+    JSON.stringify(reviewed.action.args),JSON.stringify(reviewed.preview),reviewed.requestVersion,reviewed.action.action])
+  const intent = pending.rows[0]?.['intent'] as ActionIntent | undefined
+  if (!intent) throw new Error('approval expired or changed before execution')
+  return intent
+}
+
+/** Called inside the same transaction as an effect, or after an authoritative external receipt. */
+export async function recordExecutedApproval(database: SqlQueryable, input: { companyId: string; userId: string; approvalId: string },
+  reviewed: Awaited<ReturnType<typeof inspectApproval>>, value: unknown, expectedStatus: 'PENDING' | 'EXECUTING') {
+  const updated = await database.query(`UPDATE approvals SET status='EXECUTED',resolved_at=NOW(),resolved_by=$2,executed_at=NOW(),result=$3::jsonb,error=NULL
+    WHERE id=$1 AND company_id=$4 AND status=$5 AND idempotency_key=$6 RETURNING id`,
+    [input.approvalId,input.userId,JSON.stringify(value),input.companyId,expectedStatus,reviewed.action.idempotencyKey])
+  if (updated.rows.length !== 1) throw new Error('approval changed while executing')
+  const receipt = await database.query(`UPDATE lingxios.agent_action_ledger SET result=$2::jsonb
+    WHERE idempotency_key=$1 AND result->'approval'->>'id'=$3 RETURNING idempotency_key`,
+    [reviewed.action.idempotencyKey,JSON.stringify({ ok: true, value }),input.approvalId])
+  if (receipt.rows.length !== 1) throw new Error('approval receipt is missing')
 }
 
 /** Human-facing review only; this neither decides nor executes an approval. */
@@ -125,7 +146,7 @@ export async function claimApprovalExecution(database: SqlQueryable,
         AND intent.idempotency_key=approval.idempotency_key
         AND approval.id=$1 AND approval.company_id=$3 AND approval.status='PENDING' AND approval.expires_at>NOW()
         AND approval.idempotency_key=$4 AND approval.args=$5::jsonb AND approval.preview=$6::jsonb
-        AND work.status='completed' AND work.cancel_requested_at IS NULL
+        AND work.status='waiting' AND work.cancel_requested_at IS NULL
         AND work.goal_outcome->>'status'='awaiting_approval' AND work.goal_outcome->>'approvalId'=$1
         AND (work.goal_outcome->>'requestVersion')::integer=$7 AND jsonb_array_length(work.steer_inputs)+1=$7
       RETURNING intent.intent`, params)
@@ -139,7 +160,7 @@ export async function claimApprovalExecution(database: SqlQueryable,
     JOIN lingxios.agent_action_intents intent ON intent.idempotency_key=approval.idempotency_key
     WHERE approval.id=$1 AND approval.company_id=$3 AND approval.status='EXECUTING'
       AND approval.idempotency_key=$4 AND approval.args=$5::jsonb AND approval.preview=$6::jsonb
-      AND work.status='completed' AND work.cancel_requested_at IS NULL
+      AND work.status='waiting' AND work.cancel_requested_at IS NULL
       AND work.goal_outcome->>'status'='awaiting_approval' AND work.goal_outcome->>'approvalId'=$1
       AND (work.goal_outcome->>'requestVersion')::integer=$7 AND jsonb_array_length(work.steer_inputs)+1=$7`, params)
   const intent = existing.rows[0]?.['intent'] as ActionIntent | undefined
@@ -250,7 +271,7 @@ export async function rejectApproval(database: SqlPool, services: Pick<LingxiLoo
     if (active.rows.length) throw new Error('session is active; retry rejection after it pauses')
     const resumed = await client.query(`UPDATE lingxios.agent_work_items SET status='queued', available_at=NOW(),
         goal_outcome=NULL,finished_at=NULL,result_text=NULL,error=NULL,updated_at=NOW()
-      WHERE id=$1 AND status='completed' AND cancel_requested_at IS NULL
+      WHERE id=$1 AND status='waiting' AND cancel_requested_at IS NULL
         AND goal_outcome->>'status'='awaiting_approval' AND goal_outcome->>'approvalId'=$2
         AND (goal_outcome->>'requestVersion')::integer=$3 RETURNING id`, [row['id'], input.approvalId, reviewed.requestVersion])
     if (resumed.rows.length !== 1) throw new Error('work is not waiting for this approval')
@@ -281,16 +302,7 @@ export async function approveTeacher(database: SqlPool, services: Pick<LingxiLoo
   await withTransaction(database, async client => {
     await client.query("SET LOCAL lock_timeout='5s'")
     await client.query("SET LOCAL statement_timeout='15s'")
-    const pending = await client.query(`SELECT approval.id FROM approvals approval
-      JOIN lingxios.agent_work_items work ON work.id=approval.work_id AND work.tenant_id=approval.company_id
-      WHERE approval.id=$1 AND approval.company_id=$2 AND approval.status='PENDING' AND approval.expires_at>NOW()
-        AND approval.idempotency_key=$3 AND approval.args=$4::jsonb AND approval.preview=$5::jsonb
-        AND work.status='completed' AND work.cancel_requested_at IS NULL
-        AND work.goal_outcome->>'status'='awaiting_approval' AND work.goal_outcome->>'approvalId'=$1
-        AND (work.goal_outcome->>'requestVersion')::integer=$6 AND jsonb_array_length(work.steer_inputs)+1=$6
-      FOR UPDATE OF approval,work`, [input.approvalId, input.companyId, reviewed.action.idempotencyKey,
-      JSON.stringify(reviewed.action.args), JSON.stringify(reviewed.preview), reviewed.requestVersion])
-    if (pending.rows.length !== 1) throw new Error('teacher approval expired or changed before execution')
+    await lockPendingApproval(client, input, reviewed)
     const native = await approvalNativeWork(client, input.companyId, reviewed.action.idempotencyKey)
     const locked = transition ? await client.query(`SELECT project.id,course.id AS course_id,course.project_id FROM projects project
       JOIN courses course ON course.company_id=project.company_id AND course.project_id=project.id
@@ -363,12 +375,7 @@ export async function approveTeacher(database: SqlPool, services: Pick<LingxiLoo
         if (observed.rows.length !== 1 || observed.rows[0]!['status'] !== expectedStatus) throw new Error('teacher approval postcondition was not observed')
       }
     }
-    await client.query(`UPDATE approvals SET status='EXECUTED',resolved_at=NOW(),resolved_by=$2,executed_at=NOW(),result=$3::jsonb,error=NULL WHERE id=$1`,
-      [input.approvalId, input.userId, JSON.stringify(value)])
-    const receipt = await client.query(`UPDATE lingxios.agent_action_ledger SET result=$2::jsonb
-      WHERE idempotency_key=$1 AND result->'approval'->>'id'=$3 RETURNING idempotency_key`,
-      [reviewed.action.idempotencyKey, JSON.stringify({ ok: true, value }), input.approvalId])
-    if (receipt.rows.length !== 1) throw new Error('teacher approval receipt is missing')
+    await recordExecutedApproval(client, input, reviewed, value, 'PENDING')
   })
   return resumeApproved(database, input, reviewed)
 }
@@ -395,7 +402,7 @@ export async function approveKnowledge(database: SqlPool, services: LingxiLoopSe
       WHERE id=$1 AND company_id=$3 AND status='PENDING' AND expires_at>NOW()
         AND idempotency_key=$4 AND args=$5::jsonb AND preview=$6::jsonb
         AND EXISTS(SELECT 1 FROM lingxios.agent_work_items work WHERE work.id=approvals.work_id
-          AND work.tenant_id=$3 AND work.status='completed' AND work.cancel_requested_at IS NULL
+          AND work.tenant_id=$3 AND work.status='waiting' AND work.cancel_requested_at IS NULL
           AND work.goal_outcome->>'status'='awaiting_approval' AND work.goal_outcome->>'approvalId'=$1
           AND (work.goal_outcome->>'requestVersion')::integer=$7 AND jsonb_array_length(work.steer_inputs)+1=$7)
       RETURNING id`, [input.approvalId, input.userId, input.companyId, reviewed.action.idempotencyKey,
@@ -465,9 +472,9 @@ export async function resumeApproved(database: SqlPool, input: { companyId: stri
     if (active.rows.length) throw new Error('execution recorded; session is active, retry continuation after it pauses')
     const gap = 'The approved course transition closed the teacher room. Remaining work cannot continue in this room; overall goal acceptance and external archive synchronization are not verified.'
     const outcome = closedCourse ? { status: 'blocked', verification: 'inconclusive', requestVersion: reviewed.requestVersion, gaps: [gap] } : null
-    const resumed = await client.query(`UPDATE lingxios.agent_work_items SET status=CASE WHEN $4::jsonb IS NULL THEN 'queued' ELSE 'completed' END,available_at=NOW(),
+    const resumed = await client.query(`UPDATE lingxios.agent_work_items SET status=CASE WHEN $4::jsonb IS NULL THEN 'queued' ELSE 'blocked' END,available_at=NOW(),
         goal_outcome=$4::jsonb,finished_at=CASE WHEN $4::jsonb IS NULL THEN NULL ELSE NOW() END,result_text=$5,error=NULL,updated_at=NOW()
-      WHERE id=$1 AND status='completed' AND cancel_requested_at IS NULL
+      WHERE id=$1 AND status='waiting' AND cancel_requested_at IS NULL
         AND goal_outcome->>'status'='awaiting_approval' AND goal_outcome->>'approvalId'=$2
         AND (goal_outcome->>'requestVersion')::integer=$3 RETURNING id`, [row['id'], input.approvalId, reviewed.requestVersion, outcome ? JSON.stringify(outcome) : null, closedCourse ? gap : null])
     if (resumed.rows.length !== 1) throw new Error('execution recorded; work is not waiting for this approval')

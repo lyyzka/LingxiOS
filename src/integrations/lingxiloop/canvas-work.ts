@@ -147,7 +147,7 @@ export async function executeCanvasWork(database: SqlPool, services: Services, w
         [taskRef, work.tenantId, member.agentId, work.sessionId, work.threadId ?? work.triggerRef, work.principalId, work.triggerRef, blocked,
           JSON.stringify({ text: meta['text'], authorName: meta['authorName'], attachments: meta['attachments'], canvasId: canvas['id'], assignmentId,
             assignment: member.assignment, assignmentVersion: 1, ...(handoffInstruction ? { assignmentSteers: [{ id: action.idempotencyKey, agentId: work.agentId, text: handoffInstruction }] } : {}),
-            executionRole: member.executionRole, parentWorkId: work.id,
+            executionRole: member.executionRole, parentWorkId: work.id, rootWorkId: meta['rootWorkId'] ?? work.id,
             parentRequestVersion: (live.rows[0]!['steer_inputs'] as unknown[]).length + 1,
             parentActionKey: action.idempotencyKey }), JSON.stringify(live.rows[0]!['steer_inputs'])])
         created.push({ agentId: member.agentId, assignmentId, taskRef, waitingForDependencies: blocked })
@@ -237,16 +237,16 @@ export async function reconcileCanvasWork(database: SqlPool, services: Services)
       await client.query(`UPDATE canvas_agent_assignments a SET
         status=CASE WHEN w.status='cancelled' OR w.cancel_requested_at IS NOT NULL THEN 'cancelled'
           WHEN w.status='failed' THEN 'failed'
-          WHEN w.status='completed' AND w.goal_outcome->>'status' IN ('awaiting_input','awaiting_approval') THEN 'waiting'
-          WHEN w.status='completed' AND r.id IS NOT NULL THEN 'completed'
-          WHEN w.status='completed' THEN 'failed'
+          WHEN w.status='waiting' THEN 'waiting'
+          WHEN w.status IN ('succeeded','partial','blocked') AND r.id IS NOT NULL THEN 'completed'
+          WHEN w.status IN ('succeeded','partial','blocked') THEN 'failed'
           WHEN w.status='leased' THEN 'working' ELSE a.status END,
-        result=CASE WHEN w.status='completed' THEN w.result_text ELSE a.result END,
+        result=CASE WHEN w.status IN ('succeeded','partial','blocked') THEN w.result_text ELSE a.result END,
         error=CASE WHEN w.status='failed' THEN w.error
-          WHEN w.status='completed' AND COALESCE(w.goal_outcome->>'status','') NOT IN ('awaiting_input','awaiting_approval') AND r.id IS NULL
+          WHEN w.status IN ('succeeded','partial','blocked') AND COALESCE(w.goal_outcome->>'status','') NOT IN ('awaiting_input','awaiting_approval') AND r.id IS NULL
           THEN 'Canvas worker ended without a persisted assignment report' ELSE a.error END,
         completed_at=CASE WHEN w.status IN ('failed','cancelled') OR w.cancel_requested_at IS NOT NULL
-          OR (w.status='completed' AND COALESCE(w.goal_outcome->>'status','') NOT IN ('awaiting_input','awaiting_approval'))
+          OR (w.status IN ('succeeded','partial','blocked') AND COALESCE(w.goal_outcome->>'status','') NOT IN ('awaiting_input','awaiting_approval'))
           THEN COALESCE(a.completed_at,NOW()) ELSE NULL END,updated_at=NOW()
         FROM lingxios.agent_work_items w LEFT JOIN canvas_assignment_reports r ON r.assignment_id=w.meta->>'assignmentId'
           AND r.author_agent_id=w.agent_id AND r.company_id=w.tenant_id AND EXISTS (

@@ -11,6 +11,7 @@ export interface ModelUsage {
 }
 
 export interface ModelTurnResult {
+  callId?: string
   /** Structured final response; the runtime validates it against the captured request. */
   finalCandidate?: string
   /** Items to append to session history (assistant text and/or tool calls). */
@@ -23,6 +24,7 @@ export interface ModelTurnResult {
 }
 
 export interface ModelTurnRequest {
+  tools?: readonly import('../tools/catalog.js').ToolDefinition[]
   instructions: string
   items: readonly ModelItem[]
   signal?: AbortSignal | undefined
@@ -55,6 +57,9 @@ export interface CompactionResult {
 }
 
 export interface ModelDriver {
+  /** Runtime owns retries so each outbound request reserves and settles its own budget. */
+  singleAttempt?(): ModelDriver
+  nextCallId?(): string
   readonly modelId?: string
   /** Hash of non-secret provider parameters needed to identify a replay configuration. */
   readonly configurationFingerprint?: string

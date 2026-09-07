@@ -3,7 +3,7 @@ import { withTransaction, type SqlPool } from '../../control-plane/pg-store.js'
 import type { HostAction, WorkItem } from '../../protocol/types.js'
 import type { LingxiLoopServices, NativeEmailAttachment, NativeMessage } from './service-contracts.js'
 import { EMAIL_APPROVAL_METHODS } from './email.js'
-import { claimApprovalExecution, inspectApproval, persistApproval, resumeApproved } from './approvals.js'
+import { recordExecutedApproval, claimApprovalExecution, inspectApproval, persistApproval, resumeApproved } from './approvals.js'
 
 type Services = Pick<LingxiLoopServices, 'email' | 'permissionService' | 'wukongClient'>
 
@@ -74,12 +74,7 @@ export async function approveEmail(database: SqlPool, services: Services, input:
     value = await prepared.execute()
   } else value = await replayEmail(services, work, reviewed.action, reviewed.preview, input.userId)
   await withTransaction(database, async db => {
-    const updated = await db.query(`UPDATE approvals SET status='EXECUTED',resolved_at=NOW(),resolved_by=$2,executed_at=NOW(),result=$3::jsonb,error=NULL
-      WHERE id=$1 AND company_id=$4 AND status='EXECUTING' RETURNING id`, [input.approvalId, input.userId, JSON.stringify(value), input.companyId])
-    if (updated.rows.length !== 1) throw new Error('email approval changed while executing')
-    const receipt = await db.query(`UPDATE lingxios.agent_action_ledger SET result=$2::jsonb WHERE idempotency_key=$1 AND result->'approval'->>'id'=$3 RETURNING idempotency_key`,
-      [reviewed.action.idempotencyKey, JSON.stringify({ ok: true, value }), input.approvalId])
-    if (receipt.rows.length !== 1) throw new Error('email approval receipt is missing')
+    await recordExecutedApproval(db, input, reviewed, value, 'EXECUTING')
   })
   return resumeApproved(database, input, reviewed)
 }

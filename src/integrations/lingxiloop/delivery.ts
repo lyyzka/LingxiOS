@@ -36,10 +36,10 @@ export async function deliverLingxiLoopEvent(database: SqlPool, services: Lingxi
     if (index !== undefined && !validIndex(index)) throw new Error('invalid model.completed event')
     if (validIndex(index)) await publish([{ type: 'part-finish', path: [index] }])
   } else if (event.kind === 'tool.started') {
-    const { toolCallId, partIndex, name, args } = event.data
-    const text = JSON.stringify(args)
+    const { toolCallId, partIndex, name } = event.data
+    const text = '{}'
     if (typeof toolCallId !== 'string' || !toolCallId.startsWith('host:') || !validIndex(partIndex)
-      || typeof name !== 'string' || !name || !args || typeof args !== 'object' || Array.isArray(args) || text.length > 8_000) throw new Error('invalid tool.started event')
+      || typeof name !== 'string' || !name) throw new Error('invalid tool.started event')
     await publish([{ type: 'part-start', path: [partIndex], part: { type: 'tool-call', toolCallId, toolName: name } },
       { type: 'text-delta', path: [partIndex], textDelta: text }, { type: 'tool-call-args-text-finish', path: [partIndex] }])
   } else if (event.kind === 'tool.completed') {
@@ -78,10 +78,10 @@ export async function deliverLingxiLoopEvent(database: SqlPool, services: Lingxi
 
 export async function finishLingxiLoopStream(database: SqlPool, services: LingxiLoopServices, work: Omit<WorkItem, 'leaseToken'>) {
   if (!services.publishAssistantStream) return
-  const { rows } = await database.query(`SELECT COALESCE(MAX(seq),0) AS seq,
-    COALESCE(SUM(CASE WHEN kind='model.completed' THEN (data->'usage'->>'inputTokens')::bigint ELSE 0 END),0) AS input_tokens,
-    COALESCE(SUM(CASE WHEN kind='model.completed' THEN (data->'usage'->>'outputTokens')::bigint ELSE 0 END),0) AS output_tokens
-    FROM lingxios.agent_run_events WHERE run_id=$1`, [work.id])
+  const { rows } = await database.query(`SELECT
+    (SELECT COALESCE(MAX(seq),0) FROM lingxios.agent_run_events WHERE run_id=$1) AS seq,
+    COALESCE(SUM(input_tokens),0) AS input_tokens,COALESCE(SUM(output_tokens),0) AS output_tokens
+    FROM lingxios.agent_model_budget_calls WHERE work_id=$1`, [work.id])
   const row = rows[0] ?? {}
   await services.publishAssistantStream({ type: 'assistant.stream', companyId: work.tenantId, conversationId: work.sessionId,
     messageId: `preview-${work.id}`, authorId: work.agentId, sequence: Number(row['seq'] ?? 0) * 2 + 1,

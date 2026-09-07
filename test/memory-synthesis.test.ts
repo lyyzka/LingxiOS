@@ -23,7 +23,7 @@ it('executes durable memory synthesis with independent verification, fenced atom
     const work: WorkItem = { id: `source-${sequence++}`, tenantId: 't', agentId: 'a', principalId: 'u', sessionId: 's',
       kind: 'turn', lane: 'interactive', triggerRef: 'm', fence: 1, homeEpoch: 1, leaseToken: 'test' }
     await db.query(`INSERT INTO lingxios.agent_work_items(id,tenant_id,agent_id,principal_id,session_id,kind,lane,trigger_ref,status)
-      VALUES($1,'t','a','u','s','turn','interactive','m','completed')`, [work.id])
+      VALUES($1,'t','a','u','s','turn','interactive','m','succeeded')`, [work.id])
     const revisions = revisionTime ? [{ id: 'revision', text: 'I still prefer visual examples.', createdAt: revisionTime }] : []
     if (revisionTime) await db.query("UPDATE lingxios.agent_work_items SET created_at='2000-01-01',steer_inputs=$2::jsonb WHERE id=$1", [work.id, JSON.stringify(revisions)])
     const request = { workId: work.id, sourceRef: 'm', authorId: 'u', originalText: 'I prefer visual examples.', revisions, attachments: [] }

@@ -23,10 +23,10 @@ export async function reconcileCanvasSummary(database: SqlQueryable, canvasId: s
           AND e.data->>'workId'=w.id AND e.data->>'requestVersion'=(jsonb_array_length(w.steer_inputs)+1)::text) AS report_ready
       FROM lingxios.agent_work_items w WHERE w.kind='canvas_summary' AND w.tenant_id=$2 AND w.meta->>'canvasId'=$1
       ORDER BY w.created_at DESC LIMIT 1 FOR UPDATE OF w`, [canvasId, canvas['company_id']])).rows[0]
-    if (!summary || !['completed', 'failed', 'cancelled'].includes(String(summary['status']))) return
+    if (!summary || !['succeeded', 'partial', 'blocked', 'failed', 'cancelled'].includes(String(summary['status']))) return
     const outcome = summary['goal_outcome'] as { status?: string } | null
     if (outcome?.status === 'awaiting_input' || outcome?.status === 'awaiting_approval') return
-    const status = summary['status'] === 'completed' && summary['report_ready'] ? 'completed' : summary['status'] === 'cancelled' ? 'stopped' : 'failed'
+    const status = ['succeeded','partial','blocked'].includes(String(summary['status'])) && summary['report_ready'] ? 'completed' : summary['status'] === 'cancelled' ? 'stopped' : 'failed'
     await database.query('UPDATE canvases SET status=$2,summary=$3,completed_at=NOW(),updated_at=NOW() WHERE id=$1',
       [canvasId, status, summary['result_text'] ?? summary['error'] ?? 'Canvas reporter ended without a persisted report'])
     await queueCanvasWorkspace(database, canvasId)
@@ -46,7 +46,7 @@ export async function reconcileCanvasSummary(database: SqlQueryable, canvasId: s
   await database.query(`INSERT INTO lingxios.agent_work_items(id,tenant_id,agent_id,session_id,principal_id,thread_id,kind,lane,trigger_ref,priority,meta,steer_inputs)
     VALUES($1,$2,$3,$4,$5,$6,'canvas_summary','collaboration',$7,200,$8::jsonb,$9::jsonb)`,
   [id, origin['tenant_id'], origin['agent_id'], origin['session_id'], origin['principal_id'], origin['thread_id'], origin['trigger_ref'],
-    JSON.stringify({ text: meta['text'], authorName: meta['authorName'], attachments: meta['attachments'], canvasId, executionRole: 'reporter', parentWorkId: origin['id'] }), JSON.stringify(origin['steer_inputs'])])
+    JSON.stringify({ text: meta['text'], authorName: meta['authorName'], attachments: meta['attachments'], canvasId, executionRole: 'reporter', parentWorkId: origin['id'], rootWorkId: meta['rootWorkId'] ?? origin['id'], parentRequestVersion: (origin['steer_inputs'] as unknown[]).length + 1 }), JSON.stringify(origin['steer_inputs'])])
   await database.query("UPDATE canvases SET status='summarizing',updated_at=NOW() WHERE id=$1", [canvasId])
   await queueCanvasWorkspace(database, canvasId)
 }

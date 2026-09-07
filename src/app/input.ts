@@ -50,7 +50,7 @@ export async function continueInput(database: SqlPool, input: InputContinuation)
       return { status: 'already_resumed' as const, workId: input.runId }
     }
     const outcome = row['goal_outcome'] as { status?: string; requestVersion?: number } | null
-    if (row['status'] !== 'completed' || row['cancel_requested_at'] !== null || outcome?.status !== 'awaiting_input'
+    if (row['status'] !== 'waiting' || row['cancel_requested_at'] !== null || outcome?.status !== 'awaiting_input'
       || outcome.requestVersion !== input.requestVersion || revisions.length + 1 !== input.requestVersion) throw new Error('work is not waiting for this input version')
     const active = await client.query('SELECT 1 FROM lingxios.agent_os_session_leases WHERE session_key=$1 AND expires_at>NOW()', [sessionKeyOf(input)])
     if (active.rows.length) throw new Error('session is active; retry after it pauses')

@@ -1,29 +1,16 @@
+import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { describe, it } from 'node:test'
 import { CorrectionBudget } from '../src/runtime/corrections.js'
 
-describe('CorrectionBudget', () => {
-  it('grants exactly one correction per category', () => {
-    const budget = new CorrectionBudget()
-    assert.equal(budget.consume('tool_protocol'), true)
-    assert.equal(budget.consume('tool_protocol'), false)
-  })
-
-  it('tracks categories independently', () => {
-    const budget = new CorrectionBudget()
-    assert.equal(budget.consume('tool_protocol'), true)
-    assert.equal(budget.consume('kernel_error'), true)
-    assert.equal(budget.consume('response_protocol'), true)
-    assert.equal(budget.consume('tool_protocol'), false)
-    assert.equal(budget.consume('kernel_error'), false)
-    assert.equal(budget.consume('response_protocol'), false)
-  })
-
-  it('has() reflects remaining budget without consuming it', () => {
-    const budget = new CorrectionBudget()
-    assert.equal(budget.has('tool_protocol'), true)
-    assert.equal(budget.has('tool_protocol'), true) // calling has() does not consume
-    budget.consume('tool_protocol')
-    assert.equal(budget.has('tool_protocol'), false)
-  })
+test('stalls only after rediagnosis and six identical failures; new evidence resets', () => {
+  const budget = new CorrectionBudget()
+  for (let n = 1; n <= 6; n++) {
+    assert.equal(budget.consume('kernel_error', 'same operation: missing file'), n < 6)
+    assert.equal(budget.rediagnose, n >= 3)
+  }
+  assert.equal(budget.consume('kernel_error', 'different operation: denied'), true)
+  budget.observe('new result')
+  assert.equal(budget.consume('kernel_error', 'same operation: missing file'), true)
+  budget.observe('new result') // Repeating the observation does not manufacture progress.
+  for (let n = 2; n <= 6; n++) assert.equal(budget.consume('kernel_error', 'same operation: missing file'), n < 6)
 })

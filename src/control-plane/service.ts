@@ -1,3 +1,5 @@
+import { candidateHash, type Candidate, type CandidateVerification } from '../outcome/verification.js'
+import { grantedTools, TASK_TOOLS, type ToolDefinition } from '../tools/catalog.js'
 import { appendResearchEvidence } from '../context/research-evidence.js'
 import { appendResourceCheck } from '../context/resource-checks.js'
 import { createTaskContract } from '../context/task-contract.js'
@@ -38,6 +40,10 @@ import type {
 import { isModelItem } from './stores.js'
 
 export interface ControlPlaneDeps {
+  modelBudget?: Required<import('../model/execution.js').RootModelBudgetOptions>
+  verifyCandidate?: (work: Omit<WorkItem, 'leaseToken'>, candidate: Candidate) => Promise<CandidateVerification>
+  tools?: readonly ToolDefinition[]
+  steps?: import('./steps.js').StepStore
   lecture?: (work: WorkItem, command: import('../lecture-deck/transport.js').LectureCommand) => Promise<unknown>
   work: WorkStore
   sessions: SessionStore
@@ -89,6 +95,36 @@ export function actionFingerprint(work: Pick<WorkItem, 'tenantId' | 'principalId
 }
 
 export class ControlPlaneService {
+  async verifyCandidate(proof: LeaseProof, candidate: Candidate): Promise<CandidateVerification> {
+    const work = await this.requireLease(proof, { rejectCancelled: true })
+    if (!candidate || typeof candidate.body !== 'string' || candidate.body.length > 100_000
+      || !Number.isSafeInteger(candidate.requestVersion) || candidate.requestVersion < 1) throw new ControlPlaneError(400, 'invalid candidate')
+    candidate = { ...candidate, artifacts: snapshotArtifacts(candidate.artifacts) }
+    const session = await this.getSession(proof, sessionKeyOf(work))
+    if (!session?.request || session.request.workId !== work.id || candidate.requestVersion !== session.request.revisions.length + 1) throw new ControlPlaneError(409, 'candidate request version is stale')
+    const facts = snapshotArtifacts((await this.deps.steps?.list(work.id) ?? []).flatMap(step => step.artifacts))
+    if (candidate.artifacts.some(artifact => !facts.some(fact => isDeepStrictEqual(fact, artifact)))) throw new ControlPlaneError(409, 'candidate artifact has no execution record')
+    if (!this.deps.verifyCandidate) return { requestVersion: candidate.requestVersion, candidateHash: candidateHash(candidate),
+      records: [{ checker: 'availability', status: 'inconclusive', evidence: { reason: 'No authoritative checker is configured' } }] }
+    return this.deps.verifyCandidate(work, candidate)
+  }
+
+  async saveStep(proof: LeaseProof, step: import('./steps.js').ExecutionStep): Promise<void> {
+    const work = await this.requireLease(proof, { rejectCancelled: true })
+    if (!this.deps.steps) throw new ControlPlaneError(501, 'durable steps are unavailable')
+    if (!step || typeof step.id !== 'string' || !step.id || step.id.length > 512
+      || !Number.isSafeInteger(step.requestVersion) || step.requestVersion < 1 || typeof step.kind !== 'string'
+      || !step.input || typeof step.input !== 'object' || Array.isArray(step.input)
+      || JSON.stringify(step.input).length > 1_000_000 || step.output !== undefined && (typeof step.output !== 'string' || step.output.length > 1_000_000)) throw new ControlPlaneError(400, 'invalid execution step')
+    snapshotArtifacts(step.artifacts)
+    if (step.kind === 'runtime.checkpoint') {
+      const state = step.input
+      if (typeof state['last'] !== 'string' || !Number.isSafeInteger(state['count']) || Number(state['count']) < 0 || Number(state['count']) > 6
+        || !Array.isArray(state['observations']) || state['observations'].length > 2048
+        || state['observations'].some(value => typeof value !== 'string' || !/^[a-f0-9]{64}$/.test(value))) throw new ControlPlaneError(400, 'invalid progress checkpoint')
+    }
+    await this.deps.steps.save({ workId: work.id, fence: proof.fence, leaseTokenHash: hashToken(proof.leaseToken) }, step)
+  }
   private readonly logger: Logger
 
   constructor(private readonly deps: ControlPlaneDeps) {
@@ -111,17 +147,38 @@ export class ControlPlaneService {
       || !Number.isSafeInteger(limits.maxCostMicros) || limits.maxCostMicros < 1
       || !Number.isFinite(Date.parse(limits.deadlineAt))) throw new ControlPlaneError(400, 'invalid model budget reservation')
     if ([limits.reservedTokens ?? 0, limits.reservedCostMicros ?? 0].some(value => !Number.isSafeInteger(value) || value < 0)) throw new ControlPlaneError(400, 'invalid reserved model resources')
-    return this.deps.modelBudgets.reserve(rootWorkId, callId, limits)
+    if (limits.maxExecutionMs !== undefined && (!Number.isSafeInteger(limits.maxExecutionMs) || limits.maxExecutionMs < 1)) throw new ControlPlaneError(400, 'invalid execution budget')
+    const policy = this.deps.modelBudget
+    if (policy) {
+      const input = limits.reservedInputTokens, output = limits.reservedOutputTokens
+      if (![input, output].every(value => Number.isSafeInteger(value) && Number(value) >= 0)
+        || input! + output! !== limits.reservedTokens) throw new ControlPlaneError(400, 'reservation requires input and output token bounds')
+      limits = { ...limits, maxModelCalls: Math.min(limits.maxModelCalls, policy.maxModelCalls),
+        maxTokens: Math.min(limits.maxTokens, policy.maxTokens), maxCostMicros: Math.min(limits.maxCostMicros, policy.maxCostMicros),
+        maxExecutionMs: Math.min(limits.maxExecutionMs ?? policy.wallClockMs, policy.wallClockMs),
+        reservedCostMicros: Math.ceil((input! * policy.inputCostMicrosPerMillion + output! * policy.outputCostMicrosPerMillion) / 1_000_000) }
+    }
+    return this.deps.modelBudgets.reserve(rootWorkId, callId, limits,
+      { workId: work.id, fence: proof.fence, leaseTokenHash: hashToken(proof.leaseToken) })
   }
 
-  async recordModelUsage(proof: LeaseProof, callId: string, usage: { inputTokens: number; outputTokens: number; costMicros: number }): Promise<void> {
-    const work = await this.requireLease(proof, { rejectCancelled: true })
+  async recordModelUsage(proof: LeaseProof, callId: string, usage: { inputTokens: number; outputTokens: number; costMicros: number }, observation?: import('../model/execution.js').ModelCallObservation): Promise<void> {
+    const work = await this.deps.work.getAttempt?.(proof.id, proof.fence, hashToken(proof.leaseToken)) ?? await this.requireLease(proof)
     if (!this.deps.modelBudgets) throw new ControlPlaneError(501, 'durable model budgets are unavailable')
     const rootWorkId = typeof work.meta?.['rootWorkId'] === 'string' ? work.meta['rootWorkId'] : work.id
     if (!await this.deps.work.ownsBudgetRoot(work, rootWorkId)) throw new ControlPlaneError(409, 'model budget root is outside this work lineage')
     if (!callId || callId.length > 256 || [usage?.inputTokens, usage?.outputTokens, usage?.costMicros]
       .some(value => !Number.isSafeInteger(value) || value < 0)) throw new ControlPlaneError(400, 'invalid model usage')
-    await this.deps.modelBudgets.record(rootWorkId, callId, usage.inputTokens, usage.outputTokens, usage.costMicros)
+    if (observation && (observation.callId !== callId || observation.workId !== work.id || observation.tenantId !== work.tenantId
+      || observation.agentId !== work.agentId || observation.sessionId !== work.sessionId || observation.principalId !== work.principalId
+      || observation.threadId !== work.threadId || !['agent-turn','structured','compaction','embedding'].includes(observation.purpose)
+      || !['succeeded','failed'].includes(observation.status) || !Number.isFinite(observation.latencyMs)
+      || observation.latencyMs < 0 || typeof observation.model !== 'string')) throw new ControlPlaneError(400, 'invalid model observation identity')
+    const policy = this.deps.modelBudget
+    const costMicros = policy ? Math.ceil((usage.inputTokens * policy.inputCostMicrosPerMillion
+      + usage.outputTokens * policy.outputCostMicrosPerMillion) / 1_000_000) : usage.costMicros
+    await this.deps.modelBudgets.record(rootWorkId, callId, usage.inputTokens, usage.outputTokens, costMicros,
+      { workId: work.id, fence: proof.fence, leaseTokenHash: hashToken(proof.leaseToken) }, observation)
   }
 
   /** Internal/operator API: append authoritative evidence settling an uncertain action. */
@@ -279,17 +336,21 @@ export class ControlPlaneService {
       context.capabilities = [...new Set([...context.capabilities, 'task'])]
       if (context.promptContextCandidate) context.promptContextCandidate = { ...context.promptContextCandidate, capabilities: context.capabilities }
     }
+    const steps = await this.deps.steps?.list(work.id) ?? []
+    const requestVersion = ((await this.deps.sessions.get(sessionKeyOf(work), work.id))?.request?.revisions.length ?? 0) + 1
+    const checkpoint = steps.findLast(step => step.kind === 'runtime.checkpoint' && step.requestVersion === requestVersion)
     const priorArtifacts = new Map<string, KernelArtifact>()
     if (work.fence > 1) {
-      const events = await this.deps.events.listRange(work.id, 0, (work.fence - 1) * RUN_SEQUENCE_SPAN, ['ipython.completed'])
-      for (const event of events) {
-        for (const artifact of snapshotArtifacts(event.data['artifacts'] as KernelArtifact[])) {
+      for (const step of steps) {
+        for (const artifact of snapshotArtifacts(step.artifacts)) {
           priorArtifacts.set(artifact.path, artifact)
           if (priorArtifacts.size > 512) throw new ControlPlaneError(409, 'prior artifact inventory exceeds the per-run limit')
         }
       }
     }
-    return { work: { ...work, leaseToken: proof.leaseToken }, ...context, priorArtifacts: [...priorArtifacts.values()] }
+    const grants = await this.deps.capabilityResolver.resolve(work)
+    if (typeof work.meta?.['text'] === 'string' && !grants.some(grant => grant.name === 'task')) grants.push({ name: 'task', methods: TASK_TOOLS.map(tool => tool.action.split('.')[1]!) })
+    return { work: { ...work, leaseToken: proof.leaseToken }, ...context, ...(checkpoint ? { executionCheckpoint: checkpoint.input as unknown as import('../runtime/corrections.js').ProgressCheckpoint } : {}), grants, dependencies: await this.deps.work.children?.(work) ?? [], tools: grantedTools(this.deps.tools ?? TASK_TOOLS, grants), priorArtifacts: [...priorArtifacts.values()] }
   }
 
   // -------------------------------------------------------------------------
@@ -349,6 +410,14 @@ export class ControlPlaneService {
       requestVersion = request.revisions.length + 1
     }
 
+    const tool = (this.deps.tools ?? TASK_TOOLS).find(tool => tool.action === action.action)
+    if (tool && Object.keys(action.args).some(key => !Object.hasOwn(tool.parameters.properties, key))) return { ok: false, error: 'unknown tool argument' }
+    if (tool?.effect !== 'read' && namespace !== 'task') {
+      const pending = await this.deps.actions.unsettled(work.id)
+      if (pending.some(item => item.actionKey !== action.idempotencyKey)) return {
+        ok: false, executionState: 'unknown', error: 'Prior actions require approval or reconciliation before starting another write',
+      }
+    }
     const fingerprint = actionFingerprint(work, action)
     const reservation = await this.deps.actions.reserve(action.idempotencyKey, fingerprint, {
       workId: work.id, tenantId: work.tenantId, principalId: work.principalId ?? null, agentId: work.agentId,
@@ -422,7 +491,7 @@ export class ControlPlaneService {
         result = { ok: true, value: { question }, directive: { type: 'defer', reason: 'user', data: { question } } }
       } else result = await this.deps.actionExecutor.execute(work, action)
     } catch (error) {
-      result = { ok: false, ...(namespace === 'task' ? {} : { executionState: 'unknown' as const }), error: errorMessage(error) }
+      result = { ok: false, ...(namespace === 'task' || tool?.effect === 'read' ? {} : { executionState: 'unknown' as const }), error: errorMessage(error) }
     }
     const recorded = await this.deps.actions.record(action.idempotencyKey, result)
     this.deps.metrics?.counter('agentos_actions_executed_total', 'Host actions executed').inc({
@@ -461,12 +530,8 @@ export class ControlPlaneService {
     const request = (await this.getSession(proof, sessionKeyOf(work)))?.request
     const requestVersion = request?.workId === work.id ? request.revisions.length + 1 : null
     if (requestVersion === null || work.fence <= 1) return null
-    const events = await this.deps.events.listRange(work.id, 0, (work.fence - 1) * RUN_SEQUENCE_SPAN, ['ipython.completed'])
-    const matches = events.filter(event => event.data['callId'] === cellId && event.data['requestVersion'] === requestVersion)
-    if (matches.length !== 1) return null
-    const output = matches[0]!.data['output'], artifacts = matches[0]!.data['artifacts']
-    if (typeof output !== 'string' || !Array.isArray(artifacts)) return null
-    return { output, artifacts: snapshotArtifacts(artifacts as KernelArtifact[]) }
+    const step = await this.deps.steps?.get(work.id, cellId, requestVersion)
+    return step?.output === undefined ? null : { output: step.output, artifacts: snapshotArtifacts(step.artifacts) }
   }
 
   async stageArtifact(proof: LeaseProof, artifact: KernelArtifact, contentBase64: string): Promise<void> {
@@ -520,7 +585,7 @@ export class ControlPlaneService {
       tenantId: work.tenantId,
       agentId: work.agentId,
       recordedAt: new Date().toISOString(),
-    }, { workId: work.id, fence: proof.fence, leaseTokenHash: hashToken(proof.leaseToken) })
+    }, { workId: work.id, fence: proof.fence, leaseTokenHash: hashToken(proof.leaseToken) }, work)
     if (!inserted) {
       await this.requireLease(proof)
       return // duplicate delivery of an already-recorded event
@@ -539,7 +604,14 @@ export class ControlPlaneService {
   // Final messages: stream-integrity verification
   // -------------------------------------------------------------------------
 
-  async commitMessage(proof: LeaseProof, message: AssistantMessage): Promise<void> {
+  async commitResult(proof: LeaseProof, message: AssistantMessage): Promise<void> {
+    if (!await this.deps.work.getLeased(proof.id, proof.fence, hashToken(proof.leaseToken))) {
+      const issued = await this.deps.work.getAttempt?.(proof.id, proof.fence, hashToken(proof.leaseToken))
+      if (issued) {
+        const prior = await this.deps.delivery.getMessage?.(issued)
+        if (prior && isDeepStrictEqual(prior, message)) return
+      }
+    }
     const work = await this.requireLease(proof, { rejectCancelled: true })
     if (
       !message || typeof message !== 'object'
@@ -556,21 +628,6 @@ export class ControlPlaneService {
     if (!message.envelope) {
       throw new ControlPlaneError(409, 'response envelope is required')
     }
-    const rangeStart = Math.max(0, work.fence - 1) * RUN_SEQUENCE_SPAN
-    const rangeEnd = work.fence * RUN_SEQUENCE_SPAN
-    const streamEvents = await this.deps.events.listRange(
-      work.id, rangeStart, rangeEnd, ['model.delta', 'model.completed', 'ipython.completed', 'response.assessed'],
-    )
-    const streamed = streamEvents
-      .filter((event) => event.kind === 'model.delta'
-        && event.data['partType'] === 'text' && typeof event.data['delta'] === 'string')
-      .map((event) => String(event.data['delta']))
-      .join('')
-      .trim()
-    const completedTurns = streamEvents.filter((event) => event.kind === 'model.completed')
-    if (!streamed || completedTurns.length === 0 || streamed !== message.body.trim()) {
-      throw new ControlPlaneError(409, 'assistant final message does not match its durably streamed deltas')
-    }
     if (message.envelope.goalOutcome?.verification === 'passed') {
       throw new ControlPlaneError(409, 'goal verification requires authoritative acceptance evidence')
     }
@@ -578,8 +635,11 @@ export class ControlPlaneService {
     if (!session?.request?.evidence) throw new ControlPlaneError(409, 'response requires a saved request and evidence snapshot')
     if (session.request.workId !== work.id) throw new ControlPlaneError(409, 'response request belongs to another work item')
     const evidence = session.request.evidence
-    const artifacts = streamEvents.filter((event) => event.kind === 'ipython.completed')
-      .flatMap((event) => Array.isArray(event.data['artifacts']) ? event.data['artifacts'] as KernelArtifact[] : [])
+    const recordedArtifacts = snapshotArtifacts((await this.deps.steps?.list(work.id) ?? []).flatMap(step => step.artifacts))
+    const artifacts = snapshotArtifacts(message.envelope.artifacts)
+    if (artifacts.some(artifact => !recordedArtifacts.some(recorded => isDeepStrictEqual(recorded, artifact)))) {
+      throw new ControlPlaneError(409, 'response artifact has no durable execution record')
+    }
     if (message.envelope.requestVersion !== session.request.revisions.length + 1) {
       throw new ControlPlaneError(409, 'response request version is stale')
     }
@@ -593,14 +653,12 @@ export class ControlPlaneService {
       const assessment = message.envelope.assessment
       if (assessment) {
         parseFinalCandidate(JSON.stringify({ body: message.body, ...assessment }), session.request)
-        if (!streamEvents.some(event => event.kind === 'response.assessed' && event.data['body'] === message.body
-          && isDeepStrictEqual(event.data['assessment'], assessment)
-          && isDeepStrictEqual(event.data['goalOutcome'], message.envelope.goalOutcome))) throw new Error('missing durable assessment')
+
       }
       if (message.envelope.goalOutcome.status === 'delegated' && (assessment?.status !== 'delegated'
         || assessment.taskRef !== message.envelope.goalOutcome.taskRef)) throw new Error('missing delegated self-assessment')
       if (message.envelope.goalOutcome.status === 'satisfied') {
-        if (assessment?.status !== 'satisfied') throw new Error('missing satisfied self-assessment')
+        if (assessment && assessment.status !== 'satisfied') throw new Error('conflicting self-assessment')
         if ((await this.deps.actions.unsettled(work.id)).length) throw new Error('business actions remain unresolved')
         const latest = new Map<string, unknown>()
         for (const record of session.request.resourceChecks ?? []) {

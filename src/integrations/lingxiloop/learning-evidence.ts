@@ -1,3 +1,4 @@
+import { lockAction, recordActionResult } from '../../control-plane/action-transaction.js'
 import { withTransaction, type SqlPool } from '../../control-plane/pg-store.js'
 import type { HostAction, WorkItem } from '../../protocol/types.js'
 import type { LingxiLoopServices } from './service-contracts.js'
@@ -40,6 +41,7 @@ export async function recordAttempt(database: SqlPool, services: Pick<LingxiLoop
     // Author/revision checks and native evidence reads must observe the same versions.
     await client.query('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ')
     await client.query("SET LOCAL statement_timeout='10s'")
+    await lockAction(client, work, action)
     const room = await api.findLearningRoomState(client, { companyId: work.tenantId, channelId: work.sessionId })
     if (!room || room.companyId !== work.tenantId) throw new Error('conversation is not bound to a learning project')
     await api.createPermissionService(client, { lockDependencies: true }).assertCan({ actorUserId: work.principalId!, companyId: work.tenantId,
@@ -66,7 +68,7 @@ export async function recordAttempt(database: SqlPool, services: Pick<LingxiLoop
     }, { companyId: work.tenantId, channelId: work.sessionId, agentId: work.agentId,
       ...(activityId ? { activityId } : { missionStepId: missionStepId! }), evidenceClientMsgNos, documentIds, canvasFrameIds, assistance })
     if (recorded.learnerId !== work.principalId || !recorded.id) throw new Error('recorded attempt does not match the authorized learner')
-    return recorded
+    return recordActionResult(client, action, recorded)
   })
   if (metric) api.inc('learning.attempt.accepted', metric.labels)
   return result

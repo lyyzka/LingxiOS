@@ -18,7 +18,7 @@ it('reports every processor model call to the product ledger with durable work s
   let completed: WorkCompletion | undefined
   const host: HostPort = { claimWork: async () => null, heartbeat: async () => ({ ok: true }),
     loadContext: async () => { throw new Error('unexpected context') }, executeAction: async () => ({ ok: true }),
-    loadSession: async () => null, saveSession: async () => {}, emitEvent: async () => {}, commitMessage: async () => {},
+    loadSession: async () => null, saveSession: async () => {}, emitEvent: async () => {}, commitResult: async () => {},
     completeWork: async (_work, value) => { completed = value }, yieldWork: async () => {} }
   const unexpected = async () => { throw new Error('unexpected model call') }
   const model: ModelDriver = { modelId: 'model-v1', run: unexpected, compact: unexpected,
@@ -44,12 +44,12 @@ for (const format of ['object', 'plain text'] as const) it(`preserves ${format} 
     loadContext: async () => ({ work, persona: { name: 'A', role: '', instructions: '' }, capabilities: [],
       messages: [{ ref: 'm', authorId: 'u', authorName: 'U', authorKind: 'human', body: 'Create a file.', createdAt: 'now' }] }),
     executeAction: async () => ({ ok: true }), loadSession: async () => null, saveSession: async () => {}, emitEvent: async () => {},
-    commitMessage: async (_work, message) => {
-      assert.equal(message.envelope.goalOutcome.status, 'partial')
+    commitResult: async (_work, message) => {
+      assert.equal(message.envelope.goalOutcome.status, format === 'object' ? 'blocked' : 'partial')
       assert.equal(message.body, 'File created.')
       assert.deepEqual(message.envelope.artifacts, [artifact])
       assert.equal(message.envelope.assessment, undefined)
-      assert.match(JSON.stringify(message.envelope.goalOutcome.gaps), /protocol correction exhausted/)
+      assert.match(JSON.stringify(message.envelope.goalOutcome.gaps), format === 'object' ? /protocol correction exhausted/ : /unavailable|unexpected/)
       committed = true
     }, completeWork: async () => {}, yieldWork: async () => {} }
   const unexpected = async () => { throw new Error('unexpected auxiliary call') }
@@ -61,7 +61,7 @@ for (const format of ['object', 'plain text'] as const) it(`preserves ${format} 
   } }
   await new AgentRuntime(host, model, { execute: async () => ({ executionId: 'execution', stdout: '', stderr: '', result: null,
     artifacts: [artifact], directives: [], truncated: false, durationMs: 1 }) }).runWork(work)
-  assert.equal(turns, 3)
+  assert.equal(turns, format === 'object' ? 7 : 2)
   assert.equal(committed, true)
 })
 
@@ -73,7 +73,7 @@ it('continues an actionable partial candidate before committing its result', asy
       messages: [{ ref: 'm', authorId: 'u', authorName: 'U', authorKind: 'human', body: 'Create a file.', createdAt: 'now' }] }),
     executeAction: async () => ({ ok: true, value: { requestVersion: 1, pending: [], truncated: false } }),
     loadSession: async () => null, saveSession: async () => {}, emitEvent: async () => {},
-    commitMessage: async (_work, message) => { assert.equal(executed, 1); body = message.body },
+    commitResult: async (_work, message) => { assert.equal(executed, 1); body = message.body },
     completeWork: async () => {}, yieldWork: async () => {} }
   const unexpected = async () => { throw new Error('unexpected auxiliary call') }
   const model: ModelDriver = { structured: unexpected, compact: unexpected, run: async request => {
@@ -110,7 +110,7 @@ it('drops optional recalled memory before allowing it to crowd out the original 
       return { ok: true, value: { requestVersion: 1, pending: [], truncated: false } }
     }, loadSession: async () => null, saveSession: async () => {},
     emitEvent: async (_work, event) => { if (event.kind === 'model.started') { omitted = event.data['memoryOmittedForBudget'] === true; assert.equal(event.data['memorySnapshot'], undefined) } },
-    commitMessage: async (_work, message) => {
+    commitResult: async (_work, message) => {
       assert.equal(message.body, 'Answer.')
       assert.deepEqual(message.envelope.goalOutcome, { status: 'satisfied', verification: 'not_run', requestVersion: 1 })
       committed = true
@@ -160,11 +160,12 @@ it('reviews complex candidates against original requirements, bounds corrections
       }, loadSession: async () => structuredClone(session),
       saveSession: async (_work, value) => { session = structuredClone(value) },
       emitEvent: async (_work, event) => { if (event.kind === 'model.delta') deltas.push(String(event.data['delta'])) },
-      commitMessage: async (_work, message) => {
+      commitResult: async (_work, message) => {
         body = message.body
+        completion = { status: 'completed', resultText: body, goalOutcome: message.envelope.goalOutcome }
         assert.notEqual(message.envelope?.goalOutcome.verification, 'passed')
         assert.deepEqual(message.envelope?.resourceChecks?.[0], resourceChecks[0])
-        assert.equal(message.envelope?.resourceChecks?.length, mode === 'fixed' || mode === 'exhausted' ? 3 : 2)
+        assert.equal(message.envelope?.resourceChecks?.length, mode === 'exhausted' ? 7 : mode === 'fixed' ? 3 : 2)
       },
       completeWork: async (_work, value) => { completion = value }, yieldWork: async () => {},
     }
@@ -195,7 +196,7 @@ it('reviews complex candidates against original requirements, bounds corrections
     await new AgentRuntime(host, model, { execute: async () => { throw new Error('unexpected kernel') } }).runWork(work)
     assert.equal(completion?.status, 'completed')
     assert.deepEqual(deltas, [body])
-    assert.equal(reviews, mode === 'fixed' || mode === 'exhausted' ? 2 : 1)
+    assert.equal(reviews, mode === 'exhausted' ? 6 : mode === 'fixed' ? 2 : 1)
     if (mode === 'fixed') {
       assert.equal(completion?.goalOutcome?.status, 'partial')
       assert.equal(body, 'Comparison with costs.')
@@ -234,7 +235,7 @@ it('preserves history across prompt upgrades and exposes assigned action receipt
   const host: HostPort = {
     claimWork: async () => null, heartbeat: async () => ({ ok: true }), loadContext: async () => context,
     executeAction: async () => ({ ok: true }), emitEvent: async () => {}, loadSession: async () => session,
-    saveSession: async (_work, value) => { checkpoint = structuredClone(value) }, commitMessage: async (_work, message) => { assert.equal(message.body, 'Saved.') },
+    saveSession: async (_work, value) => { checkpoint = structuredClone(value) }, commitResult: async (_work, message) => { assert.equal(message.body, 'Saved.'); completion = { status: 'completed', resultText: message.body, goalOutcome: message.envelope.goalOutcome } },
     completeWork: async (_work, result) => { completion = result }, yieldWork: async () => {},
   }
   const model: ModelDriver = {
@@ -256,15 +257,15 @@ it('preserves history across prompt upgrades and exposes assigned action receipt
     }, structured: async () => { throw new Error('unexpected') }, compact: async () => { throw new Error('unexpected') },
   }
   const kernels: KernelExecutor = { execute: async (_work, _run, _cell, _code, _signal, options) => {
-    assert.equal(_cell, 'c')
-    assert.deepEqual(checkpoint?.history.at(-1), { type: 'function_call', callId: 'c', name: 'ipython', arguments: '{"code":"result = host.files.save()"}' })
+    assert.match(_cell, /^step:/)
+    assert.deepEqual(checkpoint?.history.at(-1), { type: 'function_call', callId: 'c', stepId: _cell, name: 'ipython', arguments: '{"code":"result = host.files.save()"}' })
     const action = { runId: 'w', cellId: 'hop-1', callIndex: 0, action: 'files.save', args: {}, idempotencyKey: '[\"w\",\"hop-1\",0]' }
     await options?.onHostAction?.({ stage: 'started', action })
     await options?.onHostAction?.({ stage: 'completed', action, result: { ok: true, value: { id: 'document' } } })
     return { executionId: 'cell', stdout: '', stderr: '', result: null, durationMs: 1, truncated: false, artifacts: [], directives: [] }
   } }
   await new AgentRuntime(host, model, kernels).runWork(context.work)
-  assert.deepEqual(completion, { status: 'completed', resultText: 'Saved.', goalOutcome: { status: 'partial', verification: 'not_run', requestVersion: 1, gaps: ['Goal acceptance has not been checked'] } })
+  assert.deepEqual(completion, { status: 'completed', resultText: 'Saved.', goalOutcome: { status: 'partial', verification: 'inconclusive', requestVersion: 1, gaps: ['Durable business action reconciliation was unavailable', 'Content check was unavailable or returned invalid findings'] } })
   assert.equal(calls, 2)
   session.history.push({ type: 'function_call', callId: 'interrupted', name: 'ipython', arguments: '{"code":"host.files.save()"}' })
   await new AgentRuntime(host, model, kernels).runWork({ ...context.work, fence: 2 })
@@ -288,7 +289,7 @@ it('does not spend model-correction budget on provider failures', async () => {
     loadContext: async () => ({ work, persona: { name: '', role: '', instructions: '' }, capabilities: [],
       messages: [{ ref: 'm', authorId: 'u', authorName: 'U', authorKind: 'human', body: 'answer', createdAt: 'now' }] }),
     executeAction: async () => ({ ok: true }), emitEvent: async () => {}, loadSession: async () => null,
-    saveSession: async () => {}, commitMessage: async () => {}, yieldWork: async () => {},
+    saveSession: async () => {}, commitResult: async () => {}, yieldWork: async () => {},
     completeWork: async (_work, value) => { completion = value },
   }
   const unavailable = async () => { throw new Error('unexpected') }
@@ -297,7 +298,7 @@ it('does not spend model-correction budget on provider failures', async () => {
     structured: unavailable, compact: unavailable,
   }
   await new AgentRuntime(host, model, { execute: unavailable }).runWork(work)
-  assert.equal(calls, 1)
+  assert.equal(calls, 3)
   assert.equal(completion?.status, 'failed')
 })
 
@@ -310,7 +311,7 @@ it('records approval and input waiting without claiming goal completion or inven
       loadContext: async () => ({ work, persona: { name: '', role: '', instructions: '' }, capabilities: [], messages: [{ ref: 'm', authorId: 'u', authorName: 'User', authorKind: 'human', body: 'Save the requested file.', createdAt: 'now' }] }),
       executeAction: async () => ({ ok: true }), emitEvent: async (_work, event) => { assert.notEqual(event.kind, 'run.completed') },
       loadSession: async () => null, saveSession: async () => {},
-      commitMessage: async () => { throw new Error('waiting must not commit a final answer') },
+      commitResult: async () => { throw new Error('waiting must not commit a final answer') },
       completeWork: async (_work, result) => { completion = result }, yieldWork: async () => {},
     }
     const model: ModelDriver = {
@@ -344,9 +345,9 @@ it('discards an unexecuted model candidate when steering arrives during generati
     claimWork: async () => null,
     heartbeat: async () => ({ ok: true, steer: generated ? [{ id: 'revision', text: 'Use the new requirement', createdAt: 'now' }] : [] }),
     loadContext: async () => ({ work, persona: { name: 'A', role: 'assistant', instructions: '' }, capabilities: [], messages: [{ ref: 'm', authorId: 'u', authorName: 'U', authorKind: 'human', body: 'Original', createdAt: 'now' }] }),
-    executeAction: async () => { throw new Error('old action must not execute') }, emitEvent: async () => {},
+    executeAction: async (_work, action) => { assert.equal(action.action, 'task.inspect'); return { ok: true, value: { requestVersion: 2, pending: [], truncated: false } } }, emitEvent: async () => {},
     loadSession: async () => saved ? structuredClone(saved) : null, saveSession: async (_work, session) => { saved = structuredClone(session) },
-    commitMessage: async (_work, message) => { committed = message.body }, completeWork: async () => {}, yieldWork: async () => {},
+    commitResult: async (_work, message) => { committed = message.body }, completeWork: async () => {}, yieldWork: async () => {},
   }
   const model: ModelDriver = {
     run: async request => {
@@ -373,7 +374,7 @@ it('discards an unexecuted model candidate when steering arrives during generati
   assert.deepEqual(saved?.request?.revisions, revisions)
 })
 
-it('commits a bounded partial delivery on hop exhaustion, retaining artifacts and honoring late signals', async () => {
+it('commits a bounded partial delivery on root budget exhaustion, retaining artifacts and honoring late signals', async () => {
   for (const mode of ['normal', 'steer', 'cancel', 'lease_lost'] as const) {
     const work: TurnContext['work'] = { id: 'w', tenantId: 't', agentId: 'a', sessionId: 's', kind: 'turn', lane: 'interactive', triggerRef: 'm', fence: 1, homeEpoch: 1, leaseToken: 'token' }
     let executed = false
@@ -390,7 +391,7 @@ it('commits a bounded partial delivery on hop exhaustion, retaining artifacts an
         messages: [{ ref: 'm', authorId: 'u', authorName: 'U', authorKind: 'human', body: 'Create the requested report', createdAt: 'now' }] }),
       executeAction: async () => { throw new Error('unexpected') }, emitEvent: async () => {},
       loadSession: async () => null, saveSession: async (_work, session) => { saved = structuredClone(session) },
-      commitMessage: async (_work, message) => {
+      commitResult: async (_work, message) => {
         committed = true
         assert.deepEqual(saved?.history.at(-1), { role: 'assistant', content: message.body })
         assert.match(JSON.stringify(saved?.history), /private tool output/)
@@ -399,7 +400,7 @@ it('commits a bounded partial delivery on hop exhaustion, retaining artifacts an
         assert.equal(message.envelope?.requestVersion, mode === 'steer' ? 2 : 1)
         assert.equal(message.envelope?.goalOutcome.status, 'partial')
         assert.equal(message.envelope?.goalOutcome.verification, 'not_run')
-        assert.match(message.envelope?.goalOutcome.gaps?.[0] ?? '', /budget exhausted/)
+        assert.match(JSON.stringify(message.envelope?.goalOutcome.gaps), /budget exhausted/)
       },
       completeWork: async (_work, result) => { completion = result }, yieldWork: async () => {},
     }
@@ -411,11 +412,11 @@ it('commits a bounded partial delivery on hop exhaustion, retaining artifacts an
       executed = true
       return { executionId: 'cell', stdout: 'private tool output', stderr: '', result: null, durationMs: 1, truncated: false, artifacts: [artifact], directives: [] }
     } }
-    assert.throws(() => new AgentRuntime(host, model, kernels, { maxHops: 0 }), /positive integer/)
-    await new AgentRuntime(host, model, kernels, { maxHops: 1 }).runWork(work)
+    assert.throws(() => new AgentRuntime(host, model, kernels, { rootModelBudget: { maxModelCalls: 0 } }), /positive safe integer/)
+    await new AgentRuntime(host, model, kernels, { rootModelBudget: { maxModelCalls: 1 } }).runWork(work)
     assert.equal(calls, 1)
     assert.equal(committed, mode === 'normal' || mode === 'steer')
-    assert.equal(completion?.status, mode === 'cancel' ? 'cancelled' : mode === 'lease_lost' ? undefined : 'completed')
+    assert.equal(completion?.status, mode === 'cancel' ? 'cancelled' : undefined)
     if (mode === 'steer') assert.equal(saved?.request?.revisions[0]?.text, 'Changed requirement')
   }
 })
@@ -430,7 +431,7 @@ it('preserves unknown action outcomes in public events and model receipts', asyn
     claimWork: async () => null, heartbeat: async () => ({ ok: true }),
     loadContext: async () => ({ work, persona: { name: 'A', role: 'assistant', instructions: '' }, capabilities: ['files'], messages: [{ ref: 'm', authorId: 'u', authorName: 'User', authorKind: 'human', body: 'Save the requested file.', createdAt: 'now' }] }),
     executeAction: async () => result, emitEvent: async (_work, event) => { if (event.kind === 'tool.completed') eventResult = event.data['result'] },
-    loadSession: async () => null, saveSession: async () => {}, commitMessage: async () => {},
+    loadSession: async () => null, saveSession: async () => {}, commitResult: async (_work, message) => { completion = { status: 'completed', goalOutcome: message.envelope.goalOutcome } },
     completeWork: async (_work, value) => { completion = value }, yieldWork: async () => {},
   }
   const model: ModelDriver = {
@@ -466,7 +467,7 @@ it('keeps approval decisions separate from execution evidence when restoring a s
       claimWork: async () => null, heartbeat: async () => ({ ok: true }),
       loadContext: async () => ({ work, persona: { name: 'A', role: 'assistant', instructions: '' }, capabilities: [], messages: [{ ref: 'm', authorId: 'u', authorName: 'User', authorKind: 'human', body: 'Save the requested file.', createdAt: 'now' }], pendingApproval: approval }),
       executeAction: async () => { throw new Error('unexpected execution') }, emitEvent: async () => {},
-      loadSession: async () => null, saveSession: async () => {}, commitMessage: async () => {},
+      loadSession: async () => null, saveSession: async () => {}, commitResult: async () => {},
       completeWork: async () => {}, yieldWork: async () => {},
     }
     const model: ModelDriver = {
@@ -495,7 +496,7 @@ it('fails before model or side effects when the original request cannot be captu
     claimWork: async () => null, heartbeat: async () => ({ ok: true }),
     loadContext: async () => ({ work, persona: { name: 'A', role: 'assistant', instructions: '' }, capabilities: ['files'], messages: [] }),
     executeAction: unexpected, emitEvent: async () => {}, loadSession: async () => null,
-    saveSession: unexpected, commitMessage: unexpected, yieldWork: unexpected,
+    saveSession: unexpected, commitResult: unexpected, yieldWork: unexpected,
     completeWork: async (_work, result) => { completion = result },
   }
   await new AgentRuntime(host, { run: unexpected, structured: unexpected, compact: unexpected }, { execute: unexpected }).runWork(work)

@@ -3,7 +3,9 @@ import { PGlite } from '@electric-sql/pglite'
 import type { SqlPool } from '../src/control-plane/pg-store.js'
 import assert from 'node:assert/strict'
 import { it } from 'node:test'
+import { readFile } from 'node:fs/promises'
 import { executeTeacher, teacherTransaction } from '../src/integrations/lingxiloop/teacher.js'
+import { seedAction } from './action-fixture.js'
 import type { LingxiLoopServices } from '../src/integrations/lingxiloop/service-contracts.js'
 import type { HostAction, WorkItem } from '../src/protocol/types.js'
 
@@ -120,64 +122,71 @@ it('commits teacher metadata together and rolls back failed or mismatched native
   }
 
   try {
+    await db.exec(await readFile(new URL('../../db/schema.sql', import.meta.url), 'utf8'))
     await db.exec("CREATE TABLE metadata(id text PRIMARY KEY,name text); INSERT INTO metadata VALUES('project','Original'),('teacher','Pulse · Original')")
+    let serial = 0
+    const run = async (candidate: HostAction) => {
+      const current = { ...candidate, idempotencyKey: `teacher-${++serial}` }
+      await seedAction(database, work, current)
+      return executeTeacher(work, current, services, database)
+    }
     for (const mode of ['write', 'scope', 'value'] as const) {
       failure = mode
-      await assert.rejects(executeTeacher(work, action, services, database), mode === 'write' ? /participant update failed/ : mode === 'scope' ? /scoped project/ : /requested metadata/)
+      await assert.rejects(run(action), mode === 'write' ? /participant update failed/ : mode === 'scope' ? /scoped project/ : /requested metadata/)
       assert.deepEqual((await db.query('SELECT * FROM metadata ORDER BY id')).rows, [{ id: 'project', name: 'Original' }, { id: 'teacher', name: 'Pulse · Original' }])
     }
     failure = undefined
-    assert.deepEqual(await executeTeacher(work, action, services, database), { id: 'project', company_id: 'tenant', name: 'Updated' })
+    assert.deepEqual(await run(action), { id: 'project', company_id: 'tenant', name: 'Updated' })
     assert.deepEqual((await db.query('SELECT * FROM metadata ORDER BY id')).rows, [{ id: 'project', name: 'Updated' }, { id: 'teacher', name: 'Pulse · Updated' }])
     const draft = { ...action, action: 'teacher.draft_objectives', args: { objectives: [{ title: 'Draft', successCriteria: 'Explain the idea', targetLevel: 3, prerequisiteIds: ['prior'] }] } }
     for (const result of [[], [null], [{ id: 'unit', courseId: 'other' }], [{ id: '', courseId: 'course' }], [{ id: 'unit', courseId: 'course' }, { id: 'unit', courseId: 'course' }]]) {
       objectiveResult = result
-      await assert.rejects(executeTeacher(work, draft, services, database), /scoped objectives/)
+      await assert.rejects(run(draft), /scoped objectives/)
       assert.deepEqual((await db.query("SELECT id FROM metadata WHERE id='unit'")).rows, [])
     }
     objectiveResult = [{ id: 'unit', courseId: 'course', status: 'DRAFT' }]
-    await assert.rejects(executeTeacher(work, { ...draft, args: { objectives: [...draft.args.objectives, ...draft.args.objectives] } }, services, database), /scoped objectives/)
+    await assert.rejects(run({ ...draft, args: { objectives: [...draft.args.objectives, ...draft.args.objectives] } }), /scoped objectives/)
     assert.deepEqual((await db.query("SELECT id FROM metadata WHERE id='unit'")).rows, [])
     objectiveResult = [{ id: 'prior', courseId: 'course', status: 'PUBLISHED' }, { id: 'unit', courseId: 'course', title: 'Draft', status: 'DRAFT' }]
-    assert.deepEqual(await executeTeacher(work, draft, services, database), objectiveResult)
+    assert.deepEqual(await run(draft), objectiveResult)
     for (const objectives of [[], Array(101).fill({}), [{ title: 'Draft', success_criteria: 'Wrong alias' }], [{ title: 'Draft', successCriteria: 'Explain', targetLevel: '3' }], [{ title: 'Draft', successCriteria: 'Explain', prerequisiteIds: ['prior', 'prior'] }]]) {
-      await assert.rejects(executeTeacher(work, { ...draft, args: { objectives } }, services, database))
+      await assert.rejects(run({ ...draft, args: { objectives } }))
     }
     const activity = { ...action, action: 'teacher.draft_activity', args: { title: 'Activity', instructions: 'Compare fractions', type: 'PRACTICE', objectiveIds: ['unit'] } }
     failure = 'scope'
-    await assert.rejects(executeTeacher(work, activity, services, database), /scoped draft/)
+    await assert.rejects(run(activity), /scoped draft/)
     assert.deepEqual((await db.query("SELECT id FROM metadata WHERE id='activity'")).rows, [])
     failure = undefined
-    assert.deepEqual(await executeTeacher(work, activity, services, database), { id: 'activity', courseId: 'course', status: 'DRAFT' })
+    assert.deepEqual(await run(activity), { id: 'activity', courseId: 'course', status: 'DRAFT' })
     for (const patch of [{ title: '' }, { instructions: 1 }, { type: 'unknown' }, { evaluationMode: 'automatic' }, { targetLevel: '2' }, { rubric: {} }, { rubric: Array(101).fill('x') }, { objectiveIds: ['unit', 'unit'] }, { dueAt: 'tomorrow' }, { courseId: 'other' }]) {
-      await assert.rejects(executeTeacher(work, { ...activity, args: { ...activity.args, ...patch } }, services, database))
+      await assert.rejects(run({ ...activity, args: { ...activity.args, ...patch } }))
     }
     for (const args of [{}, { title: '' }, { description: 1 }, { title: 'x'.repeat(2001) }, { courseId: 'other' }]) {
-      await assert.rejects(executeTeacher(work, { ...action, args }, services, database))
+      await assert.rejects(run({ ...action, args }))
     }
     const binding = { ...action, action: 'teacher.set_room_binding', args: { conversationId: 'room', enabled: true, purpose: 'lab' } }
     failure = 'value'
-    await assert.rejects(executeTeacher(work, binding, services, database), /room binding domain failure/)
+    await assert.rejects(run(binding), /room binding domain failure/)
     assert.deepEqual((await db.query("SELECT name FROM metadata WHERE id='project'")).rows, [{ name: 'Updated' }])
     failure = undefined
-    assert.deepEqual(await executeTeacher(work, binding, services, database), { ok: true, enabled: true })
+    assert.deepEqual(await run(binding), { ok: true, enabled: true })
     assert.deepEqual((await db.query("SELECT name FROM metadata WHERE id='project'")).rows, [{ name: 'lab' }])
-    assert.deepEqual(await executeTeacher(work, { ...binding, args: { conversationId: 'room', enabled: false } }, services, database), { ok: true, enabled: false })
+    assert.deepEqual(await run({ ...binding, args: { conversationId: 'room', enabled: false } }), { ok: true, enabled: false })
     assert.deepEqual((await db.query("SELECT name FROM metadata WHERE id='project'")).rows, [{ name: 'unbound' }])
     for (const args of [{ conversationId: 'room', enabled: true }, { conversationId: 'room', enabled: 'false' }, { conversationId: 'room', enabled: false, purpose: 'lab' }, { conversationId: 'room', enabled: true, purpose: 'study' }, { conversation_id: 'room', enabled: false }]) {
-      await assert.rejects(executeTeacher(work, { ...binding, args }, services, database))
+      await assert.rejects(run({ ...binding, args }))
     }
     const membership = { ...action, action: 'teacher.set_learner_membership', args: { userId: 'learner', enabled: true } }
     failure = 'value'
-    await assert.rejects(executeTeacher(work, membership, services, database), /membership domain failure/)
+    await assert.rejects(run(membership), /membership domain failure/)
     assert.deepEqual((await db.query("SELECT name FROM metadata WHERE id='project'")).rows, [{ name: 'unbound' }])
     failure = undefined
     for (const enabled of [true, false]) {
-      assert.deepEqual(await executeTeacher(work, { ...membership, args: { userId: 'learner', enabled } }, services, database), { ok: true })
+      assert.deepEqual(await run({ ...membership, args: { userId: 'learner', enabled } }), { ok: true })
       assert.deepEqual((await db.query("SELECT name FROM metadata WHERE id='project'")).rows, [{ name: enabled ? 'member' : 'removed' }])
     }
     for (const args of [{ userId: 'learner' }, { userId: 'learner', enabled: 'false' }, { userId: '', enabled: true }, { userId: 'learner', enabled: true, role: 'teacher' }]) {
-      await assert.rejects(executeTeacher(work, { ...membership, args }, services, database))
+      await assert.rejects(run({ ...membership, args }))
     }
   } finally { await db.close() }
 })

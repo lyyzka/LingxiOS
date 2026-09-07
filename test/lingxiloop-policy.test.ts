@@ -15,31 +15,20 @@ const policy = new LingxiLoopRuntimePolicy({ capabilityMethods: {
   canvas: ['current', 'create_frame', 'set_status', 'submit_report', 'assign'], research: ['search', 'read'], email: ['send'],
 } })
 
-it('provides the deployment policy capability map', () => {
-  assert.deepEqual(createLingxiLoopRuntimePolicy().kernelCapabilities(context(work({ kind: 'canvas_summary' }))), [
-    { name: 'canvas', methods: ['current', 'submit_report'] },
-  ])
+it('uses authoritative grants without deriving a second role whitelist', () => {
+  const grants = [{ name: 'canvas', methods: ['current', 'submit_report'] }]
+  for (const kind of ['turn', 'canvas_worker', 'canvas_summary']) {
+    assert.deepEqual(createLingxiLoopRuntimePolicy().kernelCapabilities(context(work({ kind }), { grants })), grants)
+    assert.deepEqual(policy.kernelCapabilities(context(work({ kind }), { grants: [] })), [])
+  }
 })
 
-it('applies exact role capability whitelists', () => {
-  assert.deepEqual(policy.kernelCapabilities(context(work())), [
-    { name: 'canvas', methods: ['current', 'create_frame', 'set_status', 'submit_report', 'assign'] },
-    { name: 'research', methods: ['search', 'read'] }, { name: 'email', methods: ['send'] },
-  ])
-  assert.deepEqual(policy.kernelCapabilities(context(work({ kind: 'canvas_worker', meta: { executionRole: 'verifier' } }))), [
-    { name: 'canvas', methods: ['current', 'set_status', 'submit_report'] }, { name: 'research', methods: ['search', 'read'] },
-  ])
-  assert.deepEqual(policy.kernelCapabilities(context(work({ kind: 'canvas_summary' }))), [
-    { name: 'canvas', methods: ['current', 'submit_report'] },
-  ])
-})
-
-it('checks disclosure, citations, and durable role completion', () => {
+it('preserves exact prose while requiring durable role completion', () => {
   const verifier = context(work({ kind: 'canvas_worker', meta: { executionRole: 'verifier' } }), {
     evidence: [{ marker: 'S1', sourceId: 'source', sourceVersion: 'v1', chunkId: 'c1', title: 'Source', excerpt: 'Fact' }],
   })
-  assert.match(policy.validateAssistantText('Finding.', verifier)!, /identity/)
-  assert.match(policy.validateAssistantText('Lingxi found a fact.', verifier)!, /citation/)
+  assert.equal(policy.validateAssistantText('Finding.', verifier), null)
+  assert.equal(policy.validateAssistantText('Lingxi found a fact.', verifier), null)
   assert.equal(policy.validateAssistantText('Lingxi found [a fact](#cite-S1).', verifier), null)
   const assessment: GoalAssessment = { status: 'satisfied', checks: [{ requirement: 'verify', status: 'met', basis: 'done' }], gaps: [] }
   assert.match(policy.validateCompletion('', assessment, verifier)!, /durable role report/)

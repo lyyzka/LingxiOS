@@ -1,3 +1,5 @@
+import { seedAction } from './action-fixture.js'
+import { readFile } from 'node:fs/promises'
 import assert from 'node:assert/strict'
 import { it } from 'node:test'
 import { PGlite } from '@electric-sql/pglite'
@@ -41,6 +43,8 @@ it('pins attempt evidence to the original human and rolls back mismatched native
     },
   }
   try {
+    await db.exec(await readFile(new URL('../../db/schema.sql', import.meta.url), 'utf8'))
+    await seedAction(database, work, action)
     await db.exec("CREATE TABLE participants(company_id text,id text,kind text,departed_at timestamptz); INSERT INTO participants VALUES('tenant','human','human',NULL); CREATE TABLE recorded(id text)")
     for (const patch of [{ missionStepId: 'also-a-step' }, { assistance: null }, { evidenceClientMsgNos: ['message', 'message'] }, { documentIds: null }, { canvasFrameIds: Array(21).fill('frame') }, { learnerId: 'other' }]) {
       await assert.rejects(recordAttempt(database, services, work, { ...action, args: { ...action.args, ...patch } }, 2))

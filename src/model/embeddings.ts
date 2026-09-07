@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto'
 
 export interface EmbeddingOptions {
+  inputCostMicrosPerMillion?: number
   id: string
   apiKey: string
   baseUrl?: string

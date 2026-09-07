@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto'
 import { withTransaction, type SqlPool, type SqlQueryable } from '../../control-plane/pg-store.js'
 import type { HostAction, WorkItem } from '../../protocol/types.js'
 import type { LingxiLoopServices } from './service-contracts.js'
-import { cancelRoutineRuns } from './teacher-digest.js'
+import { cancelRoutineRuns, scheduleRoutineKind } from './routine-scheduler.js'
 
 type Identity = Pick<WorkItem, 'tenantId' | 'agentId' | 'sessionId' | 'principalId' | 'threadId'>
 type Services = Pick<LingxiLoopServices, 'permissionService'>
@@ -143,49 +143,19 @@ export async function assertRoutineWork(database: SqlQueryable, services: Servic
 }
 
 export async function scheduleRoutines(database: SqlPool, services: Services) {
-  return withTransaction(database, async client => {
-    await client.query("SET LOCAL lock_timeout='2s'")
-    await client.query("SET LOCAL statement_timeout='5s'")
-    const { rows } = await client.query(`SELECT routine.*,NOW() AS clock,
-      EXISTS(SELECT 1 FROM lingxios.agent_routine_runs run JOIN lingxios.agent_work_items work ON work.id=run.work_id
-        WHERE run.routine_id=routine.id AND work.cancel_requested_at IS NULL AND (work.status IN ('queued','leased')
-          OR EXISTS(SELECT 1 FROM lingxios.agent_delivery_outbox outbox WHERE outbox.run_id=work.id AND outbox.delivered_at IS NULL))) AS pending
-      FROM lingxios.agent_routines routine WHERE status='active' AND kind<>'teacher_digest' AND next_run_at<=NOW()
-      ORDER BY next_run_at,id LIMIT 8 FOR UPDATE OF routine SKIP LOCKED`)
-    let enqueued = 0
-    for (const row of rows) {
-      const work = identity(row)
-      try {
-        if (await routineScope(client, services, work) !== row['project_id']) throw new RoutineScopeError('routine project changed')
-      } catch (error) {
-        if (!(error instanceof RoutineScopeError) && !(error instanceof Error && error.name === 'ForbiddenError' && [403, 404].includes(Reflect.get(error, 'status')))) throw error
-        await client.query("UPDATE lingxios.agent_routines SET status='paused',next_run_at=NULL,version=version+1,pause_reason='authorization_or_scope_changed',updated_at=NOW() WHERE id=$1", [row['id']])
-        await cancelRoutineRuns(client, String(row['id']))
-        continue
-      }
-      try {
-        routineArguments({ action: 'routines.create', args: {
-          kind: row['kind'], title: row['title'], instructions: row['instructions'], schedule: row['schedule'], timezone: row['timezone'],
-        } })
-      } catch {
-        await client.query("UPDATE lingxios.agent_routines SET status='paused',next_run_at=NULL,version=version+1,pause_reason='invalid_schedule',updated_at=NOW() WHERE id=$1", [row['id']])
-        await cancelRoutineRuns(client, String(row['id']))
-        continue
-      }
-      const scheduledAt = instant(row['next_run_at']).toISOString()
-      const next = await nextRoutineRun(client, row['schedule'] as Record<string, unknown>, String(row['timezone']), instant(row['clock']))
-      const existing = await client.query('SELECT work_id FROM lingxios.agent_routine_runs WHERE routine_id=$1 AND routine_version=$2 AND scheduled_at=$3', [row['id'], row['version'], scheduledAt])
-      if (!row['pending'] && !existing.rows.length) {
-        const id = 'routine-run-' + createHash('sha256').update(JSON.stringify([row['id'], row['version'], scheduledAt])).digest('hex')
-        await client.query(`INSERT INTO lingxios.agent_work_items(id,tenant_id,agent_id,session_id,principal_id,thread_id,kind,lane,trigger_ref,meta)
-          VALUES($1,$2,$3,$4,$5,$6,'routine','background',$1,$7::jsonb)`,
-          [id, work.tenantId, work.agentId, work.sessionId, work.principalId, work.threadId ?? null,
-            JSON.stringify({ text: row['instructions'], authorName: row['title'], routineId: row['id'], routineVersion: row['version'], scheduledAt })])
-        await client.query('INSERT INTO lingxios.agent_routine_runs(routine_id,routine_version,scheduled_at,work_id) VALUES($1,$2,$3,$4)', [row['id'], row['version'], scheduledAt, id])
-        enqueued++
-      }
-      await client.query('UPDATE lingxios.agent_routines SET next_run_at=$2,updated_at=NOW() WHERE id=$1', [row['id'], next])
+  return scheduleRoutineKind(database, 'routine', async (client, row) => {
+    try {
+      if (await routineScope(client, services, identity(row)) !== row['project_id']) throw new RoutineScopeError('routine project changed')
+    } catch (error) {
+      if (!(error instanceof RoutineScopeError) && !(error instanceof Error && error.name === 'ForbiddenError' && [403,404].includes(Reflect.get(error, 'status')))) throw error
+      return { pauseReason: 'authorization_or_scope_changed' }
     }
-    return enqueued
+    try {
+      routineArguments({ action: 'routines.create', args: {
+        kind: row['kind'],title: row['title'],instructions: row['instructions'],schedule: row['schedule'],timezone: row['timezone'],
+      } })
+    } catch { return { pauseReason: 'invalid_schedule' } }
+    return { next: await nextRoutineRun(client, row['schedule'] as Record<string, unknown>, String(row['timezone']), instant(row['clock'])),
+      text: String(row['instructions']), authorName: String(row['title']) }
   })
 }

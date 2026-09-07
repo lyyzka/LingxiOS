@@ -168,7 +168,7 @@ it('records truncated-review diagnostics when rerunning one evaluation case', as
         runtimeBudget = request.max_tokens
         assert.equal(request.tool_choice, 'auto')
         assert.equal(request.response_format, undefined)
-        assert.deepEqual(request.tools.map((tool: { function: { name: string } }) => tool.function.name), ['ipython'])
+        assert.deepEqual(request.tools.map((tool: { function: { name: string } }) => tool.function.name), ['ipython', 'task__contract', 'task__ask', 'task__check_receipt', 'task__check_resource', 'task__inspect'])
         res.writeHead(200, { 'content-type': 'text/event-stream' })
         const delta = { content: JSON.stringify({
           body: '385', status: 'satisfied', gaps: [], checks: [{ requirement: '只在聊天中回复一个十进制整数', status: 'met', basis: '385' }],

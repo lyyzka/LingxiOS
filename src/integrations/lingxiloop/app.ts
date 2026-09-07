@@ -1,3 +1,4 @@
+import { LINGXILOOP_TOOLS } from './catalog.js'
 import { updateCalendar, flushCalendarEvents } from './calendar-writes.js'
 import { approveCalendar, requestCalendarApproval } from './calendar-approvals.js'
 import { executeCalendar, CALENDAR_METHODS } from './calendar.js'
@@ -6,7 +7,6 @@ import { readAttempts } from './learning-attempts.js'
 import { recordAttempt } from './learning-evidence.js'
 import { assertMissionCoordinatorWork, startMission } from './learning-missions.js'
 import { assertRoutineWork, executeRoutine, scheduleRoutines, ROUTINE_METHODS } from './routines.js'
-import { createLogger } from '../../logging.js'
 import { assertTeacherDigestWork, scheduleTeacherDigests, TEACHER_DIGEST_METHODS } from './teacher-digest.js'
 import { executeTeacher, TEACHER_METHODS } from './teacher.js'
 import { teacherContext } from './teacher-context.js'
@@ -42,6 +42,7 @@ import type { LingxiLoopServices } from './service-contracts.js'
 import { createLingxiLoopRuntimePolicy } from './policy.js'
 import { enrichLingxiLoopContext } from './context.js'
 import { deliverLingxiLoopEvent, finishLingxiLoopStream } from './delivery.js'
+import { verifyLingxiLoopResult } from './verification.js'
 import { sweepLingxiLoopWatchdog } from './watchdog.js'
 
 export interface LingxiLoopOptions extends LingxiOSOptions {
@@ -73,7 +74,7 @@ export async function createLingxiLoop(options: LingxiLoopOptions) {
   }
   const execution = options.execution ?? 'worker'
   if (execution === 'control' && options.model) throw new Error('LingxiLoop control instances must not configure a model')
-  const semantic = options.embeddings ? createSemanticMemory(database, options.embeddings) : undefined
+  const semantic = options.embeddings ? createSemanticMemory(database, options.embeddings, options.modelBudget) : undefined
   const approvalStorage = await database.query(`SELECT 1 FROM pg_constraint
     WHERE conrelid=to_regclass('public.approvals') AND conname='approvals_work_id_fkey'
       AND contype='f' AND convalidated AND confdeltype='c' AND confrelid=to_regclass('lingxios.agent_work_items')
@@ -178,29 +179,15 @@ export async function createLingxiLoop(options: LingxiLoopOptions) {
     if (row['teacher_managed'] && !services.teacher) throw new Error('native teacher services are required')
     return row
   }
-  let nextRoutineTick = 0
-  let nextWatchdogTick = 0
-  const logger = createLogger()
   const app = await assembleApp({ ...options, policy: options.policy ?? createLingxiLoopRuntimePolicy() }, {
-    beforeClaim: async () => {
-      await flushCalendarEvents(database, services)
-      await flushDocumentEvents(database, services)
-      if (services.canvas?.orchestration) {
-        try { await reconcileCanvasWork(database, services) }
-        catch { logger.warn('Canvas scheduling failed; retrying on the next worker poll') }
-        await flushCanvasEvents(database, services)
-      }
-      if (Date.now() >= nextWatchdogTick) {
-        nextWatchdogTick = Date.now() + 5_000
-        try { await sweepLingxiLoopWatchdog(database, new Date(), Number(process.env['AGENT_OS_RUN_WATCHDOG_MS'] ?? 120_000), Number(process.env['AGENT_OS_RUN_WATCHDOG_GRACE_MS'] ?? 30_000)) }
-        catch { logger.warn('work watchdog failed; retrying on the next worker poll') }
-      }
-      if (Date.now() < nextRoutineTick) return
-      nextRoutineTick = Date.now() + 30_000
-      try { await scheduleRoutines(database, services) }
-      catch { logger.warn('routine scheduling failed; retrying on the next scheduler tick') }
-      try { await scheduleTeacherDigests(database, services) }
-      catch { logger.warn('teacher digest scheduling failed; retrying on the next scheduler tick') }
+    backgroundJobs: {
+      'calendar notifications': () => flushCalendarEvents(database, services),
+      'document notifications': () => flushDocumentEvents(database, services),
+      'Canvas notifications': () => flushCanvasEvents(database, services),
+      'Canvas scheduling': async () => { if (services.canvas?.orchestration) await reconcileCanvasWork(database, services) },
+      'work watchdog': () => sweepLingxiLoopWatchdog(database, new Date(), Number(process.env['AGENT_OS_RUN_WATCHDOG_MS'] ?? 120_000), Number(process.env['AGENT_OS_RUN_WATCHDOG_GRACE_MS'] ?? 30_000)),
+      'routine scheduling': () => scheduleRoutines(database, services),
+      'teacher digest scheduling': () => scheduleTeacherDigests(database, services),
     },
     contextProvider: { loadContext: async (work) => {
       await binding(work.tenantId, work.sessionId, work.agentId)
@@ -303,7 +290,9 @@ export async function createLingxiLoop(options: LingxiLoopOptions) {
       return [...(services.calendar ? [{ name: 'calendar', methods: [...Object.keys(CALENDAR_METHODS), ...(services.calendar.writes ? ['update', 'create', 'delete'] : [])] }] : []), ...(services.documents ? [{ name: 'documents', methods: [...Object.keys(DOCUMENT_METHODS), ...(services.documents.writes ? ['rename'] : []), ...(services.documents.writes?.content ? ['create', 'edit', 'delete'] : [])] }] : []), { name: 'routines', methods: Object.keys(ROUTINE_METHODS) }, { name: 'memory', methods: Object.keys(MEMORY_METHODS) }, ...(services.canvas ? [{ name: 'canvas', methods: [...Object.keys(CANVAS_METHODS), ...(services.canvas.orchestration ? CANVAS_WORK_METHODS : [])] }] : []), ...(services.learning ? [{ name: 'learning', methods: Object.keys(LEARNING_METHODS) }] : []), { name: 'research', methods: Object.keys(RESEARCH_METHODS) }, ...(services.directory ? [{ name: 'directory', methods: Object.keys(DIRECTORY_METHODS) }] : []), ...(services.handoffs ? [{ name: 'handoffs', methods: Object.keys(HANDOFF_METHODS) }] : []), ...(services.advanceAgentReadReceipt ? [{ name: 'chat', methods: Object.keys(CHAT_METHODS).filter(method => (!['metadata', 'add_member', 'set_topic', 'rename', 'list_mutes', 'set_muted'].includes(method) || services.conversations) && (!['inbox', 'ack', 'search', 'react'].includes(method) || services.messaging)) }] : []), ...(services.email ? [{ name: 'email', methods: [...Object.keys(EMAIL_METHODS), ...Object.keys(EMAIL_APPROVAL_METHODS)] }] : []), { name: 'knowledge', methods: Object.keys(KNOWLEDGE_METHODS) }, ...(services.presentations ? [{ name: 'presentations', methods: Object.keys(PRESENTATION_METHODS) }] : []), ...(services.pollApplication ? [{ name: 'polls', methods: Object.keys(POLL_METHODS) }] : [])]
         .filter(grant => grant.name === 'memory' || grant.name === 'chat' || grant.name === 'polls' || Array.isArray(row['capabilities']) && row['capabilities'].includes(grant.name === 'presentations' ? 'knowledge' : grant.name === 'research' ? 'web' : grant.name))
     } },
-    actionExecutor: { readResource: async (work, action) => {
+    tools: LINGXILOOP_TOOLS,
+    actionExecutor: { verifyResult: async (work, action, value) => verifyLingxiLoopResult(database, services, work, action, value,
+      await binding(work.tenantId, work.sessionId, work.agentId)), readResource: async (work, action) => {
       await binding(work.tenantId, work.sessionId, work.agentId)
       // Reuse the same final authorization and resource scope checks as ordinary reads.
       switch (action.action) {
@@ -382,7 +371,7 @@ export async function createLingxiLoop(options: LingxiLoopOptions) {
         if (work.kind === 'teacher_digest') await assertTeacherDigestWork(database, work, await teacherContext(work, services, database))
         await finishLingxiLoopStream(database, services, work)
         await services.wukongClient().sendMessage(work.sessionId, channelType, work.agentId, {
-          version: 1, kind: 'text', clientMsgNo: `agent-${work.id}`, body: message.body,
+          version: 1, kind: 'text', clientMsgNo: `agent-${work.id}-${createHash('sha256').update(JSON.stringify(message)).digest('hex').slice(0, 16)}`, body: message.body,
           ...(work.threadId ? { replyToClientMsgNo: work.threadId } : {}),
           refs: { runId: work.id, agentId: work.agentId },
           data: { harness: message.envelope },

@@ -39,7 +39,7 @@ test('processor structured and compaction calls share durable budgets across att
   const host: HostPort = {
     claimWork: async () => null, heartbeat: async () => ({ ok: true }), loadContext: async () => { throw new Error('unused') },
     executeAction: async () => ({ ok: true }), loadSession: async () => null, saveSession: async () => {}, emitEvent: async () => {},
-    commitMessage: async () => {}, completeWork: async (_work, value) => { completions.push(value) }, yieldWork: async () => {},
+    commitResult: async () => {}, completeWork: async (_work, value) => { completions.push(value) }, yieldWork: async () => {},
     reserveModelCall: (item, callId, limits) => budgets.reserve(item.id, callId, limits),
     recordModelUsage: (item, callId, usage) => budgets.record(item.id, callId, usage.inputTokens, usage.outputTokens, usage.costMicros),
   }

@@ -86,7 +86,7 @@ try {
     await delay(50)
   }
   assert.ok(ready, logs)
-  assert.ok(requests.every(request => JSON.stringify(request) === JSON.stringify(['POST', '/v3/work/claim', 'Bearer image-test'])))
+  assert.ok(requests.every(request => JSON.stringify(request) === JSON.stringify(['POST', '/v4/work/claim', 'Bearer image-test'])))
   assert.equal((await fetch('http://127.0.0.1:5190/healthz')).status, 200)
   assert.equal((await fetch('http://127.0.0.1:5190/metrics')).status, 200)
   worker.kill('SIGTERM')

@@ -4,7 +4,7 @@ import type { ActionIntent } from '../../control-plane/stores.js'
 import type { HostAction, WorkItem } from '../../protocol/types.js'
 import type { LingxiLoopServices } from './service-contracts.js'
 import { documentApplication, documentScope, queueDocumentEvents, type DocumentWork } from './document-content.js'
-import { inspectApproval, persistApproval, resumeApproved } from './approvals.js'
+import { lockPendingApproval, recordExecutedApproval, inspectApproval, persistApproval, resumeApproved } from './approvals.js'
 
 type Services = Pick<LingxiLoopServices, 'documents' | 'permissionService'>
 
@@ -40,22 +40,7 @@ export async function approveDocument(database: SqlPool, services: Services, inp
   await withTransaction(database, async db => {
     await db.query("SET LOCAL lock_timeout='5s'")
     await db.query("SET LOCAL statement_timeout='15s'")
-    const pending = await db.query(`SELECT intent.intent FROM approvals approval
-      JOIN lingxios.agent_work_items work ON work.id=approval.work_id AND work.tenant_id=approval.company_id
-      JOIN lingxios.agent_action_intents intent ON intent.idempotency_key=approval.idempotency_key
-      JOIN lingxios.agent_os_sessions session ON session.tenant_id=work.tenant_id AND session.agent_id=work.agent_id
-        AND session.session_id=work.session_id AND session.thread_id IS NOT DISTINCT FROM work.thread_id
-      WHERE approval.id=$1 AND approval.company_id=$2 AND approval.status='PENDING' AND approval.expires_at>NOW()
-        AND approval.idempotency_key=$3 AND approval.args=$4::jsonb AND approval.preview=$5::jsonb
-        AND approval.action='documents.delete' AND work.status='completed' AND work.cancel_requested_at IS NULL
-        AND work.goal_outcome->>'status'='awaiting_approval' AND work.goal_outcome->>'approvalId'=$1
-        AND (work.goal_outcome->>'requestVersion')::integer=$6 AND jsonb_array_length(work.steer_inputs)+1=$6
-        AND EXISTS (SELECT 1 FROM lingxios.agent_request_snapshots snapshot WHERE snapshot.work_id=work.id
-          AND snapshot.session_key=session.session_key AND snapshot.request_snapshot->'revisions'=work.steer_inputs)
-      FOR UPDATE OF approval,work,session`, [input.approvalId, input.companyId, reviewed.action.idempotencyKey,
-      JSON.stringify(reviewed.action.args), JSON.stringify(reviewed.preview), reviewed.requestVersion])
-    const intent = pending.rows[0]?.['intent'] as ActionIntent | undefined
-    if (!intent) throw new Error('document approval expired or changed before execution')
+    const intent = await lockPendingApproval(db, input, reviewed)
     const api = services.documents?.writes
     if (!api) throw new Error('native document write bindings are required')
     await api.createPermissionService(db, { lockDependencies: true }).assertCan({ actorUserId: input.userId, companyId: input.companyId,
@@ -65,11 +50,7 @@ export async function approveDocument(database: SqlPool, services: Services, inp
     const prepared = await prepareDeletion(db, services, work, reviewed.action, input.userId)
     if (!isDeepStrictEqual(prepared.preview, reviewed.preview)) throw new Error('document approval preview is stale')
     const value = await prepared.apply()
-    await db.query("UPDATE approvals SET status='EXECUTED',resolved_at=NOW(),resolved_by=$2,executed_at=NOW(),result=$3::jsonb,error=NULL WHERE id=$1", [input.approvalId, input.userId, JSON.stringify(value)])
-    const receipt = await db.query(`UPDATE lingxios.agent_action_ledger SET result=$2::jsonb
-      WHERE idempotency_key=$1 AND result->'approval'->>'id'=$3 RETURNING idempotency_key`,
-    [reviewed.action.idempotencyKey, JSON.stringify({ ok: true, value }), input.approvalId])
-    if (receipt.rows.length !== 1) throw new Error('document approval receipt is missing')
+    await recordExecutedApproval(db, input, reviewed, value, 'PENDING')
   })
   return resumeApproved(database, input, reviewed)
 }

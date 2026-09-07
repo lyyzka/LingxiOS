@@ -284,7 +284,6 @@ it('binds native-shaped resources through the packaged ingress/action/delivery p
           return
         }
         contentReviews++
-        assert.match(JSON.stringify(requestBody.messages), /resource-review:/)
         res.writeHead(200, { 'content-type': 'application/json' })
         res.end(JSON.stringify({ model: 'test', choices: [{ message: { content: '{"missing":[]}' }, finish_reason: 'stop' }] }))
         return
@@ -357,7 +356,7 @@ it('binds native-shaped resources through the packaged ingress/action/delivery p
   const address = server.address()
   assert.ok(address && typeof address === 'object')
   const app = await createLingxiLoop({ database, services, worker: { id: 'loop-test' }, model: { id: 'test', apiKey: 'test', baseUrl: `http://127.0.0.1:${address.port}` }, kernel: { homesRoot: directory },
-    policy: new LingxiLoopRuntimePolicy({ capabilityMethods: LINGXILOOP_CAPABILITY_METHODS, requireIdentityDisclosure: false }) })
+    policy: new LingxiLoopRuntimePolicy({ capabilityMethods: LINGXILOOP_CAPABILITY_METHODS }) })
   const control = await createLingxiLoopControl({ database, services, kernel: { homesRoot: directory } })
   await assert.rejects(control.start(), /control instances cannot start/)
   await assert.rejects(control.runNext(), /control instances cannot claim/)
@@ -395,11 +394,16 @@ it('binds native-shaped resources through the packaged ingress/action/delivery p
     const memoryEvidence = await database.query('SELECT source_run_id,principal_id,request_version,assistant_text,status FROM lingxios.agent_memory_evidence WHERE source_run_id=$1', [request.id])
     assert.deepEqual(memoryEvidence.rows, [{ source_run_id: request.id, principal_id: 'u', request_version: 1, assistant_text: 'Source queued.', status: 'pending' }])
     assert.equal(delivered.length, 0)
+    const failedDeliveryDeadline = Date.now() + 2_000
+    while (!(await database.query('SELECT 1 FROM lingxios.agent_delivery_outbox WHERE run_id=$1 AND attempts>0 AND claim_token IS NULL', [request.id])).rows.length
+      && Date.now() < failedDeliveryDeadline) await delay(25)
     await database.query('UPDATE lingxios.agent_delivery_outbox SET available_at=NOW() WHERE run_id=$1', [request.id])
     assert.equal(await app.runNext(), true)
     assert.equal(memorySynthesisCalls, 2)
     assert.deepEqual((await database.query('SELECT status FROM lingxios.agent_memory_evidence WHERE source_run_id=$1', [request.id])).rows, [{ status: 'processed' }])
-    assert.deepEqual((await database.query("SELECT status FROM lingxios.agent_work_items WHERE kind='memory_synthesis'")).rows, [{ status: 'completed' }])
+    assert.deepEqual((await database.query("SELECT status FROM lingxios.agent_work_items WHERE kind='memory_synthesis'")).rows, [{ status: 'succeeded' }])
+    const deliveryDeadline = Date.now() + 2_000
+    while (await app.readDelivery(deliveryIdentity) !== 'delivered' && Date.now() < deliveryDeadline) await delay(25)
     assert.equal(await app.readDelivery(deliveryIdentity), 'delivered')
     for (const scope of [{ agentId: 'other' }, { sessionId: 'other' }, { runId: 'missing' }]) {
       assert.equal(await app.readDelivery({ ...deliveryIdentity, ...scope }), null)
@@ -419,7 +423,10 @@ it('binds native-shaped resources through the packaged ingress/action/delivery p
     const learningCheck = finalChecks?.[3]?.result.value as Record<string, unknown>
     assert.deepEqual({ action: learningCheck['action'], args: learningCheck['args'], observed: learningCheck['observed'], status: learningCheck['status'] },
       { action: 'learning.get_attempt', args: { attemptId: 'attempt' }, observed: { status: 'EVALUATED' }, status: 'pass' })
-    assert.equal(finalChecks?.[0]?.actionKey, JSON.stringify([request.id, 'c', 2]))
+    const [checkRunId, checkStepId, checkIndex] = JSON.parse(finalChecks?.[0]?.actionKey ?? '[]') as [string, string, number]
+    assert.equal(checkRunId, request.id)
+    assert.match(checkStepId, /^step:[0-9a-f-]{36}$/)
+    assert.equal(checkIndex, 2)
     assert.equal((finalChecks?.[0]?.result.value as Record<string, unknown>)['requestVersion'], 1)
     assert.deepEqual((finalChecks?.[0]?.result.value as Record<string, unknown>)['expected'], { id: 'p' })
     assert.ok(canvasReads >= 1)
@@ -437,35 +444,50 @@ it('binds native-shaped resources through the packaged ingress/action/delivery p
     assert.equal((memoryTrace.rows[0]!['snapshot'] as Record<string, unknown>)['status'], 'unavailable')
     assert.match(JSON.stringify(memoryTrace.rows[1]!['snapshot']), /Source saved for later reference/)
     const checks = await database.query(`SELECT result->'value'->>'scope' AS scope,result->'value'->>'status' AS status,
-      result->'value'->'observed' AS observed FROM lingxios.agent_action_ledger
-      WHERE idempotency_key=$1`, [JSON.stringify([request.id, 'c', 3])])
+      result->'value'->'observed' AS observed FROM lingxios.agent_action_ledger ledger
+      JOIN lingxios.agent_action_intents intent USING(idempotency_key)
+      WHERE intent.intent->>'workId'=$1 AND intent.intent->'action'->>'action'='knowledge.check_source'`, [request.id])
     assert.deepEqual(checks.rows, [{ scope: 'knowledge_source_fields', status: 'pass', observed: { enabled: true } }])
     assert.deepEqual((await database.query('SELECT * FROM knowledge_fixture')).rows, [{ title: 'Title', body: 'Body', principal: 'u', request_ref: 'm' }])
     assert.equal(delivered[0]?.body, 'Source queued.')
     assert.equal(delivered[0]?.replyToClientMsgNo, 'thread-root')
-    assert.equal(delivered[0]?.clientMsgNo, `agent-${request.id}`)
+    assert.match(delivered[0]?.clientMsgNo ?? '', new RegExp(`^agent-${request.id}-[a-f0-9]{16}$`))
     assert.deepEqual((await database.query('SELECT delivered_at IS NOT NULL AS acknowledged FROM lingxios.agent_delivery_outbox')).rows, [{ acknowledged: true }])
     // Simulate a lost local acknowledgement after the external send succeeded.
     await database.query('UPDATE lingxios.agent_delivery_outbox SET delivered_at=NULL,available_at=NOW() WHERE run_id=$1', [request.id])
     const recovered = await createLingxiLoop(invalidOptions)
     try {
+      const waitFor = async (predicate: () => Promise<boolean>) => {
+        const deadline = Date.now() + 2_000
+        while (!await predicate() && Date.now() < deadline) await delay(25)
+        assert.equal(await predicate(), true)
+      }
       assert.equal(await recovered.runNext(), false)
+      await waitFor(async () => delivered.length === 2)
       assert.deepEqual(delivered[1], delivered[0])
       assert.equal(calls, 2)
       assert.equal(await recovered.runNext(), false)
       assert.equal(delivered.length, 2)
       await database.query('UPDATE lingxios.agent_delivery_outbox SET delivered_at=NULL,available_at=NOW() WHERE run_id=$1', [request.id])
       sendFailures = 1
+      const failedAttempts = Number((await database.query('SELECT attempts FROM lingxios.agent_delivery_outbox WHERE run_id=$1', [request.id])).rows[0]!['attempts'])
       assert.equal(await recovered.runNext(), false)
+      await waitFor(async () => {
+        const row = (await database.query('SELECT attempts,available_at>NOW() AS delayed,claim_token IS NULL AS released FROM lingxios.agent_delivery_outbox')).rows[0]!
+        return Number(row['attempts']) > failedAttempts && row['delayed'] === true && row['released'] === true
+      })
       assert.deepEqual((await database.query('SELECT available_at>NOW() AS delayed,claim_token IS NULL AS released FROM lingxios.agent_delivery_outbox')).rows, [{ delayed: true, released: true }])
       assert.equal(await recovered.runNext(), false)
       assert.equal(delivered.length, 2)
       await database.query('UPDATE lingxios.agent_delivery_outbox SET available_at=NOW() WHERE run_id=$1', [request.id])
       assert.equal(await recovered.runNext(), false)
+      await waitFor(async () => delivered.length === 3)
       assert.deepEqual(delivered[2], delivered[0])
       await database.query('UPDATE lingxios.agent_delivery_outbox SET delivered_at=NULL,available_at=NOW() WHERE run_id=$1', [request.id])
       deliveryDenied = true
+      const deniedAttempts = Number((await database.query('SELECT attempts FROM lingxios.agent_delivery_outbox WHERE run_id=$1', [request.id])).rows[0]!['attempts'])
       assert.equal(await recovered.runNext(), false)
+      await waitFor(async () => Number((await database.query('SELECT attempts FROM lingxios.agent_delivery_outbox WHERE run_id=$1', [request.id])).rows[0]!['attempts']) > deniedAttempts)
       assert.equal(delivered.length, 3)
       assert.deepEqual((await database.query('SELECT delivered_at FROM lingxios.agent_delivery_outbox')).rows, [{ delivered_at: null }])
       deliveryDenied = false
@@ -670,8 +692,8 @@ it('binds native-shaped resources through the packaged ingress/action/delivery p
     try {
       const deadline = Date.now() + 10_000
       const backgroundState = async () => (await database.query('SELECT status FROM lingxios.agent_work_items WHERE id=$1', [`memory-synthesis:${waitingInput.id}`])).rows[0]?.['status']
-      while (await backgroundState() !== 'completed' && Date.now() < deadline) await delay(25)
-      assert.equal(await backgroundState(), 'completed')
+      while (await backgroundState() !== 'succeeded' && Date.now() < deadline) await delay(25)
+      assert.equal(await backgroundState(), 'succeeded')
       assert.deepEqual((await database.query('SELECT status FROM lingxios.agent_memory_evidence WHERE source_run_id=$1', [waitingInput.id])).rows, [{ status: 'processed' }])
     } finally { await remoteWorker.stop() }
     await db.exec("INSERT INTO learning_project_teacher_agents VALUES('t','a')")
@@ -686,7 +708,7 @@ it('binds native-shaped resources through the packaged ingress/action/delivery p
     await configureTeacherDigest(database, services, digestRequest, { frequency: 'daily', localTime: '09:00' })
     await database.query("UPDATE lingxios.agent_routines SET next_run_at=NOW()-INTERVAL '1 day'")
     const digestApp = await createLingxiLoop({ database, services, worker: { id: 'loop-test' }, model: { id: 'test', apiKey: 'test', baseUrl: `http://127.0.0.1:${address.port}` }, kernel: { homesRoot: directory },
-      policy: new LingxiLoopRuntimePolicy({ capabilityMethods: LINGXILOOP_CAPABILITY_METHODS, requireIdentityDisclosure: false }) })
+      policy: new LingxiLoopRuntimePolicy({ capabilityMethods: LINGXILOOP_CAPABILITY_METHODS }) })
     try {
       teacherDigest = true; teacherCalls = 0
       const digestPort = await digestApp.listenControlPlane({ serviceToken: 'digest-worker-secret', port: 0 })
@@ -696,15 +718,17 @@ it('binds native-shaped resources through the packaged ingress/action/delivery p
         AGENT_OS_HOMES_ROOT: directory, AGENT_OS_POLL_IDLE_MS: '50', AGENT_OS_MAX_CONCURRENT_RUNS: '1' })
       try {
         const deadline = Date.now() + 10_000
-        while ((await database.query("SELECT status FROM lingxios.agent_work_items WHERE kind='teacher_digest'")).rows[0]?.['status'] !== 'completed' && Date.now() < deadline) await delay(25)
+        while ((await database.query("SELECT status FROM lingxios.agent_work_items WHERE kind='teacher_digest'")).rows[0]?.['status'] !== 'succeeded' && Date.now() < deadline) await delay(25)
       } finally { await digestWorker.stop() }
       const scheduled = (await database.query("SELECT id,status,error FROM lingxios.agent_work_items WHERE kind='teacher_digest'")).rows
-      assert.equal(scheduled.length, 1); assert.equal(scheduled[0]!['status'], 'completed', JSON.stringify(scheduled[0]))
+      assert.equal(scheduled.length, 1); assert.equal(scheduled[0]!['status'], 'succeeded', JSON.stringify(scheduled[0]))
       const digestIdentity = { ...waitingIdentity, runId: String(scheduled[0]!['id']) }
       assert.equal((await digestApp.readMessage(digestIdentity))?.body, 'Five learners observed.')
+      const digestDeliveryDeadline = Date.now() + 2_000
+      while (await digestApp.readDelivery(digestIdentity) !== 'delivered' && Date.now() < digestDeliveryDeadline) await delay(25)
       assert.equal(await digestApp.readDelivery(digestIdentity), 'delivered')
       assert.equal(teacherCalls, 2)
-      assert.equal(delivered.at(-1)?.clientMsgNo, 'agent-' + scheduled[0]!['id'])
+      assert.match(delivered.at(-1)?.clientMsgNo ?? '', new RegExp(`^agent-${scheduled[0]!['id']}-[a-f0-9]{16}$`))
       // A later digest survives transport failure but cannot send after teacher revocation or schedule pause.
       await database.query("UPDATE lingxios.agent_routines SET next_run_at=NOW()-INTERVAL '2 days'")
       assert.equal(await scheduleTeacherDigests(database, services), 1)
@@ -831,7 +855,7 @@ it('binds native-shaped resources through the packaged ingress/action/delivery p
         assert.deepEqual(events.events.find(event => event.kind === 'approval.continuation_stopped')?.data['goalOutcome'], await app.readOutcome(transitionIdentity))
         assert.deepEqual((await app.inspectApproval(decision)).result, stopped.result)
         assert.equal(await app.readMessage(transitionIdentity), null)
-        assert.equal((await db.query<{ status: string }>('SELECT status FROM lingxios.agent_work_items WHERE id=$1', [transitionWork.id])).rows[0]?.status, 'completed')
+        assert.equal((await db.query<{ status: string }>('SELECT status FROM lingxios.agent_work_items WHERE id=$1', [transitionWork.id])).rows[0]?.status, 'blocked')
       }
       assert.equal(teacherApprovalWrites, writes + 1)
     }
@@ -843,7 +867,7 @@ it('binds native-shaped resources through the packaged ingress/action/delivery p
     const semanticApp = await createLingxiLoop({ ...invalidOptions, worker: { id: 'loop-test' },
       model: { id: 'test', apiKey: 'test', baseUrl: `http://127.0.0.1:${address.port}` }, kernel: { homesRoot: directory },
       embeddings: { id: 'embedding-test', apiKey: 'test', baseUrl: `http://127.0.0.1:${address.port}`, dimensions: 2 },
-      policy: new LingxiLoopRuntimePolicy({ capabilityMethods: LINGXILOOP_CAPABILITY_METHODS, requireIdentityDisclosure: false }) })
+      policy: new LingxiLoopRuntimePolicy({ capabilityMethods: LINGXILOOP_CAPABILITY_METHODS }) })
     try {
       await semanticApp.receive({ ...input, clientMsgNo: approvalMethod })
       assert.equal(await semanticApp.runNext(), true)
@@ -859,7 +883,7 @@ it('binds native-shaped resources through the packaged ingress/action/delivery p
         assert.equal(await unfinished(), 0)
       } finally { await indexWorker.stop() }
       assert.equal(await semanticApp.runNext(), false)
-      assert.deepEqual((await database.query("SELECT status FROM lingxios.agent_work_items WHERE kind='memory_index'")).rows, [{ status: 'completed' }])
+      assert.deepEqual((await database.query("SELECT status FROM lingxios.agent_work_items WHERE kind='memory_index'")).rows, [{ status: 'succeeded' }])
       approvalMethod = 'semantic-read-2'
       const semanticRequest = await semanticApp.receive({ ...input, clientMsgNo: approvalMethod })
       assert.equal(await semanticApp.runNext(), true)

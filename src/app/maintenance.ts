@@ -5,7 +5,7 @@ import type { SqlQueryable } from '../control-plane/pg-store.js'
 /** Retain committed hashes and receipts. Only expired traces and old unpublished temporary names are removed. */
 export async function maintainStorage(database: SqlQueryable, homesRoot: string) {
   const expired = await database.query(`DELETE FROM lingxios.agent_run_events WHERE (run_id,seq) IN
-    (SELECT run_id,seq FROM lingxios.agent_run_events WHERE expires_at<NOW() ORDER BY expires_at LIMIT 500)`)
+    (SELECT run_id,seq FROM lingxios.agent_run_events WHERE expires_at<NOW() AND (delivery_work IS NULL OR delivered_at IS NOT NULL) ORDER BY expires_at LIMIT 500)`)
   let inspected = 0, removed = 0
   const root = resolve(homesRoot, '.committed-artifacts')
   try {

@@ -105,7 +105,7 @@ it('resumes the same waiting request once with authenticated identity and versio
     const request = { version: 1, workId: 'w', tenantId: 't', sessionId: 's', authorId: 'u', sourceRef: 'w', attachments: [], originalText: 'Original goal', revisions: [] }
     await db.query(`INSERT INTO lingxios.agent_os_sessions(session_key,tenant_id,agent_id,session_id,thread_id,request_snapshot)
       VALUES($1,'t','a','s','thread',$2)`, [sessionKeyOf(input), JSON.stringify(request)])
-    await db.exec(`UPDATE lingxios.agent_work_items SET status='completed',goal_outcome='{"status":"awaiting_input","verification":"not_run","requestVersion":1}'`)
+    await db.exec(`UPDATE lingxios.agent_work_items SET status='waiting',goal_outcome='{"status":"awaiting_input","verification":"not_run","requestVersion":1}'`)
     for (const change of [{ principalId: 'other' }, { tenantId: 'other' }, { threadId: 'other' }, { requestVersion: 2 }]) {
       await assert.rejects(app.continueInput({ ...input, ...change }), /identity|version/)
     }
@@ -128,7 +128,7 @@ it('resumes the same waiting request once with authenticated identity and versio
     assert.equal(session.revision, 1)
     assert.equal(await app.cancel({ ...input, principalId: 'other' }), false)
     assert.equal(await app.cancel({ ...input, threadId: 'other' }), false)
-    await db.exec(`UPDATE lingxios.agent_work_items SET status='completed',goal_outcome='{"status":"awaiting_input","verification":"not_run","requestVersion":2}'`)
+    await db.exec(`UPDATE lingxios.agent_work_items SET status='waiting',goal_outcome='{"status":"awaiting_input","verification":"not_run","requestVersion":2}'`)
     assert.equal(await app.cancel(input), true)
     assert.equal(await app.cancel(input), false)
     assert.deepEqual((await db.query('SELECT status FROM lingxios.agent_work_items')).rows, [{ status: 'cancelled' }])

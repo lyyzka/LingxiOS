@@ -104,7 +104,7 @@ it('owns digest versions, coalesces missed runs, cancels old work and preserves 
     await configureTeacherDigest(database, services, work, { frequency: 'daily', localTime: '08:00' })
     await due()
     assert.equal(await scheduleTeacherDigests(database, services), 1)
-    await database.query("UPDATE lingxios.agent_work_items SET status='completed' WHERE status='queued'")
+    await database.query("UPDATE lingxios.agent_work_items SET status='succeeded' WHERE status='queued'")
     await database.query(`UPDATE lingxios.agent_routines routine SET next_run_at=run.scheduled_at FROM lingxios.agent_routine_runs run
       WHERE run.routine_id=routine.id AND run.routine_version=routine.version`)
     assert.equal(await scheduleTeacherDigests(database, services), 0)

@@ -6,6 +6,10 @@ export async function checkStorage(database: SqlQueryable): Promise<void> {
     .catch((cause: unknown) => { throw new Error('LingxiOS schema is missing or unavailable; explicitly install the packaged schema before startup', { cause }) })
   if (rows[0]?.['version'] !== releaseVersions.schema) throw new Error(`LingxiOS requires the initial schema version ${releaseVersions.schema}`)
   const probes = {
+    agent_results: 'work_id,candidate_hash,request_version,fence,message,committed_at',
+    agent_attempts: 'work_id,fence,lease_token_hash,worker_id,started_at,heartbeat_at,lease_expires_at,ended_at,reason',
+    agent_steps: 'step_seq,work_id,step_id,request_version,kind,input_hash,input,output,artifacts,created_at,completed_at',
+    agent_verifications: 'work_id,request_version,candidate_hash,checker,status,evidence,observed_at',
     lecture_decks: 'id,tenant_id,principal_id,revision,status,record,created_at,updated_at',
     lecture_checkpoints: 'deck_id,revision,stage,stage_key,input_hash,output_hash,attempts,result,completed_at',
     agent_document_outbox: 'id,event,delivered_at,available_at,claim_token,attempts',
@@ -22,7 +26,7 @@ export async function checkStorage(database: SqlQueryable): Promise<void> {
     agent_os_session_routes: 'session_key,worker_id,home_epoch,updated_at',
     agent_os_workers: 'worker_id,last_seen_at,updated_at',
     agent_claim_requests: 'request_id,worker_id,work_kinds,completed,response,created_at',
-    agent_run_events: 'run_id,seq,tenant_id,agent_id,kind,stage,visibility,data,recorded_at,expires_at',
+    agent_run_events: 'run_id,seq,tenant_id,agent_id,kind,stage,visibility,data,recorded_at,expires_at,delivery_work,delivered_at,available_at,claim_token,attempts',
     agent_action_ledger: 'idempotency_key,result,recorded_at',
     agent_action_intents: 'idempotency_key,fingerprint,intent,recorded_at',
     agent_action_resolutions: 'resolution_id,resolution_seq,idempotency_key,resolution,recorded_at',

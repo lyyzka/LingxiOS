@@ -8,7 +8,7 @@
  */
 import { createHash, randomBytes, randomUUID } from 'node:crypto'
 import { isDeepStrictEqual } from 'node:util'
-import { sessionKeyOf } from '../protocol/types.js'
+import { sessionKeyOf, workStatusOf } from '../protocol/types.js'
 import type {
   HostActionResult, SessionRecord, WorkCompletion, WorkItem,
 } from '../protocol/types.js'
@@ -76,18 +76,38 @@ function workItemFromRow(row: Record<string, unknown>, leaseToken: string, homeE
 }
 
 export class PgWorkStore implements WorkStore {
+  async children(parent: Omit<WorkItem, 'leaseToken'>) {
+    const { rows } = await this.pool.query(`SELECT id,status,result_text,goal_outcome FROM lingxios.agent_work_items
+      WHERE meta->>'parentWorkId'=$1 AND tenant_id=$2 AND principal_id IS NOT DISTINCT FROM $3
+      ORDER BY created_at,id LIMIT 64`, [parent.id,parent.tenantId,parent.principalId ?? null])
+    return rows.map(row => ({ id: String(row['id']), status: String(row['status']), resultText: row['result_text'] as string | null,
+      goalOutcome: row['goal_outcome'] as WorkCompletion['goalOutcome'] | null }))
+  }
+  async getAttempt(id: string, fence: number, leaseTokenHash: string) {
+    const { rows } = await this.pool.query(`SELECT work.* FROM lingxios.agent_work_items work
+      JOIN lingxios.agent_attempts attempt ON attempt.work_id=work.id
+      WHERE work.id=$1 AND attempt.fence=$2 AND attempt.lease_token_hash=$3`, [id, fence, leaseTokenHash])
+    if (!rows[0]) return null
+    const { leaseToken: _token, ...work } = workItemFromRow(rows[0], '', 1)
+    return { ...work, fence }
+  }
   async ownsBudgetRoot(work: Omit<WorkItem, 'leaseToken'>, rootWorkId: string): Promise<boolean> {
     if (rootWorkId === work.id) return true
     if (work.meta?.['rootWorkId'] !== rootWorkId || typeof work.meta?.['parentWorkId'] !== 'string') return false
-    const { rows } = await this.pool.query(`SELECT id FROM lingxios.agent_work_items
-      WHERE id=$1 AND tenant_id=$2 AND principal_id IS NOT DISTINCT FROM $3`,
-    [rootWorkId, work.tenantId, work.principalId ?? null])
+    const { rows } = await this.pool.query(`WITH RECURSIVE lineage AS (
+      SELECT id,meta,ARRAY[id] AS path FROM lingxios.agent_work_items
+      WHERE id=$1 AND tenant_id=$3 AND principal_id IS NOT DISTINCT FROM $4
+      UNION ALL SELECT parent.id,parent.meta,child.path||parent.id
+      FROM lingxios.agent_work_items parent JOIN lineage child ON parent.id=child.meta->>'parentWorkId'
+      WHERE parent.tenant_id=$3 AND parent.principal_id IS NOT DISTINCT FROM $4
+        AND NOT parent.id=ANY(child.path) AND cardinality(child.path)<64
+    ) SELECT id FROM lineage WHERE id=$2`, [work.id,rootWorkId,work.tenantId,work.principalId ?? null])
     return rows.length === 1
   }
   async hasPendingChild(parent: Omit<WorkItem, 'leaseToken'>, childId: string, requestVersion: number): Promise<boolean> {
     const { rows } = await this.pool.query(`SELECT id FROM lingxios.agent_work_items WHERE id=$1
       AND tenant_id=$2 AND session_id=$3 AND principal_id IS NOT DISTINCT FROM $4
-      AND status IN ('queued','leased') AND cancel_requested_at IS NULL
+      AND status IN ('queued','leased','waiting') AND cancel_requested_at IS NULL
       AND meta->>'parentWorkId'=$5 AND meta->'parentRequestVersion'=$6::jsonb`,
     [childId, parent.tenantId, parent.sessionId, parent.principalId ?? null, parent.id, JSON.stringify(requestVersion)])
     return rows.length === 1
@@ -218,7 +238,7 @@ export class PgWorkStore implements WorkStore {
         `UPDATE lingxios.agent_work_items
             SET status = 'leased', fence = fence + 1, lease_token_hash = $2, leased_by = $3,
                 lease_expires_at = NOW() + make_interval(secs => $4::int),
-                attempts = attempts + 1, updated_at = NOW()
+                attempts = attempts + 1, started_at=NOW(),heartbeat_at=NOW(),last_progress_at=NOW(),updated_at = NOW()
           WHERE id = $1
           RETURNING *`,
         [row['id'], hashToken(token), workerId, this.leaseTtlSeconds],
@@ -231,7 +251,7 @@ export class PgWorkStore implements WorkStore {
     const { rows } = await this.pool.query(
       `WITH renewed AS (
          UPDATE lingxios.agent_work_items
-            SET lease_expires_at = NOW() + make_interval(secs => $4::int), updated_at = NOW()
+            SET lease_expires_at = NOW() + make_interval(secs => $4::int),heartbeat_at=NOW()
           WHERE id = $1 AND fence = $2 AND lease_token_hash = $3 AND status = 'leased'
             AND lease_expires_at > NOW()
           RETURNING cancel_requested_at, preempt_requested_at, steer_inputs, leased_by
@@ -296,14 +316,14 @@ export class PgWorkStore implements WorkStore {
       const { rows } = await client.query(
         `UPDATE lingxios.agent_work_items
             SET status = $4, result_text = $5, error = $6, goal_outcome = $7::jsonb, lease_token_hash = NULL,
-                lease_expires_at = NULL, finished_at = NOW(), updated_at = NOW()
+                lease_expires_at = NULL, finished_at = CASE WHEN $4='waiting' THEN NULL ELSE NOW() END, updated_at = NOW()
           WHERE id = $1 AND fence = $2 AND lease_token_hash = $3 AND status = 'leased'
             AND lease_expires_at > NOW()
-            AND ($4 <> 'completed' OR cancel_requested_at IS NULL)
-            AND ($4 <> 'completed' OR jsonb_typeof(meta->'text') IS DISTINCT FROM 'string' OR $7::jsonb IS NOT NULL)
-            AND ($4 <> 'completed' OR $8::integer IS NULL OR $8::integer = jsonb_array_length(steer_inputs) + 1)
+            AND ($4 IN ('failed','cancelled') OR cancel_requested_at IS NULL)
+            AND ($4 IN ('failed','cancelled') OR jsonb_typeof(meta->'text') IS DISTINCT FROM 'string' OR $7::jsonb IS NOT NULL)
+            AND ($4 IN ('failed','cancelled') OR $8::integer IS NULL OR $8::integer = jsonb_array_length(steer_inputs) + 1)
           RETURNING id`,
-        [id, fence, leaseTokenHash, completion.status, completion.resultText ?? null, completion.error ?? null,
+        [id, fence, leaseTokenHash, workStatusOf(completion), completion.resultText ?? null, completion.error ?? null,
           completion.goalOutcome ? JSON.stringify(completion.goalOutcome) : null, completion.goalOutcome?.requestVersion ?? null],
       )
       if (!rows[0]) return false
@@ -313,15 +333,21 @@ export class PgWorkStore implements WorkStore {
   }
 
   async requestCancel(id: string): Promise<boolean> {
-    const { rowCount } = await this.pool.query(
-      `UPDATE lingxios.agent_work_items
-          SET cancel_requested_at = NOW(),
-              status = CASE WHEN status = 'queued' THEN 'cancelled' ELSE status END,
-              updated_at = NOW()
-        WHERE id = $1 AND status IN ('queued','leased')`,
-      [id],
-    )
-    return (rowCount ?? 0) > 0
+    const { rows } = await this.pool.query(`WITH RECURSIVE descendants AS (
+      SELECT id,tenant_id,principal_id,ARRAY[id] AS path FROM lingxios.agent_work_items
+      WHERE id=$1 AND status IN ('queued','leased','waiting')
+      UNION ALL SELECT child.id,child.tenant_id,child.principal_id,parent.path||child.id
+      FROM lingxios.agent_work_items child JOIN descendants parent ON child.meta->>'parentWorkId'=parent.id
+        AND child.tenant_id=parent.tenant_id AND child.principal_id IS NOT DISTINCT FROM parent.principal_id
+      WHERE NOT child.id=ANY(parent.path) AND cardinality(parent.path)<64
+    ) UPDATE lingxios.agent_work_items work SET cancel_requested_at=COALESCE(cancel_requested_at,NOW()),
+      status=CASE WHEN status='leased' THEN status ELSE 'cancelled' END,
+      finished_at=CASE WHEN status='leased' THEN finished_at ELSE NOW() END,
+      goal_outcome=CASE WHEN status='leased' THEN goal_outcome ELSE jsonb_build_object(
+        'status','blocked','verification','not_run','requestVersion',jsonb_array_length(steer_inputs)+1,
+        'gaps',jsonb_build_array('Cancelled by user')) END,updated_at=NOW()
+      WHERE id IN (SELECT id FROM descendants) AND status IN ('queued','leased','waiting') RETURNING id`, [id])
+    return rows.some(row => row['id'] === id)
   }
 
   async requestPreempt(id: string): Promise<boolean> {
@@ -422,19 +448,20 @@ export class PgSessionStore implements SessionStore {
 }
 
 export class PgEventStore implements EventStore {
-  constructor(private readonly pool: SqlPool) {}
+  constructor(private readonly pool: SqlPool, private readonly queueDelivery = false) {}
 
-  async append(event: StoredRunEvent, proof?: import('./stores.js').StoreLeaseProof): Promise<boolean> {
+  async append(event: StoredRunEvent, proof?: import('./stores.js').StoreLeaseProof, work?: Omit<WorkItem, 'leaseToken'>): Promise<boolean> {
     const { rows } = await this.pool.query(
-      `INSERT INTO lingxios.agent_run_events (run_id, seq, tenant_id, agent_id, kind, stage, visibility, data, recorded_at, expires_at)
-       SELECT $1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9,CASE WHEN $13::text IS NULL THEN NULL ELSE $13::timestamptz END
+      `INSERT INTO lingxios.agent_run_events (run_id, seq, tenant_id, agent_id, kind, stage, visibility, data, recorded_at, expires_at, delivery_work)
+       SELECT $1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9,CASE WHEN $13::text IS NULL THEN NULL ELSE $13::timestamptz END,$14::jsonb
         WHERE $10::text IS NULL OR EXISTS (SELECT 1 FROM lingxios.agent_work_items
           WHERE id=$10 AND fence=$11 AND lease_token_hash=$12 AND status='leased' AND lease_expires_at>NOW())
        ON CONFLICT (run_id, seq) DO NOTHING RETURNING run_id`,
       [event.runId, event.seq, event.tenantId, event.agentId, event.kind, event.stage,
         event.visibility, JSON.stringify(event.data), event.recordedAt,
         proof?.workId ?? null, proof?.fence ?? null, proof?.leaseTokenHash ?? null,
-        typeof event.data['traceExpiresAt'] === 'string' ? event.data['traceExpiresAt'] : null],
+        typeof event.data['traceExpiresAt'] === 'string' ? event.data['traceExpiresAt'] : null,
+        this.queueDelivery && work && (event.visibility === 'user' || /^(run\.|model\.(started|delta|completed)$|tool\.|approval\.)/.test(event.kind)) ? JSON.stringify(work) : null],
     )
     return rows.length > 0
   }
@@ -570,20 +597,33 @@ export class PgActionLedger implements ActionLedgerStore {
 export class PgModelBudgetStore implements ModelBudgetStore {
   constructor(private readonly pool: SqlPool) {}
 
-  async reserve(rootWorkId: string, callId: string, limits: ModelBudgetLimits): Promise<ModelBudgetReservation> {
+  async reserve(rootWorkId: string, callId: string, limits: ModelBudgetLimits, proof?: import('./stores.js').StoreLeaseProof): Promise<ModelBudgetReservation> {
     return withTransaction(this.pool, async client => {
+      if (proof) {
+        const owner = await client.query(`SELECT id FROM lingxios.agent_work_items
+          WHERE id=$1 AND fence=$2 AND lease_token_hash=$3 AND status='leased'
+            AND lease_expires_at>NOW() AND cancel_requested_at IS NULL FOR UPDATE`,
+          [proof.workId, proof.fence, proof.leaseTokenHash])
+        if (!owner.rows.length) throw new Error('model reservation requires a live uncancelled attempt')
+      }
       await client.query(`INSERT INTO lingxios.agent_model_budgets
-        (root_work_id,max_model_calls,max_tokens,max_cost_micros,deadline_at)
-        VALUES($1,$2,$3,$4,$5) ON CONFLICT(root_work_id) DO NOTHING`,
-      [rootWorkId, limits.maxModelCalls, limits.maxTokens, limits.maxCostMicros, limits.deadlineAt])
+        (root_work_id,max_model_calls,max_tokens,max_cost_micros,deadline_at,max_execution_ms)
+        VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(root_work_id) DO NOTHING`,
+      [rootWorkId, limits.maxModelCalls, limits.maxTokens, limits.maxCostMicros, limits.deadlineAt, limits.maxExecutionMs ?? 1_800_000])
       await client.query('SELECT root_work_id FROM lingxios.agent_model_budgets WHERE root_work_id=$1 FOR UPDATE', [rootWorkId])
+      if (limits.maxExecutionMs !== undefined) await client.query(`UPDATE lingxios.agent_model_budgets budget
+        SET deadline_at=NOW()+GREATEST(0,budget.max_execution_ms-COALESCE((
+          SELECT SUM(GREATEST(0,EXTRACT(EPOCH FROM (COALESCE(attempt.ended_at,LEAST(NOW(),attempt.lease_expires_at))-attempt.started_at))*1000))
+          FROM lingxios.agent_attempts attempt JOIN lingxios.agent_work_items work ON work.id=attempt.work_id
+          WHERE COALESCE(work.meta->>'rootWorkId',work.id)=budget.root_work_id),0))*INTERVAL '1 millisecond'
+        WHERE root_work_id=$1`, [rootWorkId])
       const prior = await client.query(`SELECT 1 FROM lingxios.agent_model_budget_calls
         WHERE root_work_id=$1 AND call_id=$2`, [rootWorkId, callId])
       if (!prior.rows.length) {
-        const inserted = await client.query(`INSERT INTO lingxios.agent_model_budget_calls(root_work_id,call_id,reserved_tokens,reserved_cost_micros)
-          SELECT root_work_id,$2,$3,$4 FROM lingxios.agent_model_budgets WHERE root_work_id=$1
+        const inserted = await client.query(`INSERT INTO lingxios.agent_model_budget_calls(root_work_id,call_id,reserved_tokens,reserved_cost_micros,work_id,fence,lease_token_hash)
+          SELECT root_work_id,$2,$3,$4,$5,$6,$7 FROM lingxios.agent_model_budgets WHERE root_work_id=$1
             AND NOW()<deadline_at AND model_calls<max_model_calls AND tokens+$3<=max_tokens AND cost_micros+$4<=max_cost_micros
-          ON CONFLICT DO NOTHING RETURNING call_id`, [rootWorkId, callId, limits.reservedTokens ?? 0, limits.reservedCostMicros ?? 0])
+          ON CONFLICT DO NOTHING RETURNING call_id`, [rootWorkId, callId, limits.reservedTokens ?? 0, limits.reservedCostMicros ?? 0, proof?.workId ?? rootWorkId, proof?.fence ?? null, proof?.leaseTokenHash ?? null])
         if (inserted.rows.length) await client.query(`UPDATE lingxios.agent_model_budgets
           SET model_calls=model_calls+1,tokens=tokens+$2,cost_micros=cost_micros+$3,updated_at=NOW() WHERE root_work_id=$1`, [rootWorkId, limits.reservedTokens ?? 0, limits.reservedCostMicros ?? 0])
       }
@@ -598,11 +638,20 @@ export class PgModelBudgetStore implements ModelBudgetStore {
     })
   }
 
-  async record(rootWorkId: string, callId: string, inputTokens: number, outputTokens: number, costMicros: number): Promise<void> {
+  async record(rootWorkId: string, callId: string, inputTokens: number, outputTokens: number, costMicros: number, proof?: import('./stores.js').StoreLeaseProof, observation?: import('../model/execution.js').ModelCallObservation): Promise<void> {
     await withTransaction(this.pool, async client => {
-      const { rows } = await client.query(`UPDATE lingxios.agent_model_budget_calls SET input_tokens=$3,output_tokens=$4,cost_micros=$5
+      const issued = await client.query(`SELECT input_tokens,output_tokens,cost_micros FROM lingxios.agent_model_budget_calls
+        WHERE root_work_id=$1 AND call_id=$2 AND ($3::text IS NULL OR (work_id=$3 AND fence=$4 AND lease_token_hash=$5)) FOR UPDATE`,
+      [rootWorkId, callId, proof?.workId ?? null, proof?.fence ?? null, proof?.leaseTokenHash ?? null])
+      if (!issued.rows.length) throw new Error('model call reservation does not belong to this attempt')
+      if (issued.rows[0]!['input_tokens'] !== null) {
+        if (Number(issued.rows[0]!['input_tokens']) !== inputTokens || Number(issued.rows[0]!['output_tokens']) !== outputTokens
+          || Number(issued.rows[0]!['cost_micros']) !== costMicros) throw new Error('model usage settlement cannot be rewritten')
+        return
+      }
+      const { rows } = await client.query(`UPDATE lingxios.agent_model_budget_calls SET input_tokens=$3,output_tokens=$4,cost_micros=$5,observation=$6::jsonb
         WHERE root_work_id=$1 AND call_id=$2 AND input_tokens IS NULL RETURNING call_id,reserved_tokens,reserved_cost_micros`,
-      [rootWorkId, callId, inputTokens, outputTokens, costMicros])
+      [rootWorkId, callId, inputTokens, outputTokens, costMicros, observation ? JSON.stringify(observation) : null])
       if (rows.length) await client.query(`UPDATE lingxios.agent_model_budgets SET tokens=tokens+$2+$3,
         cost_micros=cost_micros+$4,updated_at=NOW() WHERE root_work_id=$1`, [rootWorkId, inputTokens - Number(rows[0]!['reserved_tokens']), outputTokens, costMicros - Number(rows[0]!['reserved_cost_micros'])])
     })

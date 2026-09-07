@@ -1,3 +1,5 @@
+import { extractDocumentText } from '../context/document-text.js'
+import type { VerificationRecord } from '../outcome/verification.js'
 import { createHash, randomUUID } from 'node:crypto'
 import { open, realpath, mkdir, link, unlink } from 'node:fs/promises'
 import { isAbsolute, relative, resolve } from 'node:path'
@@ -106,4 +108,37 @@ export async function readArtifact(database: SqlPool, homesRoot: string,
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null
     throw error
   }
+}
+
+/** Read the same committed bytes later served by the download endpoint. Never accept model-supplied file contents. */
+export async function inspectArtifacts(homesRoot: string, work: Omit<WorkItem, 'leaseToken'>, artifacts: KernelArtifact[]): Promise<VerificationRecord[]> {
+  const records: VerificationRecord[] = [], started = Date.now()
+  for (const artifact of snapshotArtifacts(artifacts)) {
+    const checker = `artifact:${artifact.path}`
+    try {
+      if (Date.now() - started > 20_000) {
+        records.push({ checker, status: 'inconclusive', evidence: { artifact, reason: 'File inspection time budget exhausted' } }); continue
+      }
+      const root = await realpath(homesRoot), directory = artifactDirectory(root, { ...work, runId: work.id })
+      const { bytes } = await checkedFile(root, directory, artifact.sha256.toLowerCase(), artifact)
+      let text: string | undefined
+      const mime = artifact.mime.split(';')[0]!.toLowerCase()
+      if (mime === 'application/pdf') text = await extractDocumentText(bytes, 'pdf')
+      else if (mime === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document') text = await extractDocumentText(bytes, 'docx')
+      else if (mime.startsWith('text/') || ['application/json','application/javascript','application/xml','image/svg+xml'].includes(mime)) {
+        text = new TextDecoder('utf-8', { fatal: true }).decode(bytes)
+        if (mime === 'application/json') JSON.parse(text)
+        if (text.includes('\u0000')) throw new Error('Text file contains binary null bytes')
+      }
+      records.push({ checker, status: text === undefined ? 'inconclusive' : 'passed', evidence: {
+        artifact, byteCount: bytes.length, sha256: artifact.sha256,
+        ...(text === undefined ? { reason: 'Bytes and hash verified; no content parser is available for this format' }
+          : { extractedText: text.slice(0, 12_000), truncated: text.length > 12_000,
+            scope: 'Readable bytes and extracted text; layout, images and task semantics are separate checks' }),
+      } })
+    } catch {
+      records.push({ checker, status: 'failed', evidence: { artifact, reason: 'File bytes, hash or declared format could not be verified' } })
+    }
+  }
+  return records
 }

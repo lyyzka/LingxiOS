@@ -1,3 +1,4 @@
+import { lockAction, recordActionResult } from '../../control-plane/action-transaction.js'
 import { createHash } from 'node:crypto'
 import { recallMemories, snapshotMemories, type MemoryScope, type MemoryScopeType } from '../../memory/store.js'
 import { sessionKeyOf, type HostAction, type WorkItem } from '../../protocol/types.js'
@@ -69,6 +70,7 @@ export async function executeMemory(work: Omit<WorkItem, 'leaseToken'>, action: 
     || !/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d{1,3})?(?:Z|[+-]\d\d:\d\d)$/.test(validUntil)
     || !Number.isFinite(Date.parse(validUntil)) || Date.parse(validUntil) <= Date.now())) throw new Error('validUntil must be a future ISO timestamp')
   return withTransaction(database, async client => {
+    await lockAction(client, work, action)
     const { rows } = await client.query(`SELECT snapshot.request_snapshot FROM lingxios.agent_work_items w
       JOIN lingxios.agent_os_sessions s ON s.session_key=$4
       JOIN lingxios.agent_request_snapshots snapshot ON snapshot.work_id=w.id AND snapshot.session_key=s.session_key
@@ -91,7 +93,7 @@ export async function executeMemory(work: Omit<WorkItem, 'leaseToken'>, action: 
         ON CONFLICT(tenant_id,id) DO NOTHING RETURNING id,body,kind,origin,version,source_refs,valid_until`,
       [work.tenantId, id, scopeType, scope.scopeId, body.trim(), kind, JSON.stringify([source]), validUntil ?? null])
       if (!saved.rows.length) throw new Error('memory note already exists; reconcile its original action receipt')
-      return saved.rows[0]
+      return recordActionResult(client, action, saved.rows[0])
     }
     const id = action.args['id'], version = action.args['expectedVersion']
     if (typeof id !== 'string' || !id || !Number.isSafeInteger(version) || Number(version) < 1) throw new Error('memory changes require id and expectedVersion')
@@ -100,7 +102,7 @@ export async function executeMemory(work: Omit<WorkItem, 'leaseToken'>, action: 
         WHERE tenant_id=$1 AND id=$2 AND scope_type=$3 AND scope_id=$4 AND version=$5 RETURNING id`,
       [work.tenantId, id, scopeType, scope.scopeId, version])
       if (!deleted.rows.length) throw new Error('memory is unavailable or stale')
-      return { id, deleted: true }
+      return recordActionResult(client, action, { id, deleted: true })
     }
     if (method === 'pin') {
       const pinned = action.args['pinned']
@@ -112,7 +114,7 @@ export async function executeMemory(work: Omit<WorkItem, 'leaseToken'>, action: 
         RETURNING id,body,kind,origin,pinned,version,source_refs,valid_until`,
       [work.tenantId, id, scopeType, scope.scopeId, version, pinned, JSON.stringify([source])])
       if (!saved.rows.length) throw new Error('memory is unavailable, stale, or at its provenance limit')
-      return saved.rows[0]
+      return recordActionResult(client, action, saved.rows[0])
     }
     const saved = await client.query(`UPDATE lingxios.agent_memories SET version=version+1,status='active',
       valid_until=COALESCE($6::timestamptz,valid_until),source_refs=source_refs||$7::jsonb,updated_at=NOW()
@@ -122,6 +124,6 @@ export async function executeMemory(work: Omit<WorkItem, 'leaseToken'>, action: 
       RETURNING id,body,kind,origin,version,source_refs,valid_until`,
     [work.tenantId, id, scopeType, scope.scopeId, version, validUntil ?? null, JSON.stringify([source])])
     if (!saved.rows.length) throw new Error('memory is unavailable, stale, non-explicit, or at its provenance limit')
-    return saved.rows[0]
+    return recordActionResult(client, action, saved.rows[0])
   })
 }
