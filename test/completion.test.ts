@@ -1,3 +1,4 @@
+import { MemoryModelBudgetStore } from '../src/control-plane/memory-store.js'
 import assert from 'node:assert/strict'
 import { it } from 'node:test'
 import { ControlPlaneService } from '../src/control-plane/service.js'
@@ -13,9 +14,9 @@ it('requires settled actions and a reviewed committed response, and binds delega
   for (const delegated of [false, true]) {
     const workStore = new MemoryWorkStore(), actions = new MemoryActionLedger()
     let committed: AssistantMessage | null = null
-    const service = new ControlPlaneService({ work: workStore, actions, steps: new MemoryStepStore(), sessions: new MemorySessionStore(), events: new MemoryEventStore(),
+    const service = new ControlPlaneService({ modelBudgets: new MemoryModelBudgetStore(), steps: new MemoryStepStore(), work: workStore, actions, sessions: new MemorySessionStore(), events: new MemoryEventStore(),
       contextProvider: { loadContext: async () => { throw new Error('unexpected') } },
-      capabilityResolver: { resolve: async () => [] }, actionExecutor: { execute: async () => { throw new Error('unexpected') } },
+      capabilityResolver: { resolve: async () => [] }, actionExecutor: { prepare: async () => {}, execute: async () => { throw new Error('unexpected') } },
       delivery: { onEvent: async () => {}, getMessage: async () => committed,
         deliverMessage: async (_work, message) => { committed = structuredClone(message) } } })
     await service.enqueue({ id: 'w', tenantId: 't', principalId: 'u', agentId: 'a', sessionId: 's', triggerRef: 'm', kind: 'turn', lane: 'interactive', meta: { text: 'Create a file.' } })
@@ -24,12 +25,12 @@ it('requires settled actions and a reviewed committed response, and binds delega
     const session: SessionRecord = { key: '["t","a","s",null]', tenantId: 't', agentId: 'a', sessionId: 's', history: [], appliedWorkIds: ['w'], revision: 0, compactionEpoch: 0,
       request: { version: 1, workId: 'w', tenantId: 't', sessionId: 's', authorId: 'u', sourceRef: 'm', originalText: 'Create a file.', revisions: [], attachments: [], evidence } }
     await service.saveSession(work, session)
-    await assert.rejects(service.complete(work, { status: 'completed', goalOutcome: {
+    await assert.rejects(service.waitWork(work, {
       status: 'awaiting_approval', approvalId: 'invented', requestVersion: 1, verification: 'not_run',
-    } }), /durable pending receipt/)
-    await assert.rejects(service.complete(work, { status: 'completed', goalOutcome: {
+    }), /durable pending receipt/)
+    await assert.rejects(service.waitWork(work, {
       status: 'awaiting_input', question: 'Invented question?', requestVersion: 1, verification: 'not_run',
-    } }), /durable question receipt/)
+    }), /durable question receipt/)
     const assessment: GoalAssessment = { status: delegated ? 'delegated' : 'satisfied', ...(delegated ? { taskRef: 'child' } : {}),
       gaps: delegated ? ['Child work is pending'] : [], checks: [{ requirement: 'Create a file.', status: delegated ? 'unknown' : 'met', basis: 'Execution observation' }] }
     const outcome = delegated ? { status: 'delegated' as const, taskRef: 'child', gaps: assessment.gaps, verification: 'not_run' as const, requestVersion: 1 }
@@ -40,7 +41,8 @@ it('requires settled actions and a reviewed committed response, and binds delega
     await service.recordEvent(work, { runId: 'w', seq: 2, kind: 'model.delta', stage: 'delta', visibility: 'user', data: { partType: 'text', delta: 'Result' } })
     await service.recordEvent(work, { runId: 'w', seq: 3, kind: 'response.assessed', stage: 'completed', visibility: 'internal',
       data: { body: message.body, assessment, goalOutcome: outcome } })
-    await assert.rejects(service.complete(work, { status: 'completed', resultText: message.body, goalOutcome: outcome }), /committed assessed response/)
+    await assert.rejects(service.complete(work, { status: 'completed', goalOutcome: outcome }),
+      delegated ? /waiting requires waitWork/ : /committed assessed response/)
     if (delegated) {
       await assert.rejects(service.commitResult(work, message), /delegated task is not pending/)
       await workStore.enqueue({ id: 'child', tenantId: 't', principalId: 'u', agentId: 'child-agent', sessionId: 's', triggerRef: 'm', kind: 'turn', lane: 'collaboration',
@@ -57,7 +59,8 @@ it('requires settled actions and a reviewed committed response, and binds delega
     }
     await service.commitResult(work, message)
     if (delegated) await workStore.requestCancel('child')
-    await service.complete(work, { status: 'completed', resultText: message.body, goalOutcome: outcome })
+    if (outcome.status === 'delegated') await service.waitWork(work, outcome)
+    else await service.complete(work, { status: 'completed', goalOutcome: outcome })
     assert.deepEqual(workStore.inspect('w')?.goalOutcome, outcome)
   }
 })

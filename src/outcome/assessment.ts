@@ -21,7 +21,7 @@ export function parseFinalCandidate(raw: string, request: RequestSnapshot): { bo
   if (!Array.isArray(value.gaps) || value.gaps.length > 64
     || !value.gaps.every((gap: unknown) => typeof gap === 'string' && gap.trim() && gap.length <= 2000)) throw new Error('gaps must be an array of up to 64 remaining-work strings')
   if (!Array.isArray(value.checks) || !value.checks.length || value.checks.length > 64) throw new Error('checks must contain 1 to 64 requirement/status/basis objects')
-  const source = [request.originalText, ...request.revisions.map(revision => revision.text)]
+  const source = [request.originalText, ...(request.inheritedRevisions ?? []).map(revision => revision.text), ...request.revisions.map(revision => revision.text)]
   for (const check of value.checks) {
     if (!check || typeof check !== 'object' || Array.isArray(check)
       || Object.keys(check).sort().join(',') !== 'basis,requirement,status'
@@ -32,7 +32,7 @@ export function parseFinalCandidate(raw: string, request: RequestSnapshot): { bo
       throw new Error('Each requirement must be copied verbatim from originalText or a revision, without paraphrasing or translating. Non-matching requirement: ' + JSON.stringify(check.requirement.slice(0, 240)))
     }
   }
-  const latestRevision = request.revisions.at(-1)
+  const latestRevision = request.revisions.at(-1) ?? request.inheritedRevisions?.at(-1)
   if (latestRevision && !value.checks.some((check: GoalAssessment['checks'][number]) => latestRevision.text.includes(check.requirement))) {
     throw new Error('final self-check must cover the latest user revision')
   }

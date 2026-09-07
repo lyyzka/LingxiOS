@@ -1,59 +1,67 @@
 # LingxiOS
 
-AgentOS and Harness in one npm package: durable PostgreSQL work queues, fenced workers, versioned requests, Python execution, action receipts, goal outcomes and committed messages/files.
+LingxiOS is a product-neutral agent execution runtime for Node.js and PostgreSQL. It provides durable requests, fenced workers, native tool transactions, recovery, approval and input waits, model budgets, verified outcomes, committed artifacts, delivery outboxes, and versioned memory.
 
-The first release includes the packaged runtime and all currently implemented LingxiLoop bindings. LectureDeck is the sole presentation workflow; it persists outlines, requires approval before slide generation, and recovers fenced workers through the control plane. There is one initial schema and no legacy migration or dual-write path.
+The package has four public entries: `lingxios`, `lingxios/worker`, `lingxios/ui`, and `lingxios/eval`. Product rules and services stay in the consuming application.
 
-## Run a request
+## Install
 
-Requires Node.js 22.13+, Python 3 and a PostgreSQL pool. Apply `packageResources().schema` to a new application database before starting. The application checks the installed schema and does not fall back to in-memory storage.
+```sh
+npm install lingxios@2.0.0
+```
+
+Requires Node.js 22.13+, PostgreSQL, and Python 3. Install `packageResources().schema` through the product's explicit migration process before an application starts. LingxiOS performs read-only schema checks at startup and never applies DDL itself.
+
+## Control plane and Worker
 
 ```ts
 import { createLingxiOS } from 'lingxios'
+import { createWorker } from 'lingxios/worker'
 import { pool } from './database.js'
+import { context, delivery, tools } from './native-agent-bindings.js'
 
-const app = await createLingxiOS({
+const control = await createLingxiOS({
   database: pool,
-  model: { apiKey: process.env.AGENT_OS_MODEL_API_KEY! },
+  tools,
+  contextProvider: context,
+  delivery,
+  homesRoot: '/persistent/agent-homes',
+})
+
+const worker = createWorker({
+  controlPlane: control,
+  model: { apiKey: process.env.AGENT_MODEL_API_KEY! },
   kernel: { homesRoot: '/persistent/agent-homes' },
 })
 
-try {
-  // Authenticate and authorize this identity in the calling server.
-  const identity = {
-    runId: 'request-1', tenantId: 'tenant', agentId: 'assistant', sessionId: 'conversation',
-  }
-  await app.enqueue({
-    ...identity, id: identity.runId, principalId: 'authenticated-user',
-    text: 'Calculate six times seven using Python.',
-  })
-  await app.runNext()
-  console.log(await app.readMessage(identity))
-  console.log(await app.readOutcome(identity))
-} finally {
-  await app.stop()
-}
+await control.enqueue({
+  id: 'request-1',
+  tenantId: 'tenant',
+  agentId: 'assistant',
+  sessionId: 'conversation',
+  principalId: 'authenticated-user',
+  text: 'Create the requested document and verify it.',
+})
+await worker.runNext()
+console.log(await control.readRunState({
+  runId: 'request-1', tenantId: 'tenant', agentId: 'assistant',
+  sessionId: 'conversation', principalId: 'authenticated-user',
+}))
+
+await worker.stop()
+await control.stop()
 ```
 
-The default model is `deepseek-ai/DeepSeek-V4-Flash` at SiliconFlow, with `reasoning_effort=high`. The calling application owns the database pool. Use `start()` for continuous local workers, or `/worker` and the authenticated HTTP control plane for separate worker processes.
+Creating a control plane never claims work. A Worker receives the model, Kernel, runtime policy, and optional native processors. Web/API processes expose authenticated ingress and control operations; Worker processes alone execute tasks.
 
-## Public entries
+## Native tools and recovery
 
-| Entry | Purpose |
-| --- | --- |
-| `lingxios` | Application, diagnostics and packaged schema/runner locations |
-| `lingxios/worker` | Worker process and startup configuration |
-| `lingxios/ui` | Browser-safe committed message and event consumers |
-| `lingxios/eval` | Recorded resource checks and model review |
-| `lingxios/lingxiloop` | Optional native product bindings |
-| `lingxios/lecture-deck` | Package-owned lecture requests, operations, and artifacts |
+Each `ToolDefinition` supplies one input parser and model-visible schema plus authorization, effect type, execution, approval preview, reconciliation, and verification. Validation and authorization occur before an action intent is recorded. PostgreSQL writes receive the same transaction as their action receipt. Reads may be retried; confirmed receipts are restored; unknown external effects wait for reconciliation.
 
-Goal status is separate from worker lifecycle. `satisfied` records the model's requirement assessment; it is not independent proof of correctness. Unknown actions, missing receipts and known resource failures prevent a satisfied result. Input/approval waits retain the same request and version. Committed files are hashed snapshots; recovering an interrupted worker does not blindly repeat unknown effects.
+Work lifecycle, goal outcome, and delivery state are separate. `readRunState()` returns a consistent snapshot of all three. A `satisfied` goal requires current authoritative checks when the request created resources; model self-assessment alone cannot mark verification as passed.
 
-The shared prompt separates instruction/data boundaries, tool use, action recovery, delivery, and final JSON assessment. Its organization draws on the [system prompt reference collection](https://github.com/asgeirtj/system_prompts_leaks) and [Anthropic's prompting guidance](https://platform.claude.com/docs/en/build-with-claude/prompt-engineering/claude-prompting-best-practices); the collection is an unofficial reference, not a verified provider contract. Compaction preserves revisions and uncertain action outcomes without promoting source text into instructions. Prompt contract upgrades refresh frozen instructions while retaining session history.
+Evolution candidates remain inactive until a frozen benchmark improves target cases, passes authorization, approval, isolation and code-mutation gates, and does not regress its holdout set. Active strategy references are pinned per run and can be rolled back through the trusted control API.
 
-`eval/runtime-cases.json` includes quoted instruction injection and code examples without execution, alongside format and artifact checks. With model credentials configured, run `npm run eval:live -- --output NEW_DIRECTORY --repeat 3` to measure behavior; deterministic tests alone do not establish model quality or injection resistance.
+Production Python execution requires OS isolation. The packaged Worker defaults to Linux Bubblewrap in production and fails readiness when the isolation self-check fails. Artifact downloads verify the committed path, size, and SHA-256 digest.
 
-Python execution needs deployment isolation suitable for your trust model; Python-level guards are not an OS security boundary. Production defaults to Linux Bubblewrap and fails startup if its self-check fails. Remote workers receive lease-fenced contexts over the control-plane HTTP API and cannot access PostgreSQL or committed artifacts directly. Artifacts are hash-checked and limited to 16 MiB each.
-
-See [runtime API and deployment details](docs/packaged-runtime.md) and [production deployment and recovery](deploy/README.md). `npm test` includes standalone tarball installation. `npm run check:release` builds once and runs package, PostgreSQL, native binding, Worker recovery, capacity, and image gates; live model and signed human acceptance evidence are required for a release result.
+See [runtime and deployment details](docs/packaged-runtime.md), [Harness semantics](docs/harness-v3.md), and [production recovery](deploy/README.md).

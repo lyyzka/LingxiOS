@@ -1,4 +1,6 @@
 import { DEFAULT_MODEL_BUDGET } from '../model/execution.js'
+import { abortable } from '../deadline.js'
+import type { VerificationRecord } from '../outcome/verification.js'
 import { flushOutbox } from '../control-plane/outbox.js'
 import { resumeDependents } from '../control-plane/dependencies.js'
 import { candidateHash } from '../outcome/verification.js'
@@ -7,8 +9,7 @@ import { workStatusOf } from '../protocol/types.js'
 import { ControlPlaneServer } from '../control-plane/http-server.js'
 import { checkStorage } from './storage.js'
 import { captureMemoryEvidence, retryMemorySynthesis } from '../memory/evidence.js'
-import { registerProcessors } from '../worker/processors.js'
-import { readArtifact, persistArtifacts, stageArtifact, inspectArtifacts } from './artifacts.js'
+import { readArtifact, persistArtifacts, stageArtifact, inspectArtifacts, createNativeArtifact } from './artifacts.js'
 import { resolve } from 'node:path'
 import { snapshotAttachments, type RequestAttachment } from '../context/attachments.js'
 import { recoverWait } from './recover-wait.js'
@@ -16,58 +17,52 @@ import { continueInput, type InputContinuation } from './input.js'
 import { createHash, randomUUID } from 'node:crypto'
 import { ConfigError } from '../errors.js'
 import { ControlPlaneService } from '../control-plane/service.js'
-import { withTransaction, PgWorkStore, PgSessionStore, PgEventStore, PgActionLedger, PgModelBudgetStore, type SqlPool } from '../control-plane/pg-store.js'
+import { withTransaction, workItemFromRow, PgWorkStore, PgSessionStore, PgEventStore, PgActionLedger, PgModelBudgetStore, type SqlPool, type SqlQueryable } from '../control-plane/pg-store.js'
 import type { HostPort } from '../host/port.js'
-import { KernelManager, type KernelHostBridge, type KernelManagerOptions, type ManagedKernelExecutor } from '../kernel/manager.js'
-import { DEFAULT_MODEL, DEFAULT_SMALL_MODEL, OpenAIChatDriver } from '../model/openai.js'
-import { AgentRuntime } from '../runtime/runtime.js'
-import { AgentWorker } from '../worker/worker.js'
 import type { AssistantMessage, PromptContext, WorkItem, RunEvent } from '../protocol/types.js'
 import { sessionKeyOf } from '../protocol/types.js'
 import { RUN_SEQUENCE_SPAN } from '../protocol/constants.js'
 import type { GoalOutcome } from '../protocol/outcome.js'
-import type { ControlPlaneDeps } from '../control-plane/service.js'
 import type { ActionResolution, ContextProvider } from '../control-plane/stores.js'
-import type { RuntimePolicy } from '../runtime/policy.js'
 import type { ModelCallObserver } from '../runtime/runtime.js'
-import { type LectureDeckService } from '../lecture-deck/service.js'
-import { createLectureDeckApp } from '../lecture-deck/app.js'
-import { lectureControl } from '../lecture-deck/control.js'
-import { kernelIsolation } from '../kernel/isolation.js'
 import { mkdir, open, unlink } from 'node:fs/promises'
 import { createLogger, type Logger } from '../logging.js'
 import { MetricsRegistry } from '../metrics.js'
 import { loadModelBudget } from '../config.js'
 import { maintainStorage } from './maintenance.js'
 import { PgStepStore } from '../control-plane/steps.js'
+import { toolExecutor } from '../tools/executor.js'
+import { TASK_TOOLS } from '../tools/catalog.js'
+import type { ToolDefinition } from '../tools/definition.js'
+import { readApproval, decideApproval, resumeDecidedApprovals, executeDecidedApprovals, type ApprovalLookup, type ApprovalDecision } from '../control-plane/approvals.js'
+import { readRun, readRunState, reviseRun, cancelRun, cancelDescendants, enqueueWork, type RunIdentity, type JobInput } from './jobs.js'
+import { createMemoryRuntime, type MemoryOptions } from '../memory/runtime.js'
+import type { MemoryScope } from '../memory/store.js'
+import { sweepQueuedWork } from '../control-plane/scheduler.js'
+import { readDiagnostics, refreshMetrics, listRuns, readOperations, retryDelivery, type RunListQuery } from './diagnostics.js'
+import { freezeEvolutionBenchmark, rollbackEvolution, type EvolutionBenchmark } from '../memory/evolution.js'
+import { deadlinePool } from '../control-plane/deadline-pool.js'
 
 export interface LingxiOSOptions {
+  memory?: MemoryOptions
+  tools?: readonly ToolDefinition[]
+  delivery?: import('../control-plane/stores.js').DeliveryPort
+  capabilityResolver?: import('../control-plane/stores.js').CapabilityResolver
   logger?: Logger
   metrics?: MetricsRegistry
   database: SqlPool
-  model?: { id?: string; apiKey: string; baseUrl?: string; reasoningEffort?: 'high' | 'max'; maxOutputTokens?: number; maxThinkingTokens?: number; contextWindowTokens?: number }
-  /** Defaults to Qwen on the primary model's endpoint and credentials. */
-  smallModel?: LingxiOSOptions['model']
+  /** Shared artifact storage root, also configured on workers. */
+  homesRoot?: string
   persona?: PromptContext['persona']
   /** Trusted product context loaded for each execution attempt. */
   contextProvider?: ContextProvider
-  /** Product policy used by local runtime execution. */
-  policy?: RuntimePolicy
-  /** Opt in to storing full normalized model payloads in internal events. */
-  recordModelPayloads?: boolean
-  modelTrace?: import('../runtime/runtime.js').ModelTracePolicy
+  /** Native acceptance checks, using live business records rather than model assertions. */
+  verifyRun?: (context: RunVerificationContext) => Promise<VerificationRecord[]>
   /** Root-work limits shared by retries and delegated children. */
   modelBudget?: import('../runtime/runtime.js').RootModelBudgetOptions
   /** Required for products that own billing, quota and model-call observability. */
   onModelCall?: ModelCallObserver
-  /** Optional native professional HTML lecture-deck processor. */
-  lectureDeck?: LectureDeckService
-  kernel?: Omit<KernelManagerOptions, 'runnerPath' | 'logger' | 'maxKernels'>
-  /** Required in production for untrusted model-authored code. */
-  kernelFactory?: (bridge: KernelHostBridge) => ManagedKernelExecutor
-  /** Explicit opt-in for trusted model code using the local process backend in production. */
-  trustProcessKernel?: boolean
-  worker?: { id?: string; concurrency?: number; shutdownGraceMs?: number; pollIdleMs?: number; healthPort?: number }
+
 }
 
 export interface RequestInput {
@@ -100,50 +95,95 @@ export interface MessageIdentity {
 export type ActionResolutionInput = ActionResolution & Pick<RequestInput,
   'tenantId' | 'agentId' | 'sessionId' | 'principalId' | 'threadId'>
 
-/** Trusted server entry point. Product ingress must authenticate the principal. */
-export async function createLingxiOS(options: LingxiOSOptions) {
-  return assembleApp(options)
+export interface RunVerificationContext {
+  work: Omit<WorkItem, 'leaseToken'>
+  requestVersion: number
+  database: SqlQueryable
+  signal: AbortSignal
+  deadlineAt: string
 }
 
-/** Package-internal assembly hook; never exposed as consumer configuration. */
-export async function assembleApp(options: LingxiOSOptions, integration?: Pick<ControlPlaneDeps, 'contextProvider' | 'capabilityResolver' | 'actionExecutor' | 'delivery'> & { tools?: readonly import('../tools/catalog.js').ToolDefinition[]; backgroundJobs?: Record<string, () => Promise<unknown>> }) {
+/** Trusted server entry point. Product ingress authenticates the principal; workers execute separately. */
+export async function createLingxiOS(options: LingxiOSOptions) {
   if (!options.database?.query || !options.database.connect) throw new ConfigError('a PostgreSQL pool is required')
-  if (options.lectureDeck && !options.lectureDeck.dependencies.publisher.read) throw new ConfigError('lecture publisher must support reading committed artifacts for recovery')
-  for (const configured of [options.model, options.smallModel]) {
-    if (configured && ((configured.id !== undefined && !configured.id.trim()) || !configured.apiKey?.trim())) throw new ConfigError('model apiKey is required and any explicit model id must be non-empty')
-  }
-  const concurrency = options.worker?.concurrency ?? 2
-  if (!Number.isSafeInteger(concurrency) || concurrency < 1 || concurrency > 1_024) throw new ConfigError('worker concurrency must be 1-1024')
+  const shutdown = new AbortController()
+  options = { ...options, database: deadlinePool(options.database,shutdown.signal) }
   await checkStorage(options.database)
   const logger = options.logger ?? createLogger()
   const metrics = options.metrics ?? new MetricsRegistry()
-  const homesRoot = resolve(options.kernel?.homesRoot ?? process.env['AGENT_OS_HOMES_ROOT'] ?? '.agent-os/homes')
+  const homesRoot = resolve(options.homesRoot ?? process.env['AGENT_OS_HOMES_ROOT'] ?? '.agent-os/homes')
   const modelBudget = { ...DEFAULT_MODEL_BUDGET, ...loadModelBudget(), ...options.modelBudget }
   if (process.env['NODE_ENV'] === 'production' && !(modelBudget.inputCostMicrosPerMillion > 0 || modelBudget.outputCostMicrosPerMillion > 0)) {
     throw new ConfigError('production requires configured model token prices')
   }
   metrics.gauge('agentos_cost_budget_enabled', 'Configured prices make the cost budget effective').set(
     modelBudget.inputCostMicrosPerMillion! > 0 || modelBudget.outputCostMicrosPerMillion! > 0 ? 1 : 0)
-  let lastContactAt = 0
   const persona = options.persona ?? { name: 'Assistant', role: 'assistant', instructions: 'Follow the current user request. Clearly distinguish verified results from remaining work.' }
-  const workerId = options.worker?.id ?? `lingxios-${randomUUID()}`
+  const contextProvider: ContextProvider = options.contextProvider ?? { loadContext: async (work) => {
+      const text = work.meta?.['text']
+      if (typeof text !== 'string' || !work.principalId) throw new Error('request text and principal are missing')
+      return {
+        persona, capabilities: [],
+        messages: [{ ref: work.triggerRef, authorId: work.principalId, authorName: String(work.meta?.['authorName'] ?? 'User'), authorKind: 'human', body: text, createdAt: work.createdAt ?? '' }],
+        promptContextCandidate: { version: 3, epoch: 0, assembledAt: '', systemInstructions: '', persona, capabilities: [], sourceVersions: { persona: JSON.stringify(persona) } },
+      }
+    } }
+  const memory = options.memory ? createMemoryRuntime(options.database, options.memory, options.modelBudget) : undefined
+  const definitions = [...options.tools ?? [], ...memory?.tools ?? []]
+  const capabilities = options.capabilityResolver ?? { resolve: async () => [...new Set((options.tools ?? []).map(tool => tool.action.split('.')[0]!))]
+    .map(name => ({ name, methods: (options.tools ?? []).filter(tool => tool.action.startsWith(name + '.')).map(tool => tool.action.split('.')[1]!) })) }
+  const integration = {
+    tools: [...TASK_TOOLS, ...definitions.map(({ name, action, description, parameters, effect, approval, readback }) =>
+      ({ name, action, description, parameters, effect, approval, ...(readback ? { readback } : {}) }))],
+    actionExecutor: toolExecutor(options.database, definitions, (work, input) => createNativeArtifact(
+      resolve(options.homesRoot ?? process.env['AGENT_OS_HOMES_ROOT'] ?? '.agent-os/homes'), work, input)),
+    capabilityResolver: { async resolve(work: Omit<WorkItem, 'leaseToken'>) {
+      if (memory && ['memory_synthesis','memory_index','memory_evaluation'].includes(work.kind)) return [{ name: work.kind,
+        methods: memory.tools.filter(tool => tool.action.startsWith(work.kind + '.')).map(tool => tool.action.split('.')[1]!) }]
+      return capabilities.resolve(work)
+    } },
+    contextProvider: { async loadContext(work: Omit<WorkItem, 'leaseToken'>) {
+      const context = await contextProvider.loadContext(work)
+      return memory && !['memory_synthesis','memory_index','memory_evaluation'].includes(work.kind) ? { ...context, memory: await memory.context(work) } : context
+    } },
+    ...(options.delivery ? { delivery: options.delivery } : {}),
+  }
   const sessions = new PgSessionStore(options.database)
   async function flushDeliveries() {
-    if (!integration) return
-    await flushOutbox(options.database, 'agent_delivery_outbox', row => integration.delivery.deliverMessage(
-      row['work'] as Omit<WorkItem, 'leaseToken'>, row['message'] as AssistantMessage))
+    if (!integration?.delivery) return
+    await flushOutbox(options.database, 'agent_delivery_outbox', (row, context) => {
+      const { leaseToken: _token, ...work } = workItemFromRow(row['delivery_work'] as Record<string, unknown>, '', Number(row['home_epoch']))
+      return integration.delivery!.deliverMessage(work, row['message'] as AssistantMessage,
+        { ...context, commit: { resultId: String(row['result_id']), fence: Number(row['result_fence']) } })
+    }, { signal: shutdown.signal })
   }
   async function flushEvents() {
-    if (!integration) return
-    await flushOutbox(options.database, 'agent_run_events', row => integration.delivery.onEvent(
+    if (!integration?.delivery) return
+    await flushOutbox(options.database, 'agent_run_events', (row, context) => integration.delivery!.onEvent(
       row['delivery_work'] as Omit<WorkItem, 'leaseToken'>, { runId: String(row['run_id']), seq: Number(row['seq']),
         kind: String(row['kind']), stage: row['stage'] as RunEvent['stage'], visibility: row['visibility'] as RunEvent['visibility'],
-        data: row['data'] as RunEvent['data'] }))
+        data: row['data'] as RunEvent['data'] }, context), { signal: shutdown.signal })
   }
   async function flushModelUsage() {
     if (!options.onModelCall) return
-    await flushOutbox(options.database, 'agent_model_budget_calls', row => options.onModelCall!(
-      row['observation'] as import('../model/execution.js').ModelCallObservation))
+    await flushOutbox(options.database, 'agent_model_budget_calls', (row, context) => options.onModelCall!(
+      row['observation'] as import('../model/execution.js').ModelCallObservation, context), { signal: shutdown.signal })
+  }
+
+  async function verifyNative(work: Omit<WorkItem, 'leaseToken'>, requestVersion: number, database: SqlQueryable) {
+    if (!options.verifyRun) return []
+    const deadlineAt = new Date(Date.now() + 10_000).toISOString(), signal = AbortSignal.any([shutdown.signal,AbortSignal.timeout(10_000)])
+    let active = true
+    try {
+      const records = await abortable(options.verifyRun({ work, requestVersion, signal, deadlineAt, database: {
+        query: (sql, params) => { signal.throwIfAborted(); if (!active) throw new Error('verification ended'); return database.query(sql, params) },
+      } }), signal)
+      if (records.length > 64 || records.some(record => !record.checker.startsWith('product:')
+        || !['passed','failed','inconclusive'].includes(record.status)) || new Set(records.map(record => record.checker)).size !== records.length) {
+        throw new Error('native verification returned invalid acceptance records')
+      }
+      return records
+    } finally { active = false }
   }
 
   const service = new ControlPlaneService({
@@ -158,6 +198,7 @@ export async function assembleApp(options: LingxiOSOptions, integration?: Pick<C
           AND status='leased' AND lease_expires_at>NOW() AND cancel_requested_at IS NULL
           AND jsonb_array_length(steer_inputs)+1=$3 FOR UPDATE`, [work.id,work.fence,candidate.requestVersion])
         if (!current.rows.length) throw new Error('candidate request changed while checking files')
+        records.push(...await verifyNative(work, candidate.requestVersion, client))
         for (const record of records) await client.query(`INSERT INTO lingxios.agent_verifications
           (work_id,request_version,candidate_hash,checker,status,evidence) VALUES($1,$2,$3,$4,$5,$6::jsonb)
           ON CONFLICT(work_id,request_version,candidate_hash,checker) DO UPDATE SET
@@ -167,33 +208,25 @@ export async function assembleApp(options: LingxiOSOptions, integration?: Pick<C
       return { requestVersion: candidate.requestVersion, candidateHash: hash, records }
     },
     logger, metrics,
-    ...(options.lectureDeck ? { lecture: lectureControl(options.database, options.lectureDeck) } : {}),
     work: new PgWorkStore(options.database), sessions,
-    events: new PgEventStore(options.database, Boolean(integration)), actions: new PgActionLedger(options.database),
+    events: new PgEventStore(options.database, Boolean(integration?.delivery)), actions: new PgActionLedger(options.database),
     modelBudgets: new PgModelBudgetStore(options.database), modelBudget,
     artifactStager: { stage: (work, artifact, bytes) => stageArtifact(
-      resolve(options.kernel?.homesRoot ?? process.env['AGENT_OS_HOMES_ROOT'] ?? '.agent-os/homes'), work, artifact, bytes) },
-    contextProvider: integration?.contextProvider ?? options.contextProvider ?? { loadContext: async (work) => {
-      const text = work.meta?.['text']
-      if (typeof text !== 'string' || !work.principalId) throw new Error('request text and principal are missing')
-      return {
-        persona, capabilities: [],
-        messages: [{ ref: work.triggerRef, authorId: work.principalId, authorName: String(work.meta?.['authorName'] ?? 'User'), authorKind: 'human', body: text, createdAt: work.createdAt ?? '' }],
-        promptContextCandidate: { version: 3, epoch: 0, assembledAt: '', systemInstructions: '', persona, capabilities: [], sourceVersions: { persona: JSON.stringify(persona) } },
-      }
-    } },
-    capabilityResolver: integration?.capabilityResolver ?? { resolve: async () => [] },
-    actionExecutor: integration?.actionExecutor ?? { execute: async () => ({ ok: false, error: 'no product capabilities are granted by the default application' }) },
+      resolve(options.homesRoot ?? process.env['AGENT_OS_HOMES_ROOT'] ?? '.agent-os/homes'), work, artifact, bytes) },
+    contextProvider: integration.contextProvider,
+    capabilityResolver: integration.capabilityResolver,
+    actionExecutor: integration.actionExecutor,
     delivery: {
       getMessage: async work => {
-        const result = await options.database.query('SELECT message FROM lingxios.agent_messages WHERE run_id=$1 AND tenant_id=$2 AND agent_id=$3 AND session_id=$4',
+        const result = await options.database.query(`SELECT result.message FROM lingxios.agent_work_items work JOIN lingxios.agent_results result ON result.id=work.result_id
+          WHERE work.id=$1 AND work.tenant_id=$2 AND work.agent_id=$3 AND work.session_id=$4`,
           [work.id, work.tenantId, work.agentId, work.sessionId])
         return (result.rows[0]?.['message'] as AssistantMessage | undefined) ?? null
       },
       onEvent: async () => { background('events', flushEvents) },
       deliverMessage: async (work, message) => {
-        const recordMemory = integration && (await integration.capabilityResolver.resolve(work)).some(grant => grant.name === 'memory')
-        await persistArtifacts(resolve(options.kernel?.homesRoot ?? process.env['AGENT_OS_HOMES_ROOT'] ?? '.agent-os/homes'), work, message)
+        const recordMemory = options.memory && !['memory_synthesis','memory_index','memory_evaluation'].includes(work.kind)
+        await persistArtifacts(resolve(options.homesRoot ?? process.env['AGENT_OS_HOMES_ROOT'] ?? '.agent-os/homes'), work, message)
         await withTransaction(options.database, async client => {
           const current = await client.query(
             `SELECT id FROM lingxios.agent_work_items
@@ -202,18 +235,19 @@ export async function assembleApp(options: LingxiOSOptions, integration?: Pick<C
                 AND ($3::integer IS NULL OR jsonb_array_length(steer_inputs)+1=$3)
               FOR UPDATE`, [work.id, work.fence, message.envelope.requestVersion])
           if (!current.rows.length) throw new Error('request changed or lease expired before message persistence')
-          const { rows } = await client.query(
-            `INSERT INTO lingxios.agent_messages (run_id, tenant_id, agent_id, session_id, message, home_epoch)
-             VALUES ($1,$2,$3,$4,$5::jsonb,$6)
-             ON CONFLICT (run_id) DO UPDATE SET message=EXCLUDED.message,home_epoch=EXCLUDED.home_epoch,committed_at=NOW()
-             WHERE (lingxios.agent_messages.message=EXCLUDED.message OR lingxios.agent_messages.message->'envelope'->'goalOutcome'->>'status' IN ('delegated','awaiting_input','awaiting_approval'))
-               AND lingxios.agent_messages.tenant_id=EXCLUDED.tenant_id
-               AND lingxios.agent_messages.agent_id=EXCLUDED.agent_id
-               AND lingxios.agent_messages.session_id=EXCLUDED.session_id
-             RETURNING run_id`, [work.id, work.tenantId, work.agentId, work.sessionId, JSON.stringify(message), work.homeEpoch],
-          )
-          if (rows.length !== 1) throw new Error('a different response is already committed for this run')
+          const resultId = 'result:' + createHash('sha256').update(JSON.stringify([work.id, message])).digest('hex')
+          const previous = await client.query(`SELECT result.id,result.message FROM lingxios.agent_work_items work
+            JOIN lingxios.agent_results result ON result.id=work.result_id WHERE work.id=$1`, [work.id])
+          const prior = previous.rows[0]
+          if (prior && prior['id'] !== resultId && !['delegated','awaiting_input','awaiting_approval','blocked','partial']
+            .includes((prior['message'] as AssistantMessage).envelope.goalOutcome.status)) throw new Error('a different response is already committed for this run')
+          await client.query(`INSERT INTO lingxios.agent_results(id,work_id,request_version,fence,home_epoch,message)
+            VALUES($1,$2,$3,$4,$5,$6::jsonb) ON CONFLICT(id) DO NOTHING`,
+          [resultId,work.id,message.envelope.requestVersion,work.fence,work.homeEpoch,JSON.stringify(message)])
           if (message.envelope.goalOutcome.status === 'satisfied') {
+            if ((await verifyNative(work, message.envelope.requestVersion, client)).some(record => record.status !== 'passed')) {
+              throw new Error('native acceptance changed before successful completion')
+            }
             const hash = candidateHash({ body: message.body, requestVersion: message.envelope.requestVersion, artifacts: message.envelope.artifacts })
             const checks = await client.query(`SELECT checker,status FROM lingxios.agent_verifications
               WHERE work_id=$1 AND request_version=$2 AND candidate_hash=$3`, [work.id,message.envelope.requestVersion,hash])
@@ -229,43 +263,49 @@ export async function assembleApp(options: LingxiOSOptions, integration?: Pick<C
                 OR COALESCE(resolved.result,receipt.result)->'approval'->>'status'='PENDING') LIMIT 1`, [work.id])
             if (unresolved.rows.length) throw new Error('unresolved effects prevent successful completion')
           }
-          await client.query(`INSERT INTO lingxios.agent_results(work_id,candidate_hash,request_version,fence,message)
-            VALUES($1,$2,$3,$4,$5::jsonb) ON CONFLICT DO NOTHING`,
-            [work.id,createHash('sha256').update(JSON.stringify(message)).digest('hex'),message.envelope.requestVersion,work.fence,JSON.stringify(message)])
-          if (recordMemory && !['awaiting_input','awaiting_approval','delegated'].includes(message.envelope.goalOutcome.status)) await captureMemoryEvidence(client, work, message)
+          if (recordMemory && !['awaiting_input','awaiting_approval','delegated'].includes(message.envelope.goalOutcome.status)) await captureMemoryEvidence(client, work, message,
+            await options.memory!.resolveScopes(work,client))
           const status = workStatusOf({ status: 'completed', goalOutcome: message.envelope.goalOutcome })
-          await client.query(`UPDATE lingxios.agent_work_items SET status=$3,result_text=$4,goal_outcome=$5::jsonb,
+          await client.query(`UPDATE lingxios.agent_work_items SET status=$3,result_id=$4,goal_outcome=$5::jsonb,
             lease_token_hash=NULL,lease_expires_at=NULL,finished_at=CASE WHEN $3='waiting' THEN NULL ELSE NOW() END,
             last_progress_at=NOW(),updated_at=NOW() WHERE id=$1 AND fence=$2`,
-            [work.id, work.fence, status, message.body, JSON.stringify(message.envelope.goalOutcome)])
+            [work.id, work.fence, status, resultId, JSON.stringify(message.envelope.goalOutcome)])
           await client.query('DELETE FROM lingxios.agent_os_session_leases WHERE work_id=$1 AND fence=$2', [work.id, work.fence])
-          if (integration) await client.query('INSERT INTO lingxios.agent_delivery_outbox(run_id,work) VALUES($1,$2::jsonb) ON CONFLICT(run_id) DO UPDATE SET work=EXCLUDED.work,delivered_at=NULL,available_at=NOW(),claim_token=NULL,attempts=0', [work.id, JSON.stringify(work)])
+          if (status !== 'waiting') await cancelDescendants(client, work.id)
+          if (integration.delivery) await client.query('INSERT INTO lingxios.agent_delivery_outbox(result_id) VALUES($1) ON CONFLICT DO NOTHING', [resultId])
+          await client.query(`INSERT INTO lingxios.agent_run_events(run_id,seq,tenant_id,agent_id,kind,stage,visibility,data,delivery_work)
+            SELECT $1,COALESCE(MAX(seq),$2::bigint)+1,$3,$4,'response.committed','completed','user',$5::jsonb,$6::jsonb
+            FROM lingxios.agent_run_events WHERE run_id=$1`,
+          [work.id,(work.fence-1)*RUN_SEQUENCE_SPAN,work.tenantId,work.agentId,
+            JSON.stringify({ resultId,requestVersion: message.envelope.requestVersion }), integration.delivery ? JSON.stringify(work) : null])
         })
       },
     },
   })
   async function claimWork(claimingWorkerId: string, requestId?: string, workKinds?: readonly string[]) {
     const work = await service.claim(claimingWorkerId, requestId, workKinds)
-    lastContactAt = Date.now()
     if (!work) return null
+    await service.reconcilePending(work)
+    await executeDecidedApprovals(options.database, service, work)
     if (await recoverWait(options.database, service, work)) return null
     return work
   }
   const host: HostPort = {
     verifyCandidate: (work, candidate) => service.verifyCandidate(work, candidate),
     saveStep: (work, step) => service.saveStep(work, step),
-    lecture: (work, command) => service.lecture(work, command),
-    claimWork: () => claimWork(workerId, undefined, local?.runtime.workKinds), heartbeat: async (work) => { const result = await service.heartbeat(work); lastContactAt = Date.now(); return result },
-    loadContext: (work) => service.loadContext(work), executeAction: (work, action) => service.executeAction(work, action),
+    claimWork: async () => { throw new Error('connect a worker before claiming work') },
+    heartbeat: work => service.heartbeat(work),
+    loadContext: (work) => service.loadContext(work), executeAction: (work, action, signal) => service.executeAction(work, action, signal),
     reserveModelCall: (work, callId, limits) => service.reserveModelCall(work, callId, limits),
     recordModelUsage: (work, callId, usage, observation) => service.recordModelUsage(work, callId, usage, observation),
     recoverCell: (work, cellId) => service.recoverCell(work, cellId),
     recoverStep: (work, cellId) => service.recoverStep(work, cellId),
     stageArtifact: (work, artifact, bytes) => stageArtifact(
-      resolve(options.kernel?.homesRoot ?? process.env['AGENT_OS_HOMES_ROOT'] ?? '.agent-os/homes'), work, artifact, bytes),
+      resolve(options.homesRoot ?? process.env['AGENT_OS_HOMES_ROOT'] ?? '.agent-os/homes'), work, artifact, bytes),
     emitEvent: (work, event) => service.recordEvent(work, event), loadSession: (work, key) => service.getSession(work, key),
     saveSession: async (work, session) => { session.revision = (await service.saveSession(work, session)).revision },
     commitResult: (work, message) => service.commitResult(work, message), completeWork: (work, completion) => service.complete(work, completion),
+    waitWork: (work, outcome) => service.waitWork(work, outcome),
     yieldWork: (work) => service.yieldWork(work),
   }
   const jobs = new Map<string, Promise<unknown>>()
@@ -280,54 +320,93 @@ export async function assembleApp(options: LingxiOSOptions, integration?: Pick<C
     background('events', flushEvents)
     background('billing', () => flushModelUsage())
     background('dependencies', () => resumeDependents(options.database))
-    for (const [name, operation] of Object.entries(integration?.backgroundJobs ?? {})) background(name, operation)
-    if (integration) background('memory synthesis', () => retryMemorySynthesis(options.database))
+    background('approvals', () => resumeDecidedApprovals(options.database))
+    background('queue fairness', () => sweepQueuedWork(options.database))
+    if (memory) background('memory synthesis', () => retryMemorySynthesis(options.database))
   }, 1_000)
   const maintenanceTimer = setInterval(() => {
     background('storage maintenance', () => maintainStorage(options.database, homesRoot))
+    background('metrics', () => refreshMetrics(options.database, metrics))
   }, 60_000)
   deliveryTimer.unref(); maintenanceTimer.unref()
   let stopped = false
   let stopPromise: Promise<void> | undefined
   let listening: Promise<number> | undefined
-  let local: { runtime: AgentRuntime; worker: AgentWorker } | undefined
-  function localExecution() {
-    if (stopped) throw new Error('application has stopped')
-    if (local) return local
-    if (!options.model) throw new ConfigError('model configuration is required for local execution')
-    const model = new OpenAIChatDriver(options.model.id ?? DEFAULT_MODEL.id, options.model)
-    const smallModel = new OpenAIChatDriver(options.smallModel?.id ?? DEFAULT_SMALL_MODEL.id, {
-      apiKey: options.model.apiKey, ...(options.model.baseUrl ? { baseUrl: options.model.baseUrl } : {}),
-      ...DEFAULT_SMALL_MODEL, ...options.smallModel,
-    })
-    const bridge: KernelHostBridge = { execute: (work, action) => service.executeAction(work, action) }
-    const kernels = options.kernelFactory?.(bridge) ?? new KernelManager(bridge, { ...options.kernel, maxKernels: concurrency,
-      isolation: kernelIsolation(options.kernel?.isolation ?? process.env['AGENT_OS_KERNEL_ISOLATION'], process.env['NODE_ENV'] === 'production', options.trustProcessKernel) })
-    const runtime = new AgentRuntime(host, model, kernels, {
-      logger, smallModel,
-      ...(options.policy ? { policy: options.policy } : {}), recordModelPayloads: options.recordModelPayloads ?? false,
-      ...(options.modelTrace ? { modelTrace: options.modelTrace } : {}),
-      rootModelBudget: modelBudget,
-      ...(options.onModelCall ? { onModelCall: options.onModelCall } : {}),
-    })
-    registerProcessors(runtime, options.lectureDeck)
-    const worker = new AgentWorker({ host, runtime, kernels, workerId, maxConcurrentRuns: concurrency,
-      logger, metrics, lastContactAt: () => lastContactAt,
-      shutdownGraceMs: options.worker?.shutdownGraceMs ?? 20_000,
-      ...(options.worker?.pollIdleMs === undefined ? {} : { pollIdleMs: options.worker.pollIdleMs }),
-      ...(options.worker?.healthPort === undefined ? {} : { healthPort: options.worker.healthPort }),
-    })
-    local = { runtime, worker }
-    return local
-  }
   let controlPlane: ControlPlaneServer | undefined
   return {
+    /** An explicit in-process worker connection. Creating a control plane never executes work. */
+    connectWorker(input: { workerId: string; workKinds: readonly string[] }): HostPort {
+      if (stopped) throw new Error('application has stopped')
+      if (!input.workerId.trim()) throw new Error('workerId is required')
+      return { ...host, claimWork: async signal => {
+        signal?.throwIfAborted()
+        if (stopped) throw new Error('application has stopped')
+        return claimWork(input.workerId, undefined, input.workKinds)
+      } }
+    },
+    async recallMemory(work: Omit<WorkItem, 'leaseToken'>, scope: MemoryScope, query: string, limit = 12, signal?: AbortSignal) {
+      if (scope.tenantId !== work.tenantId) throw new Error('memory tenant does not match work')
+      signal?.throwIfAborted()
+      return memory ? memory.recall(work, scope, query, limit, signal) : []
+    },
     metrics: () => metrics.expose(),
+    listRuns: (query?: RunListQuery) => listRuns(options.database,query),
+    readOperations: () => readOperations(options.database),
+    readDiagnostics: (identity: RunIdentity) => readDiagnostics(options.database, identity),
+    readRun: (identity: RunIdentity, transaction: SqlQueryable = options.database) => readRun(transaction, identity),
+    readRunState: (identity: RunIdentity) => readRunState(options.database,identity),
+    freezeEvolutionBenchmark: (tenantId: string, benchmark: EvolutionBenchmark) => freezeEvolutionBenchmark(options.database,tenantId,benchmark),
+    /** Trusted administration APIs; the product authorizes the opaque scope before calling. */
+    rollbackEvolution: (scope: MemoryScope, activeId: string, expectedVersion: number, targetId: string | null) =>
+      withTransaction(options.database, db => rollbackEvolution(db,scope,activeId,expectedVersion,targetId)),
+    async readEvolution(scope: MemoryScope) {
+      return (await options.database.query(`SELECT m.id,m.kind,m.body,m.status,m.version,m.source_refs,e.benchmark_id,e.verdict,e.summary,e.evaluated_at,
+        w.status AS evaluation_status,w.error AS evaluation_error FROM lingxios.agent_memories m
+        JOIN lingxios.agent_evolution_evaluations e ON e.tenant_id=m.tenant_id AND e.memory_id=m.id
+        LEFT JOIN lingxios.agent_work_items w ON w.id='evaluate:'||m.id AND w.tenant_id=m.tenant_id
+        WHERE m.tenant_id=$1 AND m.scope_type=$2 AND m.scope_id=$3 AND m.origin='evolved' ORDER BY m.updated_at DESC,m.id LIMIT 64`,
+      [scope.tenantId,scope.scopeType,scope.scopeId])).rows
+    },
+    revise: (identity: RunIdentity, text: string, transaction?: SqlQueryable, author?: import('../protocol/types.js').SteerInput['author']) => transaction
+      ? reviseRun(transaction, identity, text, author) : withTransaction(options.database, db => reviseRun(db, identity, text, author)),
+    async enqueueJob(input: JobInput, transaction?: SqlQueryable) {
+      if (!input.principalId?.trim() || !input.text?.trim() || input.text.length > 100_000) throw new Error('job requires its authenticated principal and original request text')
+      const work = { ...input, triggerRef: input.sourceRef ?? input.id ?? randomUUID(),
+        meta: { ...input.meta, text: input.text, authorName: input.authorName ?? 'User', attachments: snapshotAttachments(input.attachments ?? []) } }
+      return transaction ? enqueueWork(transaction, work) : service.enqueue(work)
+    },
+    readApproval: (identity: ApprovalLookup) => readApproval(options.database, identity),
+    decideApproval: (decision: ApprovalDecision) => decideApproval(options.database, decision),
+    async reconcileAction(input: RunIdentity & { actionKey: string }) {
+      if (!input.principalId?.trim()) throw new Error('authenticated principal is required')
+      return withTransaction(options.database, async db => {
+        const { rows } = await db.query(`SELECT work.status,work.cancel_requested_at,jsonb_array_length(work.steer_inputs)+1 AS version,
+          (intent.intent->>'requestVersion')::integer AS action_version,intent.intent->'action'->>'action' AS action,
+          COALESCE(resolved.result,receipt.result) AS result FROM lingxios.agent_action_intents intent
+          JOIN lingxios.agent_work_items work ON work.id=intent.intent->>'workId'
+          LEFT JOIN lingxios.agent_action_ledger receipt USING(idempotency_key)
+          LEFT JOIN LATERAL (SELECT resolution->'result' AS result FROM lingxios.agent_action_resolutions
+            WHERE idempotency_key=intent.idempotency_key ORDER BY resolution_seq DESC LIMIT 1) resolved ON TRUE
+          WHERE intent.idempotency_key=$1 AND work.id=$2 AND work.tenant_id=$3 AND work.principal_id=$4
+            AND work.agent_id=$5 AND work.session_id=$6 AND work.thread_id IS NOT DISTINCT FROM $7 FOR UPDATE OF work`,
+          [input.actionKey,input.runId,input.tenantId,input.principalId,input.agentId,input.sessionId,input.threadId ?? null])
+        const row = rows[0]
+        if (!row) throw new Error('action is outside this principal and run')
+        const receipt = row['result'] as import('../protocol/types.js').HostActionResult | null
+        if (receipt && receipt.executionState !== 'unknown') return { state: 'settled' as const, result: receipt }
+        if (row['cancel_requested_at'] || row['version'] !== row['action_version']) throw new Error('action belongs to a cancelled or revised request')
+        if (!options.tools?.some(tool => tool.action === row['action'] && tool.reconcile)) return { state: 'unavailable' as const }
+        if (row['status'] === 'leased') return { state: 'busy' as const }
+        if (!['queued','waiting','blocked','partial','failed'].includes(String(row['status']))) throw new Error('run is not eligible for reconciliation')
+        await db.query(`UPDATE lingxios.agent_work_items SET status='queued',available_at=NOW(),goal_outcome=NULL,error=NULL,
+          finished_at=NULL,updated_at=NOW() WHERE id=$1`, [input.runId])
+        return { state: 'queued' as const }
+      })
+    },
     maintenance: () => maintainStorage(options.database, homesRoot),
-    lectures: options.lectureDeck ? createLectureDeckApp(options.database, options.lectureDeck) : undefined,
     /** Authenticate and authorize the caller before using this server API. */
     readArtifact: (identity: MessageIdentity & Pick<RequestInput, 'principalId' | 'threadId'>, path: string) =>
-      readArtifact(options.database, resolve(options.kernel?.homesRoot ?? process.env['AGENT_OS_HOMES_ROOT'] ?? '.agent-os/homes'), identity, path),
+      readArtifact(options.database, resolve(options.homesRoot ?? process.env['AGENT_OS_HOMES_ROOT'] ?? '.agent-os/homes'), identity, path),
     continueInput: (input: InputContinuation) => continueInput(options.database, input),
     resolveAction: async (input: ActionResolutionInput) => {
       const { tenantId, agentId, sessionId, principalId, threadId, ...resolution } = input
@@ -357,12 +436,9 @@ export async function assembleApp(options: LingxiOSOptions, integration?: Pick<C
       return recorded
     },
     /** Trusted server boundary: use the authenticated original principal. */
-    async cancel(identity: MessageIdentity & Pick<RequestInput, 'principalId' | 'threadId'>): Promise<boolean> {
+    async cancel(identity: MessageIdentity & Pick<RequestInput, 'principalId' | 'threadId'>, transaction?: SqlQueryable): Promise<boolean> {
       if (!identity || !identity.principalId?.trim()) throw new Error('authenticated principalId is required')
-      const { rows } = await options.database.query(`SELECT id FROM lingxios.agent_work_items
-        WHERE id=$1 AND tenant_id=$2 AND agent_id=$3 AND session_id=$4 AND principal_id=$5
-          AND thread_id IS NOT DISTINCT FROM $6`, [identity.runId, identity.tenantId, identity.agentId, identity.sessionId, identity.principalId, identity.threadId ?? null])
-      return rows.length === 1 && service.requestCancel(identity.runId)
+      return transaction ? cancelRun(transaction, identity) : withTransaction(options.database, db => cancelRun(db, identity))
     },
     async enqueue(input: RequestInput) {
       if (typeof input.text !== 'string' || !input.text.trim() || typeof input.principalId !== 'string' || !input.principalId.trim()) {
@@ -382,17 +458,10 @@ export async function assembleApp(options: LingxiOSOptions, integration?: Pick<C
           parentRequestVersion: delegation.parentRequestVersion, delegation: { ...delegation, assignment: request.text } },
       })
     },
-    async runNext() {
-      const { runtime, worker } = localExecution()
-      await worker.check()
-      const work = await host.claimWork()
-      if (!work) return false
-      await runtime.runWork(work)
-      return true
-    },
     async readMessage(identity: MessageIdentity): Promise<AssistantMessage | null> {
       const { rows } = await options.database.query(
-        'SELECT message FROM lingxios.agent_messages WHERE run_id=$1 AND tenant_id=$2 AND agent_id=$3 AND session_id=$4',
+        `SELECT result.message FROM lingxios.agent_work_items work JOIN lingxios.agent_results result ON result.id=work.result_id
+          WHERE work.id=$1 AND work.tenant_id=$2 AND work.agent_id=$3 AND work.session_id=$4`,
         [identity.runId, identity.tenantId, identity.agentId, identity.sessionId],
       )
       return (rows[0]?.['message'] as AssistantMessage | undefined) ?? null
@@ -416,16 +485,31 @@ export async function assembleApp(options: LingxiOSOptions, integration?: Pick<C
         stage: row['stage'] as RunEvent['stage'], visibility: 'user' as const, data: row['data'] as Record<string, unknown> }))
       return { events, nextSeq: events.at(-1)?.seq ?? afterSeq }
     },
-    async readDelivery(identity: MessageIdentity): Promise<'pending' | 'delivered' | 'not_observed' | null> {
-      const { rows } = await options.database.query(
-        `SELECT CASE WHEN outbox.run_id IS NULL THEN 'not_observed'
-           WHEN outbox.delivered_at IS NULL THEN 'pending' ELSE 'delivered' END AS state
-         FROM lingxios.agent_messages message
-         LEFT JOIN lingxios.agent_delivery_outbox outbox ON outbox.run_id=message.run_id
-         WHERE message.run_id=$1 AND message.tenant_id=$2 AND message.agent_id=$3 AND message.session_id=$4`,
-        [identity.runId, identity.tenantId, identity.agentId, identity.sessionId])
-      return rows[0]?.['state'] as 'pending' | 'delivered' | 'not_observed' | undefined ?? null
+    async readUsage(identity: MessageIdentity) {
+      const { rows } = await options.database.query(`SELECT
+        (SELECT COALESCE(MAX(seq),0) FROM lingxios.agent_run_events WHERE run_id=work.id) AS last_seq,
+        COUNT(calls.call_id)::integer AS calls,COUNT(calls.call_id) FILTER (WHERE calls.observation IS NULL)::integer AS pending_calls,
+        COUNT(calls.call_id) FILTER (WHERE calls.observation->'cost'->>'usage'='estimated')::integer AS estimated_calls,
+        COALESCE(SUM(calls.input_tokens),0) AS input_tokens,COALESCE(SUM(calls.output_tokens),0) AS output_tokens,
+        COALESCE(SUM(COALESCE(calls.cost_micros,calls.reserved_cost_micros)),0) AS cost_micros
+        FROM lingxios.agent_work_items work LEFT JOIN lingxios.agent_model_budget_calls calls ON calls.work_id=work.id
+        WHERE work.id=$1 AND work.tenant_id=$2 AND work.agent_id=$3 AND work.session_id=$4 GROUP BY work.id`,
+        [identity.runId,identity.tenantId,identity.agentId,identity.sessionId])
+      const row = rows[0]
+      return row ? { lastSeq: Number(row['last_seq']), calls: Number(row['calls']), pendingCalls: Number(row['pending_calls']),
+        estimatedCalls: Number(row['estimated_calls']), inputTokens: Number(row['input_tokens']), outputTokens: Number(row['output_tokens']), costMicros: Number(row['cost_micros']) } : null
     },
+    async readDelivery(identity: MessageIdentity): Promise<'pending' | 'delivered' | 'failed' | 'not_observed' | null> {
+      const { rows } = await options.database.query(
+        `SELECT CASE WHEN outbox.result_id IS NULL THEN 'not_observed'
+           WHEN outbox.failed_at IS NOT NULL THEN 'failed' WHEN outbox.delivered_at IS NULL THEN 'pending' ELSE 'delivered' END AS state
+         FROM lingxios.agent_work_items work
+         LEFT JOIN lingxios.agent_delivery_outbox outbox ON outbox.result_id=work.result_id
+         WHERE work.id=$1 AND work.tenant_id=$2 AND work.agent_id=$3 AND work.session_id=$4 AND work.result_id IS NOT NULL`,
+        [identity.runId, identity.tenantId, identity.agentId, identity.sessionId])
+      return rows[0]?.['state'] as 'pending' | 'delivered' | 'failed' | 'not_observed' | undefined ?? null
+    },
+    retryDelivery: (identity: RunIdentity, channel: 'message' | 'events' | 'usage' = 'message') => retryDelivery(options.database,identity,channel),
     async listenControlPlane(input: { serviceToken: string; port: number; host?: string }) {
       if (stopped) throw new Error('application has stopped')
       if (controlPlane) throw new Error('control plane is already listening or starting')
@@ -452,12 +536,11 @@ export async function assembleApp(options: LingxiOSOptions, integration?: Pick<C
         throw error
       }
     },
-    start: async () => localExecution().worker.start(),
     stop() {
       stopped = true
+      shutdown.abort(new Error('control plane stopped'))
       clearInterval(deliveryTimer); clearInterval(maintenanceTimer)
       stopPromise ??= (async () => {
-        await local?.worker.stop()
         await Promise.race([Promise.allSettled([...jobs.values()]), new Promise(resolve => { const timer = setTimeout(resolve, 5_000); timer.unref() })])
         // The listen caller receives startup errors; shutdown still releases any listener.
         await listening?.catch(() => {})

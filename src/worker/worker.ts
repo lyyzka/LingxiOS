@@ -13,6 +13,7 @@ import type { ManagedKernelExecutor } from '../kernel/manager.js'
 import { nullLogger, type Logger } from '../logging.js'
 import type { MetricsRegistry } from '../metrics.js'
 import type { AgentRuntime } from '../runtime/runtime.js'
+import { abortable } from '../deadline.js'
 
 export interface AgentWorkerOptions {
   host: Pick<HostPort, 'claimWork'>
@@ -40,6 +41,7 @@ export class AgentWorker {
   private checked = false
   private readonly shutdown = new AbortController()
   private readonly stopPolling = new AbortController()
+  private stopResult: Promise<{ timedOut: boolean }> | undefined
 
   constructor(private readonly options: AgentWorkerOptions) {
     this.logger = (options.logger ?? nullLogger).child({ workerId: options.workerId })
@@ -48,6 +50,20 @@ export class AgentWorker {
 
   get activeRuns(): number { return this.active.size }
   get draining(): boolean { return this.stopping }
+
+  /** Execute one queued item, for isolated evaluations and embedded workers. */
+  async runNext(): Promise<boolean> {
+    if (this.started || this.stopping) throw new Error('worker has already been started or stopped')
+    if (this.active.size >= this.options.maxConcurrentRuns) throw new Error('worker concurrency is full')
+    await this.check()
+    const work = await abortable(this.options.host.claimWork(this.stopPolling.signal),this.stopPolling.signal)
+    if (this.stopping) return false
+    if (!work) return false
+    const running = this.options.runtime.runWork(work, this.shutdown.signal)
+    this.active.set(work.id, running)
+    try { await running; return true }
+    finally { this.active.delete(work.id) }
+  }
 
   async start(): Promise<{ healthPort: number | null }> {
     if (this.started || this.stopping) throw new Error('worker has already been started or stopped')
@@ -111,7 +127,7 @@ export class AgentWorker {
           await Promise.race(this.active.values())
           continue
         }
-        const work = await this.options.host.claimWork(this.stopPolling.signal)
+        const work = await abortable(this.options.host.claimWork(this.stopPolling.signal),this.stopPolling.signal)
         this.lastClaimAt = Date.now()
         if (this.stopping) return
         if (!work) {
@@ -149,11 +165,11 @@ export class AgentWorker {
    * Graceful drain: stop claiming, let in-flight runs finish inside the grace
    * window, then tear everything down. Idempotent.
    */
-  async stop(): Promise<{ timedOut: boolean }> {
-    if (this.stopping) {
-      await this.polling
-      return { timedOut: false }
-    }
+  stop(): Promise<{ timedOut: boolean }> {
+    return this.stopResult ??= this.drain()
+  }
+
+  private async drain(): Promise<{ timedOut: boolean }> {
     this.stopping = true
     this.stopPolling.abort()
     let graceTimer: NodeJS.Timeout | undefined

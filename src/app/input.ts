@@ -68,7 +68,7 @@ export async function continueInput(database: SqlPool, input: InputContinuation)
         revision=revision+1,updated_at=NOW()
       WHERE session_key=$1 AND request_snapshot->>'workId'=$2`, [sessionKeyOf(input), input.runId])
     await client.query(`UPDATE lingxios.agent_work_items SET steer_inputs=$2::jsonb,status='queued',available_at=NOW(),
-      goal_outcome=NULL,finished_at=NULL,result_text=NULL,error=NULL,updated_at=NOW() WHERE id=$1`, [input.runId, JSON.stringify([...revisions, revision])])
+      goal_outcome=NULL,finished_at=NULL,error=NULL,updated_at=NOW() WHERE id=$1`, [input.runId, JSON.stringify([...revisions, revision])])
     return { status: 'resumed' as const, workId: input.runId }
   })
 }

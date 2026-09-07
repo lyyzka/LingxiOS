@@ -1,3 +1,4 @@
+import { durableProtocol } from './protocol-fixture.js'
 import { snapshotEvidence } from '../src/context/evidence.js'
 import { createTaskContract } from '../src/context/task-contract.js'
 import assert from 'node:assert/strict'
@@ -9,6 +10,7 @@ import type { ModelItem, SessionRecord, TurnContext, WorkCompletion } from '../s
 import { AgentRuntime } from '../src/runtime/runtime.js'
 import { ApprovalPendingError, ModelDriverError } from '../src/errors.js'
 import type { ModelCallObservation } from '../src/runtime/runtime.js'
+import { modelPricing, DEFAULT_MODEL_BUDGET } from '../src/model/execution.js'
 
 it('reports every processor model call to the product ledger with durable work scope', async () => {
   const work: TurnContext['work'] = { id: 'ledger-work', tenantId: 'tenant', agentId: 'agent', sessionId: 'room',
@@ -16,7 +18,7 @@ it('reports every processor model call to the product ledger with durable work s
     fence: 3, homeEpoch: 1, leaseToken: 'secret' }
   const observations: ModelCallObservation[] = []
   let completed: WorkCompletion | undefined
-  const host: HostPort = { claimWork: async () => null, heartbeat: async () => ({ ok: true }),
+  const host: HostPort = { ...durableProtocol(value => observations.push(value)), claimWork: async () => null, heartbeat: async () => ({ ok: true }),
     loadContext: async () => { throw new Error('unexpected context') }, executeAction: async () => ({ ok: true }),
     loadSession: async () => null, saveSession: async () => {}, emitEvent: async () => {}, commitResult: async () => {},
     completeWork: async (_work, value) => { completed = value }, yieldWork: async () => {} }
@@ -24,7 +26,7 @@ it('reports every processor model call to the product ledger with durable work s
   const model: ModelDriver = { modelId: 'model-v1', run: unexpected, compact: unexpected,
     structured: async () => ({ value: { ok: true }, model: 'model-v1',
       usage: { available: true, inputTokens: 11, outputTokens: 7 } }) }
-  const runtime = new AgentRuntime(host, model, { execute: unexpected }, { onModelCall: async value => { observations.push(value) } })
+  const runtime = new AgentRuntime(host, model, { execute: unexpected })
   runtime.registerProcessor('memory_synthesis', { process: async (_work, context) => { await context.model.structured({ instructions: 'i', input: {} }) } })
   await runtime.runWork(work)
   assert.equal(completed?.status, 'completed')
@@ -32,6 +34,7 @@ it('reports every processor model call to the product ledger with durable work s
     callId: 'ledger-work:3:model:1', purpose: 'structured', workId: 'ledger-work', tenantId: 'tenant',
     agentId: 'agent', sessionId: 'room', threadId: 'thread', principalId: 'human', model: 'model-v1',
     usage: { available: true, inputTokens: 11, outputTokens: 7 }, status: 'succeeded',
+    cost: { amountMicros: 0, usage: 'measured', pricing: modelPricing(DEFAULT_MODEL_BUDGET) },
   }])
   assert.ok(observations[0]!.latencyMs >= 0)
 })
@@ -40,7 +43,7 @@ for (const format of ['object', 'plain text'] as const) it(`preserves ${format} 
   const work: TurnContext['work'] = { id: 'w', tenantId: 't', agentId: 'a', sessionId: 's', kind: 'turn', lane: 'interactive', triggerRef: 'm', fence: 1, homeEpoch: 1, leaseToken: 'token' }
   const artifact = { path: 'answer.json', size: 12, mime: 'application/json', sha256: 'a'.repeat(64) }
   let turns = 0, committed = false
-  const host: HostPort = { claimWork: async () => null, heartbeat: async () => ({ ok: true }),
+  const host: HostPort = { ...durableProtocol(), claimWork: async () => null, heartbeat: async () => ({ ok: true }),
     loadContext: async () => ({ work, persona: { name: 'A', role: '', instructions: '' }, capabilities: [],
       messages: [{ ref: 'm', authorId: 'u', authorName: 'U', authorKind: 'human', body: 'Create a file.', createdAt: 'now' }] }),
     executeAction: async () => ({ ok: true }), loadSession: async () => null, saveSession: async () => {}, emitEvent: async () => {},
@@ -68,7 +71,7 @@ for (const format of ['object', 'plain text'] as const) it(`preserves ${format} 
 it('continues an actionable partial candidate before committing its result', async () => {
   const work: TurnContext['work'] = { id: 'w', tenantId: 't', agentId: 'a', sessionId: 's', kind: 'turn', lane: 'interactive', triggerRef: 'm', fence: 1, homeEpoch: 1, leaseToken: 'token' }
   let turns = 0, executed = 0, body = ''
-  const host: HostPort = { claimWork: async () => null, heartbeat: async () => ({ ok: true }),
+  const host: HostPort = { ...durableProtocol(), claimWork: async () => null, heartbeat: async () => ({ ok: true }),
     loadContext: async () => ({ work, persona: { name: 'A', role: '', instructions: '' }, capabilities: [],
       messages: [{ ref: 'm', authorId: 'u', authorName: 'U', authorKind: 'human', body: 'Create a file.', createdAt: 'now' }] }),
     executeAction: async () => ({ ok: true, value: { requestVersion: 1, pending: [], truncated: false } }),
@@ -100,7 +103,7 @@ it('drops optional recalled memory before allowing it to crowd out the original 
   const original = 'Original requirement '.repeat(200)
   let committed = false
   let omitted = false
-  const host: HostPort = {
+  const host: HostPort = { ...durableProtocol(),
     claimWork: async () => null, heartbeat: async () => ({ ok: true }),
     loadContext: async () => ({ work, persona: { name: 'A', role: '', instructions: '' }, capabilities: [],
       messages: [{ ref: 'm', authorId: 'u', authorName: 'U', authorKind: 'human', body: original, createdAt: 'now' }],
@@ -148,7 +151,7 @@ it('reviews complex candidates against original requirements, bounds corrections
     let body = ''
     let completion: WorkCompletion | undefined
     const deltas: string[] = []
-    const host: HostPort = {
+    const host: HostPort = { ...durableProtocol(),
       claimWork: async () => null,
       heartbeat: async () => ({ ok: true, steer: mode === 'steered' && reviews ? [{ id: 'r', text: 'Just say hello.', createdAt: 'now' }] : [] }),
       loadContext: async () => ({ work, persona: { name: 'A', role: '', instructions: '' }, capabilities: [],
@@ -162,7 +165,7 @@ it('reviews complex candidates against original requirements, bounds corrections
       emitEvent: async (_work, event) => { if (event.kind === 'model.delta') deltas.push(String(event.data['delta'])) },
       commitResult: async (_work, message) => {
         body = message.body
-        completion = { status: 'completed', resultText: body, goalOutcome: message.envelope.goalOutcome }
+        completion = { status: 'completed', goalOutcome: message.envelope.goalOutcome }
         assert.notEqual(message.envelope?.goalOutcome.verification, 'passed')
         assert.deepEqual(message.envelope?.resourceChecks?.[0], resourceChecks[0])
         assert.equal(message.envelope?.resourceChecks?.length, mode === 'exhausted' ? 4 : mode === 'fixed' ? 3 : 2)
@@ -232,10 +235,10 @@ it('preserves history across prompt upgrades and exposes assigned action receipt
   let completion: WorkCompletion | undefined
   let checkpoint: SessionRecord | undefined
   let calls = 0
-  const host: HostPort = {
+  const host: HostPort = { ...durableProtocol(),
     claimWork: async () => null, heartbeat: async () => ({ ok: true }), loadContext: async () => context,
     executeAction: async () => ({ ok: true }), emitEvent: async () => {}, loadSession: async () => session,
-    saveSession: async (_work, value) => { checkpoint = structuredClone(value) }, commitResult: async (_work, message) => { assert.equal(message.body, 'Saved.'); completion = { status: 'completed', resultText: message.body, goalOutcome: message.envelope.goalOutcome } },
+    saveSession: async (_work, value) => { checkpoint = structuredClone(value) }, commitResult: async (_work, message) => { assert.equal(message.body, 'Saved.'); completion = { status: 'completed', goalOutcome: message.envelope.goalOutcome } },
     completeWork: async (_work, result) => { completion = result }, yieldWork: async () => {},
   }
   const model: ModelDriver = {
@@ -265,7 +268,7 @@ it('preserves history across prompt upgrades and exposes assigned action receipt
     return { executionId: 'cell', stdout: '', stderr: '', result: null, durationMs: 1, truncated: false, artifacts: [], directives: [] }
   } }
   await new AgentRuntime(host, model, kernels).runWork(context.work)
-  assert.deepEqual(completion, { status: 'completed', resultText: 'Saved.', goalOutcome: { status: 'partial', verification: 'inconclusive', requestVersion: 1, gaps: ['Durable business action reconciliation was unavailable', 'Content check was unavailable or returned invalid findings'] } })
+  assert.deepEqual(completion, { status: 'completed', goalOutcome: { status: 'partial', verification: 'inconclusive', requestVersion: 1, gaps: ['Durable business action reconciliation was unavailable', 'Content check was unavailable or returned invalid findings'] } })
   assert.equal(calls, 2)
   session.history.push({ type: 'function_call', callId: 'interrupted', name: 'ipython', arguments: '{"code":"host.files.save()"}' })
   await new AgentRuntime(host, model, kernels).runWork({ ...context.work, fence: 2 })
@@ -284,7 +287,7 @@ it('does not spend model-correction budget on provider failures', async () => {
   const work: TurnContext['work'] = { id: 'w', tenantId: 't', agentId: 'a', sessionId: 's', kind: 'turn', lane: 'interactive', triggerRef: 'm', fence: 1, homeEpoch: 1, leaseToken: 'token', meta: { text: 'answer' } }
   let calls = 0
   let completion: WorkCompletion | undefined
-  const host: HostPort = {
+  const host: HostPort = { ...durableProtocol(),
     claimWork: async () => null, heartbeat: async () => ({ ok: true }),
     loadContext: async () => ({ work, persona: { name: '', role: '', instructions: '' }, capabilities: [],
       messages: [{ ref: 'm', authorId: 'u', authorName: 'U', authorKind: 'human', body: 'answer', createdAt: 'now' }] }),
@@ -306,13 +309,15 @@ it('records approval and input waiting without claiming goal completion or inven
   for (const mode of ['approval', 'user', 'handoff'] as const) {
     const work: TurnContext['work'] = { id: 'w', tenantId: 't', agentId: 'a', sessionId: 's', kind: 'turn', lane: 'interactive', triggerRef: 'm', fence: 1, homeEpoch: 1, leaseToken: 'token' }
     let completion: WorkCompletion | undefined
-    const host: HostPort = {
+    let waiting: import('../src/protocol/outcome.js').WaitingOutcome | undefined
+    const host: HostPort = { ...durableProtocol(),
       claimWork: async () => null, heartbeat: async () => ({ ok: true }),
       loadContext: async () => ({ work, persona: { name: '', role: '', instructions: '' }, capabilities: [], messages: [{ ref: 'm', authorId: 'u', authorName: 'User', authorKind: 'human', body: 'Save the requested file.', createdAt: 'now' }] }),
       executeAction: async () => ({ ok: true }), emitEvent: async (_work, event) => { assert.notEqual(event.kind, 'run.completed') },
       loadSession: async () => null, saveSession: async () => {},
       commitResult: async () => { throw new Error('waiting must not commit a final answer') },
       completeWork: async (_work, result) => { completion = result }, yieldWork: async () => {},
+      waitWork: async (_work, result) => { waiting = result },
     }
     const model: ModelDriver = {
       run: async () => ({ text: '', output: [{ type: 'function_call', callId: 'c', name: 'ipython', arguments: '{"code":"1"}' }], usage: { available: false, inputTokens: 0, outputTokens: 0 } }),
@@ -323,10 +328,11 @@ it('records approval and input waiting without claiming goal completion or inven
       return { executionId: 'cell', stdout: '', stderr: '', result: null, durationMs: 1, truncated: false, artifacts: [], directives: [{ type: 'defer', reason: mode }] }
     } }
     await new AgentRuntime(host, model, kernels).runWork(work)
-    assert.equal(completion?.status, 'completed')
-    assert.equal(completion?.goalOutcome?.status, mode === 'approval' ? 'awaiting_approval' : mode === 'user' ? 'awaiting_input' : 'blocked')
-    assert.equal(completion?.goalOutcome?.verification, 'not_run')
-    if (completion?.goalOutcome?.status === 'awaiting_approval') assert.equal(completion.goalOutcome.approvalId, 'approval-id')
+    assert.equal(completion?.status, mode === 'handoff' ? 'completed' : undefined)
+    const outcome = waiting ?? completion?.goalOutcome
+    assert.equal(outcome?.status, mode === 'approval' ? 'awaiting_approval' : mode === 'user' ? 'awaiting_input' : 'blocked')
+    assert.equal(outcome?.verification, 'not_run')
+    if (outcome?.status === 'awaiting_approval') assert.equal(outcome.approvalId, 'approval-id')
   }
 })
 
@@ -341,7 +347,7 @@ it('discards an unexecuted model candidate when steering arrives during generati
     request: { version: 1, workId: 'w', tenantId: 't', sessionId: 's', authorId: 'u', sourceRef: 'm', evidence: snapshotEvidence('w:evidence:1', []), attachments: [], originalText: 'Original', revisions: [],
       contract: createTaskContract('Original', 1, { deliverables: ['OBSOLETE_DELIVERABLE'], constraints: [], actions: [], acceptance: ['Original condition'] }) },
   }
-  const host: HostPort = {
+  const host: HostPort = { ...durableProtocol(),
     claimWork: async () => null,
     heartbeat: async () => ({ ok: true, steer: generated ? [{ id: 'revision', text: 'Use the new requirement', createdAt: 'now' }] : [] }),
     loadContext: async () => ({ work, persona: { name: 'A', role: 'assistant', instructions: '' }, capabilities: [], messages: [{ ref: 'm', authorId: 'u', authorName: 'U', authorKind: 'human', body: 'Original', createdAt: 'now' }] }),
@@ -383,7 +389,7 @@ it('commits a bounded partial delivery on root budget exhaustion, retaining arti
     let saved: SessionRecord | undefined
     let completion: WorkCompletion | undefined
     const artifact = { path: 'report.txt', size: 4, mime: 'text/plain', sha256: 'a'.repeat(64) }
-    const host: HostPort = {
+    const host: HostPort = { ...durableProtocol(),
       claimWork: async () => null,
       heartbeat: async () => ({ ok: !(executed && mode === 'lease_lost'), cancelRequested: executed && mode === 'cancel',
         steer: executed && mode === 'steer' ? [{ id: 'r', text: 'Changed requirement', createdAt: 'now' }] : [] }),
@@ -427,7 +433,7 @@ it('preserves unknown action outcomes in public events and model receipts', asyn
   let eventResult: unknown
   let calls = 0
   let completion: WorkCompletion | undefined
-  const host: HostPort = {
+  const host: HostPort = { ...durableProtocol(),
     claimWork: async () => null, heartbeat: async () => ({ ok: true }),
     loadContext: async () => ({ work, persona: { name: 'A', role: 'assistant', instructions: '' }, capabilities: ['files'], messages: [{ ref: 'm', authorId: 'u', authorName: 'User', authorKind: 'human', body: 'Save the requested file.', createdAt: 'now' }] }),
     executeAction: async () => result, emitEvent: async (_work, event) => { if (event.kind === 'tool.completed') eventResult = event.data['result'] },
@@ -463,7 +469,7 @@ it('keeps approval decisions separate from execution evidence when restoring a s
   ]) {
     const work: TurnContext['work'] = { id: 'w', tenantId: 't', agentId: 'a', sessionId: 's', kind: 'resume', lane: 'interactive', triggerRef: 'm', fence: 1, homeEpoch: 1, leaseToken: 'token' }
     let observed = false
-    const host: HostPort = {
+    const host: HostPort = { ...durableProtocol(),
       claimWork: async () => null, heartbeat: async () => ({ ok: true }),
       loadContext: async () => ({ work, persona: { name: 'A', role: 'assistant', instructions: '' }, capabilities: [], messages: [{ ref: 'm', authorId: 'u', authorName: 'User', authorKind: 'human', body: 'Save the requested file.', createdAt: 'now' }], pendingApproval: approval }),
       executeAction: async () => { throw new Error('unexpected execution') }, emitEvent: async () => {},
@@ -492,7 +498,7 @@ it('fails before model or side effects when the original request cannot be captu
   const calls: string[] = []
   let completion: WorkCompletion | undefined
   const unexpected = async () => { calls.push('unexpected'); throw new Error('unexpected execution') }
-  const host: HostPort = {
+  const host: HostPort = { ...durableProtocol(),
     claimWork: async () => null, heartbeat: async () => ({ ok: true }),
     loadContext: async () => ({ work, persona: { name: 'A', role: 'assistant', instructions: '' }, capabilities: ['files'], messages: [] }),
     executeAction: unexpected, emitEvent: async () => {}, loadSession: async () => null,

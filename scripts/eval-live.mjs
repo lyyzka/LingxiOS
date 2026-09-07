@@ -4,9 +4,9 @@ import { resolve, join, dirname } from 'node:path'
 import { createHash, randomUUID } from 'node:crypto'
 import { isDeepStrictEqual } from 'node:util'
 import { Pool } from 'pg'
-import { fileURLToPath } from 'node:url'
 import { PGlite } from '@electric-sql/pglite'
 import { createLingxiOS, packageResources, releaseVersions, DEFAULT_MODEL } from 'lingxios'
+import { createWorker } from 'lingxios/worker'
 import { executeRequest, reviewAnswer } from 'lingxios/eval'
 import { intEnv } from '../dist/src/config.js'
 
@@ -48,7 +48,6 @@ const dependencyLockSha256 = hash(await readFile(new URL('../package-lock.json',
 const redactError = error => String(error instanceof Error ? error.message : 'Unknown failure').replaceAll(model.apiKey, '[redacted]').slice(0, 2000)
 const reports = []
 const connectionString = process.env.LINGXIOS_TEST_DATABASE_URL
-const source = resolve(process.env.LINGXILOOP_SOURCE ?? fileURLToPath(new URL('../../LingxiLoop/server/src', import.meta.url)))
 let databaseVersion
 let databaseInitialized = false
 const temporaryRoot = resolve(tmpdir())
@@ -63,6 +62,7 @@ for (let repeat = 1; repeat <= Number(args[3]); repeat++) {
       return { rows: result.rows, rowCount: result.affectedRows ?? result.rows.length }
     }, connect: async () => ({ query: database.query, release() {} }) }
     let app
+    let worker
     let timeout
     let cancellation
     let timedOut = false
@@ -77,17 +77,19 @@ for (let repeat = 1; repeat <= Number(args[3]); repeat++) {
       }
       if (!pool || !databaseInitialized) await db.exec(await readFile(packageResources().schema, 'utf8'))
       databaseInitialized = true
-      app = await createLingxiOS({ database, model, kernel: { homesRoot: join(directory, 'homes'), allowNetwork: false } })
+      app = await createLingxiOS({ database, homesRoot: join(directory, 'homes') })
+      worker = createWorker({ controlPlane: app, model, smallModel: model, kernel: { homesRoot: join(directory, 'homes'), allowNetwork: false } })
       timeout = setTimeout(() => {
         timedOut = true
         cancellation = app.cancel(identity).catch(() => { report.failures.push('Timeout cancellation failed') })
       }, 120_000)
-      const result = await executeRequest(app, { id: identity.runId, ...identity, text: sample.originalInput })
+      const result = await executeRequest(app, worker, { id: identity.runId, ...identity, text: sample.originalInput })
       report.body = result.message?.body ?? null
       report.outcome = result.outcome
       report.assessment = result.message?.envelope.assessment ?? null
       report.delivery = result.delivery
       report.externalDelivery = result.externalDelivery
+      report.usage = await app.readUsage(identity)
       report.executionDurationMs = Date.now() - started
       report.checks.push({ id: 'committed_response', status: result.message ? 'pass' : 'not_observed' })
       if (sample.expectedOutcome) report.checks.push({ id: 'goal_status', status: result.outcome
@@ -143,6 +145,7 @@ for (let repeat = 1; repeat <= Number(args[3]); repeat++) {
       await cancellation
       report.timedOut = timedOut
       report.durationMs = Date.now() - started
+      await worker?.stop()
       await app?.stop()
       await db.close()
       if (dirname(resolve(directory)) !== temporaryRoot) throw new Error('evaluation cleanup escaped its temporary root')
@@ -156,7 +159,7 @@ for (let repeat = 1; repeat <= Number(args[3]); repeat++) {
 }
 await writeFile(join(output, 'summary.json'), JSON.stringify({ version: 1, mode: 'live_model_runtime',
   runtimeVersions: releaseVersions, runnerSha256, implementationSha256, dependencyLockSha256,
-  databaseEngine: Pool ? 'postgresql' : 'pglite', databaseVersion,
+  databaseEngine: connectionString ? 'postgresql' : 'pglite', databaseVersion,
   model: model.id, reasoningEffort: model.reasoningEffort, providerOrigin: new URL(model.baseUrl).origin,
   budgets: { runtimeOutputTokens: model.maxOutputTokens, reviewOutputTokens: reviewModel.maxOutputTokens, reviewTimeoutMs, contextWindowTokens: model.contextWindowTokens },
   datasetSha256: hash(datasetBytes), datasetReview: dataset.reviewStatus,

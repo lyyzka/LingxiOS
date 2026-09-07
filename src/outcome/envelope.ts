@@ -33,6 +33,8 @@ export function snapshotArtifacts(artifacts: readonly KernelArtifact[]): KernelA
     && typeof item.path === 'string' && item.path.length > 0 && item.path.length <= 4096
     && !/[\\:\u0000-\u001f\u007f]/.test(item.path) && item.path.split('/').every((part: string) => part !== '' && part !== '.' && part !== '..')
     && Number.isSafeInteger(item.size) && item.size >= 0
+    && (item.source === undefined || typeof item.source.ref === 'string' && item.source.ref.length > 0 && item.source.ref.length <= 2000
+      && typeof item.source.version === 'string' && item.source.version.length > 0 && item.source.version.length <= 2000)
     && typeof item.mime === 'string' && typeof item.sha256 === 'string' && /^[a-f0-9]{64}$/i.test(item.sha256))) {
     throw new Error('invalid response artifacts')
   }

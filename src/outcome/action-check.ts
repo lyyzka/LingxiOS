@@ -35,7 +35,8 @@ export async function inspectActions(database: SqlQueryable, work: Omit<WorkItem
     } else if (!executor?.verifyResult) {
       records.push({ checker, status: 'inconclusive', evidence: { action: action.action, reason: 'Authoritative business readback is unavailable' } })
     } else {
-      try { records.push({ checker, ...await executor.verifyResult(work, action, result.value) }) }
+      try { records.push({ checker, ...await executor.verifyResult(work, action, result.value,
+        { requestVersion, signal: AbortSignal.timeout(30_000), deadlineAt: new Date(Date.now() + 30_000).toISOString() }) }) }
       catch { records.push({ checker, status: 'inconclusive', evidence: { action: action.action, reason: 'Current authorized resource readback failed' } }) }
     }
   }

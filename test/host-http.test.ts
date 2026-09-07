@@ -1,3 +1,5 @@
+import { MemoryStepStore } from '../src/control-plane/steps.js'
+import { MemoryModelBudgetStore } from '../src/control-plane/memory-store.js'
 import { snapshotEvidence } from '../src/context/evidence.js'
 import type { AssistantMessage, ModelItem } from '../src/protocol/types.js'
 import { createTaskContract } from '../src/context/task-contract.js'
@@ -34,11 +36,11 @@ it('preserves goal outcomes and enforces session leases over real HTTP', async (
   let resourceVersion = 2
   let readbacks = 0
   let staged = ''
-  const service = new ControlPlaneService({
+  const service = new ControlPlaneService({ modelBudgets: new MemoryModelBudgetStore(), steps: new MemoryStepStore(),
     work: workStore, sessions: new MemorySessionStore(), events: new MemoryEventStore(), actions: new MemoryActionLedger(),
     contextProvider: { loadContext: async () => { throw new Error('unexpected') } },
     capabilityResolver: { resolve: async () => resourceGranted ? [{ name: 'resource', methods: ['read', 'write'] }] : [] },
-    actionExecutor: { readResource: async (work, action) => {
+    actionExecutor: { prepare: async () => {}, readResource: async (work, action) => {
       assert.equal(work.principalId, 'u')
       if (action.action !== 'resource.read') throw new Error('read-only method required')
       readbacks++
@@ -54,13 +56,13 @@ it('preserves goal outcomes and enforces session leases over real HTTP', async (
   const client = new HttpHostClient({ baseUrl: `http://127.0.0.1:${port}`, serviceToken: 'test-secret', workerId: 'worker', maxAttempts: 1 })
   try {
     for (const body of ['null', '[]', '42', 'true', '"text"']) {
-      const response = await fetch(`http://127.0.0.1:${port}/v4/work/claim`, { method: 'POST',
+      const response = await fetch(`http://127.0.0.1:${port}/v5/work/claim`, { method: 'POST',
         headers: { authorization: 'Bearer test-secret', 'content-type': 'application/json' }, body })
       assert.equal(response.status, 400)
       assert.deepEqual(await response.json(), { error: 'request body must be a JSON object' })
     }
     for (const workerId of [123, true, ['worker'], null]) {
-      const response = await fetch(`http://127.0.0.1:${port}/v4/work/claim`, { method: 'POST',
+      const response = await fetch(`http://127.0.0.1:${port}/v5/work/claim`, { method: 'POST',
         headers: { authorization: 'Bearer test-secret', 'content-type': 'application/json' }, body: JSON.stringify({ workerId, workKinds: ['turn'] }) })
       assert.equal(response.status, 400)
       assert.deepEqual(await response.json(), { error: 'workerId must be a string' })
@@ -73,7 +75,7 @@ it('preserves goal outcomes and enforces session leases over real HTTP', async (
       sha256: createHash('sha256').update(artifactBytes).digest('hex') }, artifactBytes)
     assert.equal(staged, 'artifact')
     for (const fence of ['1', true, [1], 0, 1.5]) {
-      const response = await fetch(`http://127.0.0.1:${port}/v4/work/${work.id}/heartbeat`, { method: 'POST',
+      const response = await fetch(`http://127.0.0.1:${port}/v5/work/${work.id}/heartbeat`, { method: 'POST',
         headers: { authorization: 'Bearer test-secret', 'content-type': 'application/json' }, body: JSON.stringify({ fence, leaseToken: work.leaseToken }) })
       assert.equal(response.status, 400)
       assert.deepEqual(await response.json(), { error: 'fence must be a positive safe integer' })
@@ -193,7 +195,7 @@ it('preserves goal outcomes and enforces session leases over real HTTP', async (
     await assert.rejects(client.executeAction(work, { ...draftAction, args: { ...draftAction.args, actions: ['Different'] } }), /internal error/)
     const invalidDraft = await client.executeAction(work, { ...draftAction, cellId: 'invalid', idempotencyKey: JSON.stringify([work.id, 'invalid', 0]), args: { ...draftAction.args, requestVersion: 99 } })
     assert.equal(invalidDraft.ok, false)
-    assert.equal(invalidDraft.executionState, undefined)
+    assert.equal(invalidDraft.executionState, 'rejected')
     assert.equal(invalidDraft.directive, undefined)
     assert.deepEqual((await client.loadSession(work, session.key))?.request?.contract, contract)
     const outcome = { status: 'partial' as const, requestVersion: 2, verification: 'not_run' as const, gaps: ['Pending verification'] }

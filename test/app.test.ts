@@ -1,4 +1,4 @@
-import { startWorker } from '../src/worker/index.js'
+import { startWorker, createWorker } from '../src/worker/index.js'
 import { setTimeout as delay } from 'node:timers/promises'
 import assert from 'node:assert/strict'
 import http from 'node:http'
@@ -89,17 +89,19 @@ it('assembles the public app through HTTP model and Python, persisting results a
     }
   } }
   const options = { database: pool, model: { id: 'test', apiKey: 'test', baseUrl: `http://127.0.0.1:${address.port}` }, kernel: { homesRoot: join(directory, 'homes') }, worker: { healthPort: 0, pollIdleMs: 50 },
-    contextProvider, policy: new InjectedPolicy(), modelBudget: { maxModelCalls: 16 },
+    homesRoot: join(directory, 'homes'), contextProvider, policy: new InjectedPolicy(), modelBudget: { maxModelCalls: 16 },
     modelTrace: { recordPayloads: true, redact: () => ({ redacted: true }), sampleRate: 1, retentionDays: 1 } }
   let app: Awaited<ReturnType<typeof createLingxiOS>> | undefined
   let controlApp: Awaited<ReturnType<typeof createLingxiOS>> | undefined
+  let worker: ReturnType<typeof createWorker> | undefined
   try {
     await assert.rejects(createLingxiOS(options), /schema is missing/)
     await db.exec(await readFile(new URL('../../db/schema.sql', import.meta.url), 'utf8'))
     const stoppedApp = await createLingxiOS(options)
     await stoppedApp.stop()
-    await assert.rejects(stoppedApp.start(), /application has stopped/)
-    await assert.rejects(stoppedApp.runNext(), /application has stopped/)
+    assert.equal('start' in stoppedApp, false)
+    assert.equal('runNext' in stoppedApp, false)
+    assert.throws(() => createWorker({ ...options, controlPlane: stoppedApp }), /application has stopped/)
     await assert.rejects(stoppedApp.listenControlPlane({ serviceToken: 'test', port: 0 }), /application has stopped/)
     const racingApp = await createLingxiOS({ database: pool })
     const opening = racingApp.listenControlPlane({ serviceToken: 'test', port: 0 })
@@ -109,8 +111,9 @@ it('assembles the public app through HTTP model and Python, persisting results a
     await closing
     await assert.rejects(fetch(`http://127.0.0.1:${closedPort}/healthz`))
     app = await createLingxiOS(options)
+    worker = createWorker({ ...options, controlPlane: app })
     const identity = { runId: 'request', tenantId: 'tenant', agentId: 'assistant', sessionId: 'session' }
-    const evaluation = await executeRequest(app, { id: identity.runId, ...identity, principalId: 'user', text: 'Calculate 2 + 2 using Python.' })
+    const evaluation = await executeRequest(app, worker, { id: identity.runId, ...identity, principalId: 'user', text: 'Calculate 2 + 2 using Python.' })
     assert.equal(evaluation.mode, 'runtime_execution')
     assert.equal(evaluation.workDequeued, true)
     assert.equal(evaluation.message?.body, '4')
@@ -130,7 +133,7 @@ it('assembles the public app through HTTP model and Python, persisting results a
     assert.deepEqual(evaluation.message?.envelope?.taskContract, storedContract)
     assert.match(JSON.stringify(requests[1]!.messages), /Derived task checklist/)
 
-    await assert.rejects(executeRequest(app, { id: identity.runId, ...identity, principalId: 'user', text: 'Calculate 2 + 2 using Python.' }), /already exists/)
+    await assert.rejects(executeRequest(app, worker, { id: identity.runId, ...identity, principalId: 'user', text: 'Calculate 2 + 2 using Python.' }), /already exists/)
     assert.equal(requests.length, 2)
     assert.equal((await app.readMessage(identity))?.body, '4')
     assert.equal(contentChecks, 1)
@@ -148,24 +151,26 @@ it('assembles the public app through HTTP model and Python, persisting results a
     assert.match(JSON.stringify(requests[0]!.messages), /Injected context:.*tenant/)
     const output = requests[1]!.messages.find((item) => item.role === 'tool')!
     assert.equal(JSON.parse(output.content).stdout, '4\n')
-    const { healthPort } = await app.start()
+    const { healthPort } = await worker.start()
     assert.equal((await fetch(`http://127.0.0.1:${healthPort}/readyz`)).status, 200)
-    await assert.rejects(app.start(), /already/)
+    await assert.rejects(worker.start(), /already/)
+    await worker.stop()
     await app.stop()
     await db.close()
     db = new PGlite(join(directory, 'database'))
     app = await createLingxiOS(options)
+    worker = createWorker({ ...options, controlPlane: app })
     assert.equal((await app.readMessage(identity))?.body, '4')
-    assert.equal(await app.runNext(), false)
+    assert.equal(await worker.runNext(), false)
     // A committed result and terminal work state survive the same database reopen.
     const { model: _model, ...controlOptions } = options
     controlApp = await createLingxiOS(controlOptions)
-    await assert.rejects(controlApp.runNext(), /model configuration is required for local execution/)
-    await assert.rejects(controlApp.start(), /model configuration is required for local execution/)
+    assert.equal('runNext' in controlApp, false)
+    assert.equal('start' in controlApp, false)
     await assert.rejects(controlApp.listenControlPlane({ serviceToken: '', port: 0 }), /token is required/)
     const controlPort = await controlApp.listenControlPlane({ serviceToken: 'test-worker-secret', port: 0 })
     await assert.rejects(controlApp.listenControlPlane({ serviceToken: 'test-worker-secret', port: 0 }), /already/)
-    const claimUrl = `http://127.0.0.1:${controlPort}/v4/work/claim`
+    const claimUrl = `http://127.0.0.1:${controlPort}/v5/work/claim`
     assert.equal((await fetch(claimUrl, { method: 'POST' })).status, 401)
     const recoveredClaim = await fetch(claimUrl, { method: 'POST', headers: { authorization: 'Bearer test-worker-secret', 'content-type': 'application/json' }, body: JSON.stringify({ workerId: 'remote-worker', workKinds: ['turn','resume'] }) })
     assert.equal(recoveredClaim.status, 200)
@@ -203,7 +208,7 @@ it('assembles the public app through HTTP model and Python, persisting results a
     assert.deepEqual(recoveredHistory.at(-1), { role: 'assistant', content: '4' })
     const recoveryEvents = (await db.query('SELECT seq,kind,visibility,data FROM lingxios.agent_run_events WHERE run_id=$1 AND seq>100000 ORDER BY seq', [identity.runId])).rows
     assert.deepEqual(recoveryEvents, [])
-    assert.equal(await app.runNext(), false)
+    assert.equal(await worker.runNext(), false)
     assert.deepEqual((await db.query('SELECT seq,kind,visibility,data FROM lingxios.agent_run_events WHERE run_id=$1 AND seq>100000 ORDER BY seq', [identity.runId])).rows, recoveryEvents)
 
     const remoteIdentity = { ...identity, runId: 'remote-request', sessionId: 'remote-session' }
@@ -227,15 +232,15 @@ it('assembles the public app through HTTP model and Python, persisting results a
     const lateIdentity = { ...identity, runId: 'late-request', sessionId: 'late-session' }
     await app.enqueue({ id: lateIdentity.runId, ...lateIdentity, principalId: 'user', text: 'Answer this request.' })
     reviseBeforeCommit = true
-    assert.equal(await app.runNext(), true)
+    assert.equal(await worker.runNext(), true)
     assert.equal(reviseBeforeCommit, false)
     assert.equal((await app.readMessage(lateIdentity))?.envelope?.goalOutcome.status, 'blocked')
-    assert.deepEqual((await db.query('SELECT * FROM lingxios.agent_delivery_outbox WHERE run_id=$1', [lateIdentity.runId])).rows, [])
+    assert.deepEqual((await db.query('SELECT outbox.* FROM lingxios.agent_delivery_outbox outbox JOIN lingxios.agent_results result ON result.id=outbox.result_id WHERE result.work_id=$1', [lateIdentity.runId])).rows, [])
     exhaustBudget = true
     const partialIdentity = { ...identity, runId: 'partial-request', sessionId: 'partial-session' }
     const beforePartial = requests.length
     await app.enqueue({ id: partialIdentity.runId, ...partialIdentity, principalId: 'user', text: 'Calculate and explain the result.' })
-    assert.equal(await app.runNext(), true)
+    assert.equal(await worker.runNext(), true)
     assert.equal(requests.length - beforePartial, 16)
     const partialMessage = await app.readMessage(partialIdentity)
     assert.ok(partialMessage)
@@ -243,18 +248,19 @@ it('assembles the public app through HTTP model and Python, persisting results a
       gaps: ['Execution stopped before verified completion', 'root work model budget exhausted'] })
     const partialHistory = (await db.query<{ history: unknown[] }>('SELECT history FROM lingxios.agent_os_sessions WHERE session_id=$1', [partialIdentity.sessionId])).rows[0]!.history
     assert.deepEqual(partialHistory.at(-1), { role: 'assistant', content: partialMessage.body })
-    assert.equal(await app.runNext(), false)
+    assert.equal(await worker.runNext(), false)
 
     missingArtifact = true
     const missingIdentity = { ...identity, runId: 'missing-artifact', sessionId: 'missing-artifact' }
     await app.enqueue({ ...missingIdentity, id: missingIdentity.runId, principalId: 'user', text: 'Create a result file.' })
-    assert.equal(await app.runNext(), true)
+    assert.equal(await worker.runNext(), true)
     assert.equal(missingArtifactCalls, 2)
     assert.equal((await app.readMessage(missingIdentity))?.body, 'File prepared.')
     assert.equal((await app.readOutcome(missingIdentity))?.status, 'satisfied')
     assert.equal((await app.readArtifact({ ...missingIdentity, principalId: 'user' }, 'missing.txt'))?.bytes.toString(), 'result')
 
   } finally {
+    await worker?.stop()
     await controlApp?.stop()
     await app?.stop()
     await db.close()

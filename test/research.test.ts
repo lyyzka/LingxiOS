@@ -9,7 +9,6 @@ import { EventEmitter } from 'node:events'
 import { isPublicAddress, researchUrl } from '../src/research/address.js'
 import { fetchResearch, pinnedRequestOptions } from '../src/research/fetch.js'
 import { decodeHtml, parseOpenAlex, readResearch, searchResearch } from '../src/research/index.js'
-import { executeResearch } from '../src/integrations/lingxiloop/research.js'
 
 it('rejects local, mapped, transition and reserved research addresses', () => {
   for (const address of ['127.0.0.1', '10.1.2.3', '100.64.0.1', '169.254.169.254', '192.168.1.2', '198.18.0.1', '224.0.0.1', '::1', '::ffff:127.0.0.1', '::ffff:8.8.8.8', 'fc00::1', 'fe80::1', '2002:7f00:1::', '2001:db8::1']) {
@@ -69,18 +68,6 @@ it('bounds response bodies and revalidates redirects before making another reque
     context.mock.restoreAll()
     syncBuiltinESMExports()
   }
-})
-
-it('authorizes research using the persisted human and conversation', async () => {
-  const work = { id: 'w', tenantId: 't', agentId: 'a', principalId: 'u', sessionId: 's', kind: 'turn', lane: 'interactive' as const, triggerRef: 'm', fence: 1, homeEpoch: 1 }
-  const action = { runId: 'w', cellId: 'c', callIndex: 0, action: 'research.read', args: { url: 'http://127.0.0.1/private' }, idempotencyKey: 'key' }
-  const requests: unknown[] = []
-  const services = { permissionService: { assertCan: async (request: unknown) => { requests.push(request) } } }
-  await assert.rejects(executeResearch(work, action, services), /blocked/)
-  assert.deepEqual(requests, [{ actorUserId: 'u', companyId: 't', action: 'agent:read', resource: { type: 'conversation', id: 's' } }])
-  await assert.rejects(executeResearch(work, { ...action, args: { ...action.args, userId: 'forged' } }, services), /unknown/)
-  await assert.rejects(executeResearch(work, action, { permissionService: { assertCan: async () => { throw new Error('denied') } } }), /denied/)
-  assert.equal(requests.length, 1)
 })
 
 it('extracts bounded research text and rejects invalid requests before fetching', async () => {

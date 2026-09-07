@@ -8,6 +8,14 @@ import { kernelHome } from '../kernel/manager.js'
 import { snapshotArtifacts } from '../outcome/envelope.js'
 import type { AssistantMessage, KernelArtifact, WorkItem } from '../protocol/types.js'
 import type { MessageIdentity, RequestInput } from './index.js'
+import type { ArtifactInput } from '../tools/definition.js'
+
+export async function createNativeArtifact(homesRoot: string, work: Omit<WorkItem, 'leaseToken'>, input: ArtifactInput) {
+  const artifact = snapshotArtifacts([{ path: input.path, mime: input.mime, size: input.bytes.byteLength,
+    sha256: createHash('sha256').update(input.bytes).digest('hex'), ...(input.source ? { source: input.source } : {}) }])[0]!
+  await stageArtifact(homesRoot, work, artifact, input.bytes)
+  return artifact
+}
 
 function artifactDirectory(root: string, identity: MessageIdentity): string {
   const hash = createHash('sha256').update(JSON.stringify([identity.tenantId, identity.agentId, identity.runId])).digest('hex')
@@ -89,10 +97,9 @@ export async function persistArtifacts(homesRoot: string, work: Omit<WorkItem, '
 export async function readArtifact(database: SqlPool, homesRoot: string,
   identity: MessageIdentity & Pick<RequestInput, 'principalId' | 'threadId'>, path: string) {
   if (!identity.principalId?.trim()) throw new Error('authenticated principalId is required')
-  const { rows } = await database.query(`SELECT message.message,message.home_epoch FROM lingxios.agent_messages message
-    JOIN lingxios.agent_work_items work ON work.id=message.run_id AND work.tenant_id=message.tenant_id
-      AND work.agent_id=message.agent_id AND work.session_id=message.session_id
-    WHERE message.run_id=$1 AND message.tenant_id=$2 AND message.agent_id=$3 AND message.session_id=$4
+  const { rows } = await database.query(`SELECT result.message FROM lingxios.agent_work_items work
+    JOIN lingxios.agent_results result ON result.id=work.result_id
+    WHERE work.id=$1 AND work.tenant_id=$2 AND work.agent_id=$3 AND work.session_id=$4
       AND work.principal_id=$5 AND work.thread_id IS NOT DISTINCT FROM $6`,
   [identity.runId, identity.tenantId, identity.agentId, identity.sessionId, identity.principalId, identity.threadId ?? null])
   if (!rows[0]) return null

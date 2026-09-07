@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto'
-import { withTransaction, type SqlPool } from '../control-plane/pg-store.js'
+import type { SqlQueryable } from '../control-plane/pg-store.js'
 import type { WorkItem } from '../protocol/types.js'
-import { snapshotMemories, type MemoryScopeType } from './store.js'
+import { snapshotMemories, type MemoryScope, type MemoryScopeType } from './store.js'
 
 export interface MemoryChange {
   action: 'create' | 'update' | 'expire'
@@ -14,9 +14,11 @@ export interface MemoryChange {
   validUntil?: string
 }
 export interface MemoryBatch {
+  evolutionEnabled?: boolean
   evidence: Record<string, unknown>
   currentMemories: Array<Record<string, unknown>>
   omittedMemories: number
+  scopes: MemoryScope[]
 }
 
 export function parseMemoryChanges(value: unknown): MemoryChange[] {
@@ -25,9 +27,10 @@ export function parseMemoryChanges(value: unknown): MemoryChange[] {
   for (const item of value) {
     if (!item || typeof item !== 'object' || Array.isArray(item)
       || Object.keys(item).some(key => !['action','scopeType','sourceRunIds','id','expectedVersion','body','kind','validUntil'].includes(key))
-      || !['create','update','expire'].includes(item.action) || !['learner','course','agent_role'].includes(item.scopeType)
+      || !['create','update','expire'].includes(item.action) || typeof item.scopeType !== 'string' || !item.scopeType.trim() || item.scopeType.length > 1000
       || !Array.isArray(item.sourceRunIds) || item.sourceRunIds.length !== 1
-      || typeof item.sourceRunIds[0] !== 'string' || !item.sourceRunIds[0] || item.sourceRunIds[0].length > 1000) throw new Error('invalid memory synthesis change')
+      || typeof item.sourceRunIds[0] !== 'string' || !item.sourceRunIds[0] || item.sourceRunIds[0].length > 1000
+      || ['experience','skill','strategy'].includes(item.kind)) throw new Error('invalid memory synthesis change')
     if (item.action === 'create') {
       if (item.id !== undefined || item.expectedVersion !== undefined) throw new Error('new memory cannot supply an identity')
     } else {
@@ -46,15 +49,14 @@ export function parseMemoryChanges(value: unknown): MemoryChange[] {
 }
 
 /** Integration must authorize the live principal, conversation and memory permission before calling. */
-export async function executeMemorySynthesis(database: SqlPool, work: Omit<WorkItem, 'leaseToken'>,
-  method: string, args: Record<string, unknown>): Promise<MemoryBatch | { outcome: string; changeCount: number } | null> {
+export async function executeMemorySynthesis(client: SqlQueryable, work: Omit<WorkItem, 'leaseToken'>,
+  method: string, args: Record<string, unknown>, authorizedScopes: readonly MemoryScope[]): Promise<MemoryBatch | { outcome: string; changeCount: number } | null> {
   if (work.kind !== 'memory_synthesis' || !work.principalId || typeof work.meta?.['sourceRunId'] !== 'string'
     || !['load','apply'].includes(method)) throw new Error('invalid memory synthesis work')
   if (Object.keys(args).some(key => !(method === 'load' ? [] : ['changes','approved','confidence']).includes(key))) throw new Error('invalid memory synthesis arguments')
   const changes = method === 'apply' ? parseMemoryChanges(args['changes']) : []
   if (method === 'apply' && (typeof args['approved'] !== 'boolean' || typeof args['confidence'] !== 'number'
     || !Number.isFinite(args['confidence']) || args['confidence'] < 0 || args['confidence'] > 1)) throw new Error('invalid memory verification')
-  return withTransaction(database, async client => {
     // Source and synthesis leases are checked under locks, so cancellation and steering cannot race the commit.
     const { rows } = await client.query(`SELECT e.*,source.created_at::text AS observed_at,
       source.steer_inputs->-1->>'createdAt' AS revised_at,job.meta->'memorySnapshot' AS memory_snapshot FROM lingxios.agent_work_items job
@@ -81,15 +83,18 @@ export async function executeMemorySynthesis(database: SqlPool, work: Omit<WorkI
     const previousSnapshot = evidence['memory_snapshot'] as { fence?: number; memories?: Array<{ id: string; version: number }> } | undefined
     delete evidence['memory_snapshot']
     if (evidence['status'] !== 'pending') return method === 'load' ? null : { outcome: String(evidence['status']), changeCount: 0 }
-    const scopeIds = { learner: work.principalId!, course: work.sessionId, agent_role: work.agentId }
+    const recordedScopes = evidence['scopes'] as MemoryScope[]
+    const scopes = authorizedScopes.filter(scope => scope.tenantId === work.tenantId
+      && recordedScopes.some(recorded => recorded.tenantId === scope.tenantId && recorded.scopeType === scope.scopeType && recorded.scopeId === scope.scopeId))
+    if (!scopes.length || scopes.length > 12 || new Set(scopes.map(scope => scope.scopeType)).size !== scopes.length) throw new Error('memory evidence scope is unavailable')
+    const scopeIds = Object.fromEntries(scopes.map(scope => [scope.scopeType,scope.scopeId]))
     if (method === 'load') {
       const groups = []
-      for (const scopeType of ['learner','course','agent_role'] as const) {
-        const scope = { tenantId: work.tenantId, scopeType, scopeId: scopeIds[scopeType] }
+      for (const scope of scopes) {
         for (const expired of [false, true]) {
           const memories = await client.query(`SELECT id,body,kind,origin,pinned,version,source_refs,valid_until,updated_at,status,
             (status='expired' OR valid_until<=NOW()) IS TRUE AS "needsReverification"
-            FROM lingxios.agent_memories WHERE tenant_id=$1 AND scope_type=$2 AND scope_id=$3
+            FROM lingxios.agent_memories WHERE tenant_id=$1 AND scope_type=$2 AND scope_id=$3 AND origin<>'evolved'
               AND ((status='expired' OR valid_until<=NOW()) IS TRUE)=$4
             ORDER BY pinned DESC,updated_at DESC,id LIMIT 12`, [scope.tenantId, scope.scopeType, scope.scopeId, expired])
           groups.push({ scope, items: memories.rows })
@@ -102,9 +107,10 @@ export async function executeMemorySynthesis(database: SqlPool, work: Omit<WorkI
       return { evidence: { ...evidence, input_text: excerpt(evidence['input_text']), assistant_text: excerpt(evidence['assistant_text']),
         input_truncated: evidence['input_truncated'] === true || String(evidence['input_text']).length > 4000,
         assistant_truncated: evidence['assistant_truncated'] === true || String(evidence['assistant_text']).length > 4000 },
-        currentMemories: snapshot.items, omittedMemories: snapshot.omitted }
+        currentMemories: snapshot.items, omittedMemories: snapshot.omitted, scopes }
     }
     if (changes.some(change => change.sourceRunIds[0] !== evidence['source_run_id'])) throw new Error('memory change uses unknown evidence')
+    if (changes.some(change => !Object.hasOwn(scopeIds, change.scopeType))) throw new Error('memory change uses an unauthorized scope')
     if (previousSnapshot?.fence !== work.fence || !Array.isArray(previousSnapshot.memories)
       || changes.some(change => change.action !== 'create' && !previousSnapshot.memories!.some(item => item.id === change.id && item.version === change.expectedVersion))) {
       throw new Error('memory synthesis requires the loaded snapshot and versions')
@@ -138,5 +144,4 @@ export async function executeMemorySynthesis(database: SqlPool, work: Omit<WorkI
     }
     await client.query('UPDATE lingxios.agent_memory_evidence SET status=$2 WHERE source_run_id=$1', [evidence['source_run_id'], approved ? 'processed' : 'rejected'])
     return { outcome: approved ? 'committed' : 'rejected', changeCount: approved ? changes.length : 0 }
-  })
 }

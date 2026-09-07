@@ -4,7 +4,17 @@ export interface ProgressCheckpoint { last: string; count: number; observations:
 
 export type CorrectionCategory = 'content_acceptance' | 'tool_protocol' | 'kernel_error' | 'response_protocol'
 
-/** Consecutive identical failures, not a lifetime allowance for unrelated errors. */
+const incidental = new Set(['observedAt', 'recordedAt', 'timestamp', 'durationMs', 'latencyMs', 'executionId', 'idempotencyKey', 'callId'])
+function stableObservation(value: unknown, key = ''): unknown {
+  if (Array.isArray(value)) return value.map(item => stableObservation(item))
+  if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value)
+    .filter(([name]) => !incidental.has(name)).sort(([a], [b]) => a.localeCompare(b)).map(([name, item]) => [name, stableObservation(item, name)]))
+  // Resource revisions remain exact. Incidental clock output cannot manufacture progress.
+  if (typeof value === 'string' && !/revision|version|sha256/i.test(key)) return value.replace(/\b\d{4}-\d\d-\d\d[T ]\d\d:\d\d:\d\d(?:\.\d+)?(?:Z|[+-]\d\d:\d\d)?\b/g, '<time>')
+  return value
+}
+
+/** Only new observations reset the shared continuation bound, never a reworded error. */
 export class CorrectionBudget {
   private last = ''
   private count = 0
@@ -20,12 +30,12 @@ export class CorrectionBudget {
       if (this.protocolRepairs > 2) return false
     }
     const key = createHash('sha256').update(category + ':' + failure).digest('hex')
-    this.count = this.last === key ? this.count + 1 : 1
+    this.count = Math.min(6, this.count + 1)
     this.last = key
     return this.count < 3
   }
-  observe(value: string): void {
-    const key = createHash('sha256').update(value).digest('hex')
+  observe(value: unknown): void {
+    const key = createHash('sha256').update(JSON.stringify(stableObservation(value))).digest('hex')
     if (this.observations.has(key)) return
     this.observations.add(key)
     if (this.observations.size > 2048) this.observations.delete(this.observations.values().next().value!)

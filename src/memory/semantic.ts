@@ -2,7 +2,7 @@ import { modelExecution, DEFAULT_MODEL_BUDGET, type RootModelBudgetOptions } fro
 import { PgModelBudgetStore, PgWorkStore } from '../control-plane/pg-store.js'
 import { createHash, randomUUID } from 'node:crypto'
 import { OpenAIEmbeddingDriver, type EmbeddingOptions } from '../model/embeddings.js'
-import { withTransaction, type SqlPool } from '../control-plane/pg-store.js'
+import { withTransaction, type SqlPool, type SqlQueryable } from '../control-plane/pg-store.js'
 import type { WorkItem } from '../protocol/types.js'
 import { recallMemories, type MemoryScope } from './store.js'
 
@@ -24,7 +24,7 @@ export function createSemanticMemory(database: SqlPool, options: EmbeddingOption
       reserveModelCall: (_work, callId, reserved) => budgets.reserve(root, callId, reserved, proof),
       recordModelUsage: (_work, callId, usage, observation) => budgets.record(root, callId, usage.inputTokens, usage.outputTokens, usage.costMicros, proof, observation),
     }, { modelId: options.id, maxOutputTokens: 0, toolDefinitionTokens: 0 }, { ...work, leaseToken: '' }, limits,
-    undefined, undefined, `embedding:${randomUUID()}`)
+    undefined, `embedding:${randomUUID()}`)
     return invoke('embedding', { input, signal }, async requestSignal => {
       const result = await driver.embed(input, requestSignal)
       return { ...result, usage: { ...result.usage, outputTokens: 0 } }
@@ -32,9 +32,9 @@ export function createSemanticMemory(database: SqlPool, options: EmbeddingOption
   }
   const queries = new Map<string, { expires: number; value: ReturnType<OpenAIEmbeddingDriver['embed']> }>()
   return {
-    async recall(work: Omit<WorkItem, 'leaseToken'>, scope: MemoryScope, query: string, limit: number): Promise<Array<Record<string, unknown>>> {
-      if (scope.tenantId !== work.tenantId || scope.scopeType === 'course' && scope.scopeId !== work.sessionId
-        || scope.scopeType === 'agent_role' && scope.scopeId !== work.agentId) throw new Error('memory recall scope does not match the work')
+    async recall(work: Omit<WorkItem, 'leaseToken'>, scope: MemoryScope, query: string, limit: number, signal?: AbortSignal): Promise<Array<Record<string, unknown>>> {
+      signal?.throwIfAborted()
+      if (scope.tenantId !== work.tenantId || query.length > 2000 || !Number.isSafeInteger(limit) || limit < 1 || limit > 12) throw new Error('invalid memory recall scope or query')
       // Backfill every eligible record over successive reads, without blocking the foreground on indexing.
       const enqueue = (model: string | null) => database.query(`INSERT INTO lingxios.agent_work_items
         (id,tenant_id,agent_id,principal_id,session_id,thread_id,kind,lane,trigger_ref,meta)
@@ -42,7 +42,7 @@ export function createSemanticMemory(database: SqlPool, options: EmbeddingOption
           $1,$5,$6,$7,$8,'memory_index','background',m.id,
           jsonb_build_object('memoryId',m.id,'version',m.version,'modelKey',$4::text,'expectedModel',$11::text,'scopeType',m.scope_type,'scopeId',m.scope_id)
         FROM lingxios.agent_memories m LEFT JOIN lingxios.agent_memory_embeddings e ON e.tenant_id=m.tenant_id AND e.memory_id=m.id AND e.model_key=$4
-        WHERE m.tenant_id=$1 AND m.scope_type=$2 AND m.scope_id=$3 AND m.status='active' AND (m.valid_until IS NULL OR m.valid_until>NOW())
+        WHERE m.tenant_id=$1 AND m.scope_type=$2 AND m.scope_id=$3 AND m.origin<>'evolved' AND m.status='active' AND (m.valid_until IS NULL OR m.valid_until>NOW())
           AND (e.memory_id IS NULL OR e.version<>m.version OR ($11::text IS NOT NULL AND e.model<>$11))
           AND EXISTS(SELECT 1 FROM lingxios.agent_work_items w WHERE w.id=$9 AND w.fence=$10 AND w.status='leased'
             AND w.lease_expires_at>NOW() AND w.cancel_requested_at IS NULL)
@@ -54,13 +54,14 @@ export function createSemanticMemory(database: SqlPool, options: EmbeddingOption
       let cached = queries.get(key)
       if (!cached || cached.expires <= Date.now()) {
         if (queries.size >= 64) queries.delete(queries.keys().next().value!)
-        const value = embed(work, [query], AbortSignal.timeout(3000))
+        const value = embed(work, [query], AbortSignal.any([AbortSignal.timeout(3000), ...(signal ? [signal] : [])]))
         cached = { expires: Date.now() + 60_000, value }
         queries.set(key, cached)
       }
       let vector: Awaited<ReturnType<OpenAIEmbeddingDriver['embed']>>
       try { vector = await cached.value }
       catch {
+        signal?.throwIfAborted()
         // Keep the rejected promise for the short TTL, preventing one outage from being retried every hop.
         return (await recallMemories(database, scope, '', limit)).map(row => ({ ...row, retrieval: 'recency_embedding_unavailable' }))
       }
@@ -74,13 +75,14 @@ export function createSemanticMemory(database: SqlPool, options: EmbeddingOption
           FROM lingxios.agent_memories m LEFT JOIN lingxios.agent_memory_embeddings e
             ON e.tenant_id=m.tenant_id AND e.memory_id=m.id AND e.version=m.version AND e.model_key=$4 AND e.model=$5
               AND cardinality(e.embedding)=cardinality($6::double precision[])
-          WHERE m.tenant_id=$1 AND m.scope_type=$2 AND m.scope_id=$3 AND m.status='active' AND (m.valid_until IS NULL OR m.valid_until>NOW())
+          WHERE m.tenant_id=$1 AND m.scope_type=$2 AND m.scope_id=$3 AND m.origin<>'evolved' AND m.status='active' AND (m.valid_until IS NULL OR m.valid_until>NOW())
           ORDER BY m.pinned DESC,similarity DESC NULLS LAST,m.updated_at DESC,m.id LIMIT $7`,
         [scope.tenantId, scope.scopeType, scope.scopeId, driver.cacheKey, vector.model, vector.vectors[0], limit])
         return rows
       }).catch(async () => (await recallMemories(database, scope, '', limit)).map(row => ({ ...row, retrieval: 'recency_index_unavailable' })))
     },
-    async refresh(work: Omit<WorkItem, 'leaseToken'>, authorize: () => Promise<void>) {
+    async refresh(work: Omit<WorkItem, 'leaseToken'>, authorize: (database: SqlQueryable) => Promise<void>, signal?: AbortSignal) {
+      signal?.throwIfAborted()
       if (work.kind !== 'memory_index') throw new Error('invalid memory index work')
       if (work.meta?.['modelKey'] !== driver.cacheKey) return { outcome: 'obsolete' }
       const read = async (client: Pick<SqlPool, 'query'>, lock: boolean) => client.query(`SELECT m.id,m.body,m.version,m.scope_type,m.scope_id
@@ -89,13 +91,14 @@ export function createSemanticMemory(database: SqlPool, options: EmbeddingOption
           AND w.tenant_id=$3 AND m.version=(w.meta->>'version')::integer AND m.scope_type=w.meta->>'scopeType' AND m.scope_id=w.meta->>'scopeId'
           AND m.status='active' AND (m.valid_until IS NULL OR m.valid_until>NOW()) ${lock ? 'FOR UPDATE OF w,m' : ''}`,
       [work.id, work.fence, work.tenantId])
-      await authorize()
+      await authorize(database)
       const initial = (await read(database, false)).rows[0]
       if (!initial) return { outcome: 'stale' }
-      const result = await embed(work, [String(initial['body'])])
+      const result = await embed(work, [String(initial['body'])], signal)
       if (typeof work.meta?.['expectedModel'] === 'string' && work.meta['expectedModel'] !== result.model) return { outcome: 'obsolete' }
-      await authorize()
       return withTransaction(database, async client => {
+        signal?.throwIfAborted()
+        await authorize(client)
         const current = (await read(client, true)).rows[0]
         if (!current || current['body'] !== initial['body']) return { outcome: 'stale' }
         await client.query(`INSERT INTO lingxios.agent_memory_embeddings(tenant_id,memory_id,version,model_key,model,embedding)

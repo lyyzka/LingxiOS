@@ -13,15 +13,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with: { node-version: 22.13.1, cache: npm }
-      - uses: actions/checkout@v4
-        with:
-          repository: lyyzka/LingxiLoop
-          ref: 27295d82137ae6bcfb96d09ab139d5b780e0806b
-          path: ../LingxiLoop
       - run: npm ci --ignore-scripts
-      - run: npm run check:release -- --deterministic
-        env:
-          LINGXILOOP_SOURCE: ${{ github.workspace }}/../LingxiLoop/server/src
+      - run: npm run check:release
 
   windows-package:
     runs-on: windows-2025

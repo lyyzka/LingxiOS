@@ -1,13 +1,14 @@
+import { durableProtocol } from './protocol-fixture.js'
 import assert from 'node:assert/strict'
 import { readFile } from 'node:fs/promises'
 import { it } from 'node:test'
 import { PGlite } from '@electric-sql/pglite'
-import { sweepLingxiLoopWatchdog } from '../src/integrations/lingxiloop/watchdog.js'
+import { sweepQueuedWork } from '../src/control-plane/scheduler.js'
 import type { SqlPool } from '../src/control-plane/pg-store.js'
 import { AgentRuntime } from '../src/runtime/runtime.js'
 import type { HostPort } from '../src/host/port.js'
 import type { AssistantMessage, WorkItem } from '../src/protocol/types.js'
-import { toolCatalog } from '../src/tools/catalog.js'
+import type { ToolDefinition } from '../src/tools/catalog.js'
 import { setTimeout as delay } from 'node:timers/promises'
 import { executionModel, DEFAULT_MODEL_BUDGET } from '../src/model/execution.js'
 import { ModelDriverError } from '../src/errors.js'
@@ -28,7 +29,7 @@ it('routes small work without splitting root budgets or assigning approval decis
       reservations.push(limits.reservedOutputTokens)
       return { allowed: true, remainingCalls: 9, remainingTokens: 99999, remainingCostMicros: 99999, deadlineAt: new Date(Date.now() + 5000).toISOString() }
     }, recordModelUsage: async (_work, id, _usage, observation) => { settled.push(id + ':' + observation?.model) } },
-    driver(DEFAULT_MODEL.id, 8192), work, { ...DEFAULT_MODEL_BUDGET, maxModelCalls: 3 }, undefined, undefined, driver(DEFAULT_SMALL_MODEL.id, 2048))
+    driver(DEFAULT_MODEL.id, 8192), work, { ...DEFAULT_MODEL_BUDGET, maxModelCalls: 3 }, undefined, driver(DEFAULT_SMALL_MODEL.id, 2048))
     await model.run({ instructions: '', items: [] })
     await model.structured({ instructions: '', input: {} })
     await model.compact({ instructions: '', items: [] })
@@ -44,10 +45,12 @@ it('routes small work without splitting root budgets or assigning approval decis
 it('continues beyond twelve steps, bounds concurrent reads, and stops an unstarted write at approval', async () => {
   const work: WorkItem = { id: 'long', tenantId: 't', agentId: 'a', sessionId: 's', principalId: 'u', kind: 'turn',
     lane: 'interactive', triggerRef: 'm', fence: 1, homeEpoch: 1, leaseToken: 'token' }
-  const tools = toolCatalog('data', { read: ['query'], write: ['body'] }, ['read'])
+  const tools: ToolDefinition[] = ['read','write'].map(method => ({ name: `data__${method}`, action: `data.${method}`,
+    description: method, parameters: { type: 'object', properties: { [method === 'read' ? 'query' : 'body']: { type: 'string' } }, additionalProperties: false },
+    effect: method === 'read' ? 'read' : 'uncertain', approval: method === 'write' }))
   let calls = 0, active = 0, peak = 0, reads = 0, writes = 0, message: AssistantMessage | undefined
   const stepIds = new Set<string>()
-  const host: HostPort = { claimWork: async () => null, heartbeat: async () => ({ ok: true }),
+  const host: HostPort = { ...durableProtocol(), claimWork: async () => null, heartbeat: async () => ({ ok: true }),
     loadContext: async () => ({ work, persona: { name: 'A', role: '', instructions: '' }, capabilities: ['data'], tools,
       messages: [{ ref: 'm', authorId: 'u', authorName: 'U', authorKind: 'human', body: 'Read the requested data.', createdAt: 'now' }] }),
     loadSession: async () => null, saveSession: async () => {}, emitEvent: async () => {}, yieldWork: async () => {},
@@ -109,8 +112,8 @@ it('preempts a healthy lower-priority lease and fences it after the grace period
       VALUES ('active','t','a','s','routine','background','m','leased',NOW()-INTERVAL '10 minutes',NOW()-INTERVAL '10 minutes',NOW(),NOW()+INTERVAL '45 seconds'),
       ('waiting','t','a','s','turn','interactive','m2','queued',NOW()-INTERVAL '5 minutes',NOW()-INTERVAL '5 minutes',NOW(),NULL)`)
     const now = new Date()
-    assert.deepEqual(await sweepLingxiLoopWatchdog(pool, now, 120_000, 30_000), { tripped: 1, fenced: 0 })
-    assert.deepEqual(await sweepLingxiLoopWatchdog(pool, new Date(now.getTime() + 31_000), 120_000, 30_000), { tripped: 0, fenced: 1 })
+    assert.deepEqual(await sweepQueuedWork(pool, now, 120_000, 30_000), { tripped: 1, fenced: 0 })
+    assert.deepEqual(await sweepQueuedWork(pool, new Date(now.getTime() + 31_000), 120_000, 30_000), { tripped: 0, fenced: 1 })
     assert.deepEqual((await db.query('SELECT status,fence,preemptions FROM lingxios.agent_work_items WHERE id=$1', ['active'])).rows,
       [{ status: 'queued', fence: 1, preemptions: 1 }])
   } finally { await db.close() }

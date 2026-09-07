@@ -3,6 +3,8 @@ import { compileContext, fingerprint, observationItems, type ContextBlock } from
 import { requiresReview } from '../outcome/completion.js'
 import { appendResourceCheck } from '../context/resource-checks.js'
 import { createTaskContract } from '../context/task-contract.js'
+import { abortable } from '../deadline.js'
+import { deadlineHost } from '../host/deadline-host.js'
 /**
  * AgentRuntime — the product-agnostic agent loop.
  *
@@ -73,8 +75,6 @@ export interface AgentRuntimeOptions {
   recordModelPayloads?: boolean
   modelTrace?: ModelTracePolicy
   rootModelBudget?: RootModelBudgetOptions
-  /** Product-owned billing/limit ledger. Failure is fatal so usage cannot disappear silently. */
-  onModelCall?: ModelCallObserver
 }
 
 export type { ModelCallObservation, ModelCallObserver, RootModelBudgetOptions } from '../model/execution.js'
@@ -107,10 +107,12 @@ export class AgentRuntime {
   private readonly recordModelPayloads: boolean
   private readonly modelTrace: Required<Pick<ModelTracePolicy, 'sampleRate' | 'retentionDays'>> & Pick<ModelTracePolicy, 'redact'>
   private readonly rootModelBudget: Required<RootModelBudgetOptions>
-  private readonly onModelCall: ModelCallObserver | undefined
   private readonly smallModel: ModelDriver
   private readonly processors = new Map<string, WorkProcessor | 'conversation'>()
   private readonly eventSeqByRun = new Map<string, number>()
+  private readonly hostsByRun = new Map<string, HostPort>()
+
+  private hostFor(work: WorkItem): HostPort { return this.hostsByRun.get(work.id) ?? this.host }
 
   constructor(
     private readonly host: HostPort,
@@ -133,7 +135,6 @@ export class AgentRuntime {
     if (!Number.isSafeInteger(this.modelTrace.retentionDays) || this.modelTrace.retentionDays < 1) throw new Error('model trace retentionDays must be a positive integer')
     if (options.modelTrace?.recordPayloads === true) this.recordModelPayloads = true
     this.rootModelBudget = { ...DEFAULT_MODEL_BUDGET, ...options.rootModelBudget }
-    this.onModelCall = options.onModelCall
     this.smallModel = options.smallModel ?? model
     for (const [name, value] of Object.entries(this.rootModelBudget)) {
       if (!Number.isSafeInteger(value) || value < (name.includes('CostMicrosPerMillion') ? 0 : 1)) throw new Error(`${name} must be a positive safe integer`)
@@ -150,7 +151,7 @@ export class AgentRuntime {
   private async event(work: WorkItem, runId: string, event: Omit<RunEvent, 'runId' | 'seq'>): Promise<number> {
     const seq = (this.eventSeqByRun.get(runId) ?? 0) + 1
     this.eventSeqByRun.set(runId, seq)
-    await this.host.emitEvent(work, { runId, seq, ...event })
+    await this.hostFor(work).emitEvent(work, { runId, seq, ...event })
     return seq
   }
 
@@ -168,7 +169,7 @@ export class AgentRuntime {
 
     const refresh = (): Promise<void> => {
       if (heartbeatInFlight) return heartbeatInFlight
-      heartbeatInFlight = this.host.heartbeat(work).then((result) => {
+      heartbeatInFlight = this.hostFor(work).heartbeat(work).then((result) => {
         if (!result.ok) {
           leaseLost = new LeaseLostError()
           lifecycle.abort(leaseLost)
@@ -211,9 +212,10 @@ export class AgentRuntime {
     const runId = work.id
     this.eventSeqByRun.set(runId, Math.max(0, work.fence - 1) * RUN_SEQUENCE_SPAN)
     const signals = this.startSignals(work, signal)
+    this.hostsByRun.set(runId,deadlineHost(this.host,signals.lifecycle.signal))
     let activeSession: SessionRecord | null = null
     const log = this.logger.child({ runId, workId: work.id, agentId: work.agentId, fence: work.fence })
-    const model = executionModel(this.host, this.model, work, this.rootModelBudget, this.onModelCall, event => this.event(work, runId, event), this.smallModel)
+    const model = executionModel(this.hostFor(work), this.model, work, this.rootModelBudget, event => this.event(work, runId, event), this.smallModel)
 
     try {
       await this.event(work, runId, {
@@ -228,13 +230,13 @@ export class AgentRuntime {
       if (!processor) throw new Error(`no processor registered for work kind '${work.kind}'`)
       if (processor !== 'conversation') {
         await processor.process(work, {
-          host: this.host,
+          host: this.hostFor(work),
           model,
           signal: signals.lifecycle.signal,
           emit: async (event) => { await this.event(work, runId, event) },
         })
         await this.event(work, runId, { kind: 'run.completed', stage: 'completed', visibility: 'internal', data: {} })
-        await this.host.completeWork(work, { status: 'completed' })
+        await this.hostFor(work).completeWork(work, { status: 'completed' })
         return
       }
 
@@ -245,9 +247,10 @@ export class AgentRuntime {
         activeSession = sessionRef.session
       }
     } catch (error) {
+      this.hostsByRun.set(runId,deadlineHost(this.host,undefined,5000))
       if (signal?.aborted && !signals.leaseLost()) {
-        if (activeSession) await this.host.saveSession(work, activeSession).catch(() => {})
-        await this.host.yieldWork(work).catch(() => {})
+        if (activeSession) await this.hostFor(work).saveSession(work, activeSession).catch(() => {})
+        await this.hostFor(work).yieldWork(work).catch(() => {})
         return
       }
       await this.finishWithError(work, runId, signals, activeSession, error)
@@ -255,6 +258,7 @@ export class AgentRuntime {
     } finally {
       signals.stop()
       this.eventSeqByRun.delete(runId)
+      this.hostsByRun.delete(runId)
     }
   }
 
@@ -267,7 +271,7 @@ export class AgentRuntime {
     sessionRef: { session: SessionRecord | null },
     model: ModelDriver,
   ): Promise<void> {
-    const context = await this.host.loadContext(work)
+    const context = await this.hostFor(work).loadContext(work)
     await this.event(work, runId, {
       kind: 'input.loaded', stage: 'completed', visibility: 'internal',
       data: { triggerRef: work.triggerRef },
@@ -275,7 +279,7 @@ export class AgentRuntime {
 
     const session = await this.restoreSession(work, context)
     sessionRef.session = session
-    await this.host.saveSession(work, session)
+    await this.hostFor(work).saveSession(work, session)
     const capabilities = this.policy.kernelCapabilities(context)
     const budget = new CorrectionBudget(context.executionCheckpoint)
     let nextStreamPartIndex = 0
@@ -286,7 +290,7 @@ export class AgentRuntime {
     let lastGood: { text: string; envelope: ResponseEnvelope } | undefined
     let contentCheckExhausted = false
     let acceptanceGaps: string[] = []
-    const artifacts: KernelArtifact[] = []
+    const artifacts: KernelArtifact[] = [...context.priorArtifacts ?? []]
     const executedSteps = [...(context.executionSteps ?? [])]
     const evidence = () => session.request?.evidence ?? snapshotEvidence(`${work.id}:evidence:1`, [])
     let protocolCorrection: ModelItem | null = null
@@ -294,7 +298,7 @@ export class AgentRuntime {
     const applySteering = async () => {
       const steers = signals.drainSteer()
       if (steers.length > 0) {
-        budget.observe(JSON.stringify(steers.map(steer => ({ id: steer.id, text: steer.text }))))
+        budget.observe({ revisions: steers })
         fallbackText = undefined
         lastGood = undefined
         acceptanceGaps = []
@@ -305,7 +309,7 @@ export class AgentRuntime {
               delete session.request.contract
             }
           }
-          await this.host.saveSession(work, session)
+          await this.hostFor(work).saveSession(work, session)
         } else {
           session.history.push({
             role: 'user',
@@ -322,12 +326,12 @@ export class AgentRuntime {
       if (signals.lifecycle.signal.aborted) throw new RunCancelledError('lifecycle')
 
       await applySteering()
-      await this.host.saveStep?.(work, { id: `progress:${randomUUID()}`, kind: 'runtime.checkpoint',
+      await this.hostFor(work).saveStep(work, { id: `progress:${randomUUID()}`, kind: 'runtime.checkpoint',
         requestVersion: (session.request?.revisions.length ?? 0) + 1, input: { ...budget.snapshot() }, output: '{}', artifacts: [] })
 
       // Dynamic context stays outside conversational history; memory snapshots
       // are recorded separately with the model call for traceability.
-      const liveContext = hop === 0 ? context : await this.host.loadContext(work)
+      const liveContext = hop === 0 ? context : await this.hostFor(work).loadContext(work)
       session.promptContext = this.freezePromptContext(liveContext.promptContextCandidate ?? session.promptContext!, session.compactionEpoch, liveContext)
       const preferenceItems = compileContext(session.promptContext.blocks ?? []).items
       const dynamicItems = [...preferenceItems, ...this.policy.dynamicContextItems(liveContext)]
@@ -349,7 +353,7 @@ export class AgentRuntime {
       }
       const compacted = await compactIfNeeded(session, instructions, model, this.compaction, signals.lifecycle.signal, overheadTokens)
       if (compacted.compacted) {
-        await this.host.saveSession(work, session)
+        await this.hostFor(work).saveSession(work, session)
         await this.event(work, runId, {
           kind: 'session.compacted', stage: 'completed', visibility: 'internal',
           data: { epoch: session.compactionEpoch, ...(compacted.usage ? { usage: compacted.usage } : {}) },
@@ -434,7 +438,7 @@ export class AgentRuntime {
           await this.event(work, runId, { kind: 'response.withheld', stage: 'failed', visibility: 'internal',
             data: { violation: errorMessage(error), candidateType: 'final_json' } })
           session.history.push(...turn.output)
-          await this.host.saveSession(work, session)
+          await this.hostFor(work).saveSession(work, session)
           if (!budget.consume('response_protocol', errorMessage(error))) {
             contentCheckExhausted = true
             acceptanceGaps.push('Final assessment protocol correction exhausted: ' + errorMessage(error))
@@ -473,7 +477,7 @@ export class AgentRuntime {
           } catch { /* Invalid citations or envelope fields are not a deliverable candidate. */ }
         }
         session.history.push(...turn.output)
-        await this.host.saveSession(work, session)
+        await this.hostFor(work).saveSession(work, session)
         await this.event(work, runId, { kind: 'response.withheld', stage: 'failed', visibility: 'internal',
           data: { violation: 'A partial candidate was returned while execution budget remains', gaps: assessment.gaps } })
         protocolCorrection = { role: 'user', content: 'Your candidate still has unfinished requirements and execution budget remains. '
@@ -492,8 +496,8 @@ export class AgentRuntime {
         let fileObservations: import('../outcome/verification.js').VerificationRecord[] = []
         let needsContentCheck = Boolean(session.request && requiresReview(session.request, executedSteps, liveContext.tools ?? [], artifacts) || liveContext.dependencies?.length || artifacts.length || session.request?.contract || session.request?.resourceChecks?.some(record =>
           (record.result.value as Record<string, unknown> | undefined)?.['requestVersion'] === session.request!.revisions.length + 1))
-        if (!violation && this.host.verifyCandidate) {
-          const checked = await this.host.verifyCandidate(work, { body: turn.text.trim(), artifacts,
+        if (!violation) {
+          const checked = await this.hostFor(work).verifyCandidate(work, { body: turn.text.trim(), artifacts,
             requestVersion: (session.request?.revisions.length ?? 0) + 1 })
           fileObservations = checked.records
           needsContentCheck ||= checked.records.length > 0
@@ -506,7 +510,7 @@ export class AgentRuntime {
         }
         if (!violation && session.request?.resourceChecks?.length) {
           const refresh = await refreshResourceChecks(this.host, work, session.request, hop, signals.lifecycle.signal)
-          await this.host.saveSession(work, session)
+          await this.hostFor(work).saveSession(work, session)
           await signals.refresh()
           if (signals.leaseLost()) throw signals.leaseLost()!
           if (signals.lifecycle.signal.aborted) throw new RunCancelledError('lifecycle')
@@ -517,7 +521,7 @@ export class AgentRuntime {
         }
         if (!violation && session.request) {
           const identity = { runId: work.id, cellId: `completion-inspect:${work.fence}:${hop}`, callIndex: 0 }
-          const result = await this.host.executeAction(work, { ...identity, idempotencyKey: actionKeyOf(identity), action: 'task.inspect', args: {} })
+          const result = await this.hostFor(work).executeAction(work, { ...identity, idempotencyKey: actionKeyOf(identity), action: 'task.inspect', args: {} })
           const value = result.value as { requestVersion?: number; pending?: Array<{ action: string; state: string }>; truncated?: boolean } | undefined
           if (!result.ok || value?.requestVersion !== (session.request?.revisions.length ?? 0) + 1 || !Array.isArray(value.pending)) {
             resourceGaps.push('Durable business action reconciliation was unavailable')
@@ -542,7 +546,7 @@ export class AgentRuntime {
           if (signals.lifecycle.signal.aborted) throw new RunCancelledError('lifecycle')
           if (signals.hasSteer()) continue
           await this.event(work, runId, { kind: 'response.content_checked', stage: 'completed', visibility: 'internal', data: check })
-          await this.host.saveStep?.(work, { id: `review:${randomUUID()}`, kind: 'runtime.review', requestVersion: check.requestVersion,
+          await this.hostFor(work).saveStep(work, { id: `review:${randomUUID()}`, kind: 'runtime.review', requestVersion: check.requestVersion,
             input: { workId: work.id, candidateHash: check.candidateHash }, output: JSON.stringify(check), artifacts: [] })
           contentCheckError = 'error' in check ? check.error : undefined
           acceptanceGaps = [...resourceGaps, ...(contentCheckError ? [contentCheckError] : []),
@@ -601,7 +605,7 @@ export class AgentRuntime {
       for (const call of calls) call.stepId ??= `step:${randomUUID()}`
       executedSteps.push(...calls.map(call => ({ id: call.stepId!, kind: call.name, requestVersion: session.request!.revisions.length + 1, input: {}, artifacts: [] })))
       session.history.push(...turn.output)
-      await this.host.saveSession(work, session)
+      await this.hostFor(work).saveSession(work, session)
       const onlyReads = calls.every(call => liveContext.tools?.some(tool => tool.name === call.name && tool.effect === 'read'))
       let terminal = false
       for (let index = 0; index < calls.length; index += onlyReads ? 4 : 1) {
@@ -634,13 +638,13 @@ export class AgentRuntime {
         }
         if (terminal) return
       }
-      await this.host.saveSession(work, session)
+      await this.hostFor(work).saveSession(work, session)
 
     }
 
     if (finalText && !streamedText) {
       session.history.push({ role: 'assistant', content: finalText })
-      await this.host.saveSession(work, session)
+      await this.hostFor(work).saveSession(work, session)
       await this.event(work, runId, { kind: 'model.delta', stage: 'delta', visibility: 'user',
         data: { delta: finalText, partType: 'text', partIndex: nextStreamPartIndex++, partStart: true } })
       streamedText = finalText
@@ -659,7 +663,7 @@ export class AgentRuntime {
           : 'Execution stopped before verified completion', ...acceptanceGaps],
       }, evidence(), artifacts, session.request?.contract, session.request?.resourceChecks)
       session.history.push({ role: 'assistant', content: finalText })
-      await this.host.saveSession(work, session)
+      await this.hostFor(work).saveSession(work, session)
       await this.event(work, runId, {
         kind: 'model.delta', stage: 'delta', visibility: 'user',
         data: { delta: finalText, partType: 'text', partIndex: nextStreamPartIndex++, partStart: true },
@@ -676,8 +680,8 @@ export class AgentRuntime {
       body: durableText,
       envelope: finalEnvelope,
     }
-    await this.host.saveSession(work, session)
-    await this.host.commitResult(work, message)
+    await this.hostFor(work).saveSession(work, session)
+    await this.hostFor(work).commitResult(work, message)
     log.info('run completed')
   }
 
@@ -745,7 +749,7 @@ export class AgentRuntime {
     const step = { id: cellId, kind: call.name, requestVersion: (session.request?.revisions.length ?? 0) + 1,
       input: { callId: call.callId, ...(call.name === 'ipython' ? { code } : { arguments: call.arguments }) }, artifacts: [] as KernelArtifact[] }
     try {
-      await this.host.saveStep?.(work, step)
+      await this.hostFor(work).saveStep(work, step)
       const hostToolPartIndices = new Map<string, number>()
       const executionOptions: KernelExecutionOptions = {
         capabilities,
@@ -782,29 +786,31 @@ export class AgentRuntime {
       }
       const execution = call.name === 'ipython'
         ? await this.kernels.execute(work, runId, cellId, code, signals.lifecycle.signal, executionOptions)
-        : await this.executeDirect(work, call, executionOptions)
-      if (execution.artifacts.length && this.host.stageArtifact) {
+        : await this.executeDirect(work, call, executionOptions, signals.lifecycle.signal)
+      const artifactHost = this.hostFor(work)
+      if (execution.artifacts.length && artifactHost.stageArtifact) {
         if (!this.kernels.readArtifact) throw new Error('remote artifact transfer is unavailable for this kernel backend')
         for (const artifact of execution.artifacts) {
-          await this.host.stageArtifact(work, artifact, await this.kernels.readArtifact(work, artifact))
+          await artifactHost.stageArtifact(work, artifact, await this.kernels.readArtifact(work, artifact))
         }
       }
+      execution.artifacts.push(...receipts.flatMap(receipt => receipt.result.ok ? receipt.result.artifacts ?? [] : []))
       artifacts.push(...execution.artifacts)
       if (artifacts.length > 512) throw new Error('artifact count exceeds the per-run limit')
       const output = boundedToolOutput({
           stdout: execution.stdout, stderr: execution.stderr, result: execution.result,
           truncated: execution.truncated, artifacts: execution.artifacts, receipts,
         })
-      await this.host.saveStep?.(work, { ...step, output, artifacts: execution.artifacts })
+      await this.hostFor(work).saveStep(work, { ...step, output, artifacts: execution.artifacts })
       const failures = receipts.filter(receipt => !receipt.result.ok && !receipt.result.approval)
       let correction: ModelItem | undefined
       if (failures.length) {
-        const failure = JSON.stringify([call.name, failures.map(receipt => [receipt.action, receipt.result.error])])
-        if (!budget.consume('kernel_error', failure)) throw new ModelBudgetExceededError('Same operation failed three times without new resource or action state')
+        const failure = JSON.stringify(failures.map(receipt => [receipt.action, receipt.result.code ?? receipt.result.executionState ?? 'tool_error']))
+        if (!budget.consume('kernel_error', failure)) throw new ModelBudgetExceededError('Three failed continuations without new resource or action state')
         correction = { role: 'user', content: 'Inspect the recorded failures before proceeding. Reconcile unknown effects; do not repeat them under a new identity.' }
       } else {
         const facts = progressFacts({ artifacts: execution.artifacts, observations: receipts.map(receipt => ({ action: receipt.action, result: receipt.result })) })
-        if (JSON.stringify(facts) !== '{}') budget.observe(JSON.stringify(facts))
+        if (JSON.stringify(facts) !== '{}') budget.observe(facts)
       }
       session.history.push({ type: 'function_call_output', callId: call.callId, output })
       await this.event(work, runId, {
@@ -827,28 +833,30 @@ export class AgentRuntime {
         session.request.contract = createTaskContract(session.request.originalText, session.request.revisions.length + 1, {
           deliverables: draft['deliverables'], constraints: draft['constraints'], actions: draft['actions'], acceptance: draft['acceptance'],
         })
-        await this.host.saveSession(work, session)
+        await this.hostFor(work).saveSession(work, session)
       }
       const defer = execution.directives.find((directive) => directive.type === 'defer')
       if (defer) {
         const goalOutcome: GoalOutcome = {
-          status: defer.reason === 'user' ? 'awaiting_input' : 'blocked', verification: 'not_run',
+          ...(defer.reason === 'child' && typeof defer.data?.['taskRef'] === 'string' ? { status: 'delegated' as const, taskRef: defer.data['taskRef'] }
+            : { status: defer.reason === 'user' ? 'awaiting_input' as const : 'blocked' as const }), verification: 'not_run',
           ...(defer.reason === 'user' && typeof defer.data?.['question'] === 'string' ? { question: defer.data['question'] } : {}),
           requestVersion: (session.request?.revisions.length ?? 0) + 1,
-          ...(defer.reason === 'user' ? {} : { gaps: ['Deferred action has no verified resumable task reference'] }),
+          ...(['user','child'].includes(defer.reason ?? '') ? {} : { gaps: ['Deferred action has no verified resumable task reference'] }),
         }
-        await this.host.saveSession(work, session)
+        await this.hostFor(work).saveSession(work, session)
         await this.event(work, runId, {
           kind: 'goal.waiting', stage: 'completed', visibility: 'user',
           data: { goalOutcome },
         })
-        await this.host.completeWork(work, { status: 'completed', goalOutcome })
+        if (goalOutcome.status === 'blocked') await this.hostFor(work).completeWork(work, { status: 'completed', goalOutcome })
+        else await this.hostFor(work).waitWork(work, goalOutcome as import('../protocol/outcome.js').WaitingOutcome)
         return { nextStreamPartIndex, terminal: true }
       }
       return { nextStreamPartIndex, terminal: false, ...(correction ? { correction } : {}) }
     } catch (error) {
       if (error instanceof ApprovalPendingError || error instanceof KernelTimeoutError || error instanceof KernelExecutionError) {
-        await this.host.saveStep?.(work, { ...step, output: boundedToolOutput({ error: errorMessage(error), receipts,
+        await this.hostFor(work).saveStep(work, { ...step, output: boundedToolOutput({ error: errorMessage(error), receipts,
           ...(error instanceof ApprovalPendingError ? { approvalPending: error.approvalId } : {}) }) })
       }
       if (error instanceof ApprovalPendingError) {
@@ -864,8 +872,8 @@ export class AgentRuntime {
           type: 'function_call_output', callId: call.callId,
           output: boundedToolOutput({ approvalPending: error.approvalId, receipts }),
         })
-        await this.host.saveSession(work, session)
-        await this.host.completeWork(work, { status: 'completed', goalOutcome })
+        await this.hostFor(work).saveSession(work, session)
+        await this.hostFor(work).waitWork(work, goalOutcome)
         return { nextStreamPartIndex, terminal: true }
       }
       if (error instanceof KernelTimeoutError) {
@@ -899,13 +907,14 @@ export class AgentRuntime {
     }
   }
 
-  private async executeDirect(work: WorkItem, call: Extract<ModelItem, { type: 'function_call' }>, options: KernelExecutionOptions): Promise<import('../protocol/types.js').KernelExecution> {
+  private async executeDirect(work: WorkItem, call: Extract<ModelItem, { type: 'function_call' }>, options: KernelExecutionOptions, signal: AbortSignal): Promise<import('../protocol/types.js').KernelExecution> {
     const identity = { runId: work.id, cellId: call.stepId!, callIndex: 0 }
     const action = { ...identity, idempotencyKey: actionKeyOf(identity), action: call.name.replace('__', '.'),
       args: JSON.parse(call.arguments) as Record<string, unknown> }
     const started = Date.now()
     await options.onHostAction?.({ stage: 'started', action })
-    const result = await this.host.executeAction(work, action)
+    const bounded = AbortSignal.any([signal, AbortSignal.timeout(30_000)])
+    const result = await abortable(this.hostFor(work).executeAction(work, action, bounded), bounded)
     await options.onHostAction?.({ stage: 'completed', action, result })
     if (result.approval) throw new ApprovalPendingError(result.approval.id, identity.cellId)
     return { executionId: identity.cellId, stdout: '', stderr: '', result, durationMs: Date.now() - started,
@@ -918,7 +927,7 @@ export class AgentRuntime {
 
   private async restoreSession(work: WorkItem, context: TurnContext): Promise<SessionRecord> {
     const key = sessionKeyOf(work)
-    const stored = await this.host.loadSession(work, key)
+    const stored = await this.hostFor(work).loadSession(work, key)
     if (stored && (stored.key !== key || stored.tenantId !== work.tenantId || stored.agentId !== work.agentId
       || stored.sessionId !== work.sessionId || stored.threadId !== work.threadId)) {
       throw new Error('stored session identity does not match the work')
@@ -941,8 +950,9 @@ export class AgentRuntime {
       if ('type' in item && item.type === 'function_call_output') pendingCalls.delete(item.callId)
     }
     for (const [callId, call] of pendingCalls) {
-      const step = await this.host.recoverStep?.(work, call.stepId ?? callId)
+      const step = await this.hostFor(work).recoverStep(work, call.stepId ?? callId)
       if (step) {
+        context.priorArtifacts = [...context.priorArtifacts ?? [], ...step.artifacts]
         session.history.push({ type: 'function_call_output', callId, output: step.output })
         const journal = JSON.parse(step.output) as { receipts?: Array<{ action: string; idempotencyKey: string; result: HostActionResult }> }
         for (const receipt of journal.receipts ?? []) {
@@ -960,8 +970,16 @@ export class AgentRuntime {
         }
         continue
       }
-      const receipts = await this.host.recoverCell?.(work, call.stepId ?? callId)
+      let receipts = await this.hostFor(work).recoverCell(work, call.stepId ?? callId)
+      const tool = context.tools?.find(tool => tool.name === call.name)
+      if (!receipts?.length && tool && ['read', 'transaction', 'idempotent'].includes(tool.effect)) {
+        const identity = { runId: work.id, cellId: call.stepId ?? callId, callIndex: 0 }
+        const key = actionKeyOf(identity)
+        receipts = [{ action: tool.action, idempotencyKey: key, result: await this.hostFor(work).executeAction(work,
+          { ...identity, idempotencyKey: key, action: tool.action, args: JSON.parse(call.arguments) as Record<string, unknown> }) }]
+      }
       if (!receipts?.length) throw new Error('unresolved tool execution checkpoint; reconcile before continuing')
+      context.priorArtifacts = [...context.priorArtifacts ?? [], ...receipts.flatMap(({ result }) => result.ok ? result.artifacts ?? [] : [])]
       if (receipts.some(({ result }) => result.executionState === 'unknown')
         && receipts.some(({ result }) => result.directive?.type === 'defer')) {
         throw new Error('cell continued after a terminal action with an unknown outcome; reconcile before continuing')
@@ -1034,7 +1052,7 @@ export class AgentRuntime {
     const log = this.logger.child({ runId })
     if (signals.preemptRequested()) {
       if (session) {
-        await this.host.saveSession(work, session).catch((saveError: unknown) => {
+        await this.hostFor(work).saveSession(work, session).catch((saveError: unknown) => {
           log.error('preemption session save failed', { error: saveError })
         })
       }
@@ -1043,7 +1061,7 @@ export class AgentRuntime {
       }).catch((eventError: unknown) => {
         log.error('preemption event failed', { error: eventError })
       })
-      await this.host.yieldWork(work)
+      await this.hostFor(work).yieldWork(work)
       return
     }
     const leaseLost = signals.leaseLost()
@@ -1066,7 +1084,7 @@ export class AgentRuntime {
     }).catch((eventError: unknown) => {
       log.error('terminal event emission failed', { error: eventError })
     })
-    await this.host.completeWork(work, { status: error instanceof ModelBudgetExceededError ? 'completed' : status, error: errorMessage(error), goalOutcome: {
+    await this.hostFor(work).completeWork(work, { status: error instanceof ModelBudgetExceededError ? 'completed' : status, error: errorMessage(error), goalOutcome: {
       status: 'blocked', verification: 'inconclusive', requestVersion: (session?.request?.revisions.length ?? 0) + 1,
       gaps: [cancelled ? 'Execution was cancelled' : 'Execution failed before verified delivery'],
     } }).catch((completeError: unknown) => {

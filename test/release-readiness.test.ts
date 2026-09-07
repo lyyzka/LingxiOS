@@ -1,3 +1,4 @@
+import { durableProtocol } from './protocol-fixture.js'
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { readFile } from 'node:fs/promises'
@@ -8,35 +9,35 @@ import { AgentRuntime } from '../src/runtime/runtime.js'
 import type { HostPort } from '../src/host/port.js'
 import type { WorkCompletion, WorkItem } from '../src/protocol/types.js'
 
-test('fresh schema checks reject missing lecture tables and removed constraints', async () => {
+test('fresh schema checks reject missing execution tables and removed constraints', async () => {
   const db = new PGlite()
   const database = { async query(sql: string, values?: unknown[]) { const result = await db.query(sql, values); return { rows: result.rows as Record<string, unknown>[], rowCount: result.affectedRows ?? result.rows.length } } }
   try {
     await db.exec(await readFile(new URL('../../db/schema.sql', import.meta.url), 'utf8'))
     await checkStorage(database)
-    await db.exec('ALTER TABLE lingxios.lecture_decks DROP CONSTRAINT lecture_decks_status_check')
+    await db.exec('ALTER TABLE lingxios.agent_work_items DROP CONSTRAINT agent_work_items_status_check')
     await assert.rejects(checkStorage(database), /required constraint is missing/)
-    await db.exec('DROP TABLE lingxios.lecture_checkpoints')
-    await assert.rejects(checkStorage(database), /lecture_checkpoints/)
+    await db.exec('DROP TABLE lingxios.agent_steps')
+    await assert.rejects(checkStorage(database), /agent_steps/)
   } finally { await db.close() }
 })
 
 test('claims filter unsupported work and bind retries to the normalized type set', async () => {
   const store = new MemoryWorkStore()
   const common = { tenantId: 't', principalId: 'p', agentId: 'a', lane: 'interactive' as const, triggerRef: 'm' }
-  await store.enqueue({ ...common, id: 'lecture', sessionId: 'deck', kind: 'lecture_deck' })
+  await store.enqueue({ ...common, id: 'custom', sessionId: 'custom', kind: 'custom_job' })
   await store.enqueue({ ...common, id: 'turn', sessionId: 'chat', kind: 'turn' })
   const work = await store.claim('worker', 'request1', ['resume','turn'])
   assert.equal(work?.id, 'turn')
   assert.deepEqual(await store.claim('worker', 'request1', ['turn','resume','turn']), work)
-  await assert.rejects(store.claim('worker', 'request1', ['lecture_deck']), /task types changed/)
+  await assert.rejects(store.claim('worker', 'request1', ['custom_job']), /task types changed/)
   assert.equal(await store.claim('worker', undefined, ['turn']), null)
 })
 
 test('processor structured and compaction calls share durable budgets across attempts without an observer', async () => {
   const budgets = new MemoryModelBudgetStore(), completions: WorkCompletion[] = []
   const work: WorkItem = { id: 'w', tenantId: 't', principalId: 'p', agentId: 'a', sessionId: 's', kind: 'test_processor', lane: 'background', triggerRef: 'm', fence: 1, homeEpoch: 1, leaseToken: 'token' }
-  const host: HostPort = {
+  const host: HostPort = { ...durableProtocol(),
     claimWork: async () => null, heartbeat: async () => ({ ok: true }), loadContext: async () => { throw new Error('unused') },
     executeAction: async () => ({ ok: true }), loadSession: async () => null, saveSession: async () => {}, emitEvent: async () => {},
     commitResult: async () => {}, completeWork: async (_work, value) => { completions.push(value) }, yieldWork: async () => {},

@@ -13,7 +13,6 @@ import { createLingxiOS, packageResources } from 'lingxios'
 
 const connectionString = process.env.LINGXIOS_WORKER_TEST_DATABASE_URL
 assert.ok(connectionString, 'configure a fresh disposable PostgreSQL database for worker recovery')
-const source = resolve(process.env.LINGXILOOP_SOURCE ?? fileURLToPath(new URL('../../LingxiLoop/server/src', import.meta.url)))
 const pool = new Pool({ connectionString, max: 4, connectionTimeoutMillis: 5000 })
 const directory = await mkdtemp(join(tmpdir(), 'lingxios-worker-recovery-'))
 const homesRoot = join(directory, 'homes')
@@ -78,7 +77,7 @@ try {
   assert.equal((await pool.query("SELECT 1 FROM pg_namespace WHERE nspname='lingxios'")).rows.length, 0, 'use a fresh disposable database')
   assert.equal((await pool.query("SELECT 1 FROM pg_tables WHERE schemaname NOT IN ('pg_catalog','information_schema') LIMIT 1")).rows.length, 0, 'use an empty disposable database')
   await pool.query(await readFile(packageResources().schema, 'utf8'))
-  app = await createLingxiOS({ database: pool, kernel: { homesRoot } })
+  app = await createLingxiOS({ database: pool, homesRoot })
   controlPort = await app.listenControlPlane({ serviceToken: 'recovery-test', port: 0 })
   model.listen(0, '127.0.0.1'); await once(model, 'listening')
   proxy.listen(0, '127.0.0.1'); await once(proxy, 'listening')

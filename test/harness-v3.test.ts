@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { durableProtocol } from './protocol-fixture.js'
 import { it } from 'node:test'
 import { compileContext, observationItems } from '../src/context/compiler.js'
 import { CorrectionBudget, progressFacts } from '../src/runtime/corrections.js'
@@ -34,6 +35,7 @@ it('does not reset repeated failures for timestamps or wording in observations a
   assert.equal(budget.consume('kernel_error', 'write failed'), false)
   budget.observe(JSON.stringify(progressFacts({ revision: 2 })))
   assert.equal(budget.consume('kernel_error', 'write failed'), true)
+  budget.observe(JSON.stringify(progressFacts({ revision: 3 })))
   assert.equal(budget.consume('response_protocol', 'one'), true)
   assert.equal(budget.consume('response_protocol', 'two'), true)
   assert.equal(new CorrectionBudget(budget.snapshot()).consume('response_protocol', 'three'), false)
@@ -44,7 +46,7 @@ async function fixture(original: string, model: ModelDriver, tools?: TurnContext
   const steps: import('../src/control-plane/steps.js').ExecutionStep[] = []
   const context: TurnContext = { work, persona: { name: 'A', role: 'assistant', instructions: 'Default preference.' }, capabilities: [],
     messages: [{ ref: work.triggerRef, authorId: 'u', authorName: 'U', authorKind: 'human', body: original, createdAt: 'now' }], ...(tools ? { tools } : {}) }
-  const host: HostPort = { claimWork: async () => null, heartbeat: async () => ({ ok: true }), loadContext: async () => ({ ...context, executionSteps: steps }),
+  const host: HostPort = { ...durableProtocol(), claimWork: async () => null, heartbeat: async () => ({ ok: true }), loadContext: async () => ({ ...context, executionSteps: steps }),
     loadSession: async () => null, saveSession: async (_work, value) => { session = structuredClone(value) },
     executeAction: async () => ({ ok: true, value: { requestVersion: 1, pending: [], truncated: false } }),
     saveStep: async (_work, step) => { steps.push(structuredClone(step)) }, emitEvent: async () => {},

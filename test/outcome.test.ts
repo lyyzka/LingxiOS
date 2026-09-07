@@ -6,7 +6,10 @@ import { it } from 'node:test'
 import { isGoalOutcome } from '../src/protocol/outcome.js'
 import { parseFinalCandidate } from '../src/outcome/assessment.js'
 import type { RequestSnapshot } from '../src/context/request.js'
-import { consumeAssistantMessage, consumeRunEvent, createRunView } from '../src/ui/index.js'
+import { consumeAssistantMessage as consumeCommitted, consumeRunEvent, createRunView, consumeRunState } from '../src/ui/index.js'
+import { RUN_SEQUENCE_SPAN } from '../src/protocol/constants.js'
+const consumeAssistantMessage = (view: ReturnType<typeof createRunView>, message: AssistantMessage) =>
+  consumeCommitted(view,message,{ resultId: `result:${message.envelope?.requestVersion ?? 1}`, fence: message.envelope?.requestVersion ?? 1 })
 
 it('grounds self-checks without treating model assertions as verification', () => {
   const request: RequestSnapshot = { version: 1, workId: 'w', tenantId: 't', sessionId: 's', authorId: 'u', sourceRef: 'm',
@@ -78,4 +81,33 @@ it('rejects messages without the first-release envelope', () => {
   assert.throws(() => consumeAssistantMessage(createRunView('w'), withoutEnvelope as AssistantMessage), /inconsistent envelope/)
   const envelope = createResponseEnvelope(message.body, { status: 'partial', verification: 'not_run', requestVersion: 1 }, snapshotEvidence('e', []))
   assert.throws(() => consumeAssistantMessage(createRunView('w'), { ...message, envelope } as AssistantMessage), /invalid committed assistant message/)
+})
+
+it('keeps newer attempts and committed results when approval messages or revisions arrive late', () => {
+  const waiting: AssistantMessage = { version: 2, runId: 'w', agentId: 'a', sessionId: 's', body: 'Approval needed',
+    envelope: createResponseEnvelope('Approval needed',{ status: 'awaiting_approval', approvalId: 'approval', requestVersion: 1, verification: 'not_run' },snapshotEvidence('e',[])) }
+  let view = consumeCommitted(createRunView('w'),waiting,{ resultId: 'first', fence: 1 })
+  view = consumeRunEvent(view,{ runId: 'w', seq: RUN_SEQUENCE_SPAN+1, kind: 'run.started', stage: 'started', visibility: 'user', data: {} })
+  assert.equal(view.lifecycle,'leased')
+  assert.equal(view.goalOutcome,null)
+  assert.equal(view.message?.body,'Approval needed')
+  const completed = { ...waiting, body: 'Confirmed', envelope: createResponseEnvelope('Confirmed',
+    { status: 'satisfied', requestVersion: 1, verification: 'passed' },snapshotEvidence('e',[])) }
+  view = consumeCommitted(view,completed,{ resultId: 'second', fence: 2 })
+  assert.equal(consumeCommitted(view,waiting,{ resultId: 'first', fence: 1 }),view)
+  view = consumeRunState(view,{ run: { id: 'w', fence: 2, resultFence: 2, resultId: 'second', status: 'succeeded', kind: 'turn', attempts: 2,
+    requestVersion: 1, createdAt: '', availableAt: '', heartbeatAt: null, lastProgressAt: null, goalOutcome: completed.envelope.goalOutcome, error: null },
+    message: completed, delivery: 'failed' })
+  assert.equal(view.delivery,'failed')
+  assert.equal(view.goalOutcome?.status,'satisfied')
+  const queued = { ...view, lifecycle: 'queued' as const, goalOutcome: null }
+  assert.equal(consumeCommitted(queued,completed,{ resultId: 'second', fence: 2 }),queued)
+  assert.equal(consumeRunState(view,{ run: { id: 'w', fence: 2, resultFence: 1, resultId: 'first', status: 'leased', kind: 'turn', attempts: 2,
+    requestVersion: 1, createdAt: '', availableAt: '', heartbeatAt: null, lastProgressAt: null, goalOutcome: null, error: null },
+    message: waiting, delivery: 'delivered' }),view)
+  const revised = { ...completed, envelope: createResponseEnvelope(completed.body,
+    { status: 'partial', requestVersion: 2, verification: 'inconclusive', gaps: ['Missing edited attachment'] },snapshotEvidence('e',[])) }
+  view = consumeCommitted(view,revised,{ resultId: 'third', fence: 3 })
+  assert.equal(consumeCommitted(view,completed,{ resultId: 'second', fence: 2 }),view)
+  assert.equal(view.lifecycle,'partial')
 })

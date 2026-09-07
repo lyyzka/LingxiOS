@@ -81,7 +81,6 @@ export interface WorkItem {
 export interface WorkCompletion {
   goalOutcome?: import('./outcome.js').GoalOutcome
   status: 'completed' | 'failed' | 'cancelled'
-  resultText?: string
   error?: string
 }
 
@@ -129,8 +128,10 @@ export function actionKeyOf(action: Pick<HostAction, 'runId' | 'cellId' | 'callI
 
 export interface HostActionResult {
   ok: boolean
-  executionState?: 'unknown'
+  executionState?: 'rejected' | 'no_effect' | 'succeeded' | 'awaiting_approval' | 'unknown'
+  code?: string
   value?: unknown
+  artifacts?: KernelArtifact[]
   error?: string
   /** Present when the action suspended into a human approval. */
   approval?: { id: string; status: 'PENDING' }
@@ -162,6 +163,7 @@ export interface ApprovalResolution {
 // ---------------------------------------------------------------------------
 
 export interface KernelArtifact {
+  source?: { ref: string; version: string }
   path: string
   size: number
   mime: string
@@ -304,6 +306,7 @@ export interface SteerInput {
   id: string
   text: string
   createdAt: string
+  author?: { id: string; kind: 'human' | 'agent' }
   attachments?: import('../context/attachments.js').RequestAttachment[]
 }
 

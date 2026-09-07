@@ -1,3 +1,5 @@
+import { MemoryStepStore } from '../src/control-plane/steps.js'
+import { MemoryModelBudgetStore } from '../src/control-plane/memory-store.js'
 import { snapshotEvidence } from '../src/context/evidence.js'
 import assert from 'node:assert/strict'
 import { it } from 'node:test'
@@ -11,12 +13,12 @@ it('reserves before execution, blocks concurrent replay and rejects changed argu
   const wait = new Promise<void>((resolve) => { finish = resolve })
   let started!: () => void
   const executing = new Promise<void>((resolve) => { started = resolve })
-  const service = new ControlPlaneService({
+  const service = new ControlPlaneService({ modelBudgets: new MemoryModelBudgetStore(), steps: new MemoryStepStore(),
     work: new MemoryWorkStore(), sessions: new MemorySessionStore(), events: new MemoryEventStore(), actions,
     contextProvider: { loadContext: async () => ({ persona: { name: '', role: '', instructions: '' }, capabilities: [], messages: [] }) },
     capabilityResolver: { resolve: async () => [{ name: 'files', methods: ['save'] }] },
     delivery: { onEvent: async () => {}, deliverMessage: async () => {} },
-    actionExecutor: { execute: async () => { calls++; started(); await wait; return { ok: true, value: 'saved' } } },
+    actionExecutor: { prepare: async () => {}, execute: async () => { calls++; started(); await wait; return { ok: true, value: 'saved' } } },
   })
   await service.enqueue({ id: 'w', tenantId: 't', agentId: 'a', sessionId: 's', principalId: 'u', kind: 'turn', lane: 'interactive', triggerRef: 'm' })
   const work = (await service.claim('worker'))!
@@ -51,10 +53,10 @@ it('does not overwrite intent or replay a receipt without an intent', async () =
   assert.deepEqual(await ledger.find('intent'), resolution.result)
   assert.deepEqual(await ledger.unsettled('w'), [])
   await assert.rejects(ledger.recordResolution({ ...resolution, evidence: { source: 'changed' } }), /identity reused/)
-  const service = new ControlPlaneService({
+  const service = new ControlPlaneService({ modelBudgets: new MemoryModelBudgetStore(), steps: new MemoryStepStore(),
     work: new MemoryWorkStore(), sessions: new MemorySessionStore(), events: new MemoryEventStore(), actions: ledger,
     contextProvider: { loadContext: async () => ({ persona: { name: '', role: '', instructions: '' }, capabilities: [], messages: [] }) },
-    capabilityResolver: { resolve: async () => [] }, actionExecutor: { execute: async () => ({ ok: true }) },
+    capabilityResolver: { resolve: async () => [] }, actionExecutor: { prepare: async () => {}, execute: async () => ({ ok: true }) },
     delivery: { onEvent: async () => {}, deliverMessage: async () => {} },
   })
   await assert.rejects(service.resolveAction({ ...resolution, id: 'resolution-2' }, {
@@ -77,12 +79,12 @@ it('does not treat a changed request or principal as a duplicate enqueue', async
 it('rejects actions from a stale request before reserving or executing them', async () => {
   const actions = new MemoryActionLedger()
   let calls = 0
-  const service = new ControlPlaneService({
+  const service = new ControlPlaneService({ modelBudgets: new MemoryModelBudgetStore(), steps: new MemoryStepStore(),
     work: new MemoryWorkStore(), sessions: new MemorySessionStore(), events: new MemoryEventStore(), actions,
     contextProvider: { loadContext: async () => ({ persona: { name: '', role: '', instructions: '' }, capabilities: [], messages: [] }) },
     capabilityResolver: { resolve: async () => [{ name: 'files' }] },
     delivery: { onEvent: async () => {}, deliverMessage: async () => {} },
-    actionExecutor: { execute: async () => { calls++; return { ok: true } } },
+    actionExecutor: { prepare: async () => {}, execute: async () => { calls++; return { ok: true } } },
   })
   await service.enqueue({ id: 'w', tenantId: 't', agentId: 'a', sessionId: 's', principalId: 'u', kind: 'turn', lane: 'interactive', triggerRef: 'm', meta: { text: 'Save' } })
   const work = (await service.claim('worker'))!

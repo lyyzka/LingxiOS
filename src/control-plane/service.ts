@@ -1,5 +1,7 @@
 import { candidateHash, type Candidate, type CandidateVerification } from '../outcome/verification.js'
-import { grantedTools, TASK_TOOLS, type ToolDefinition } from '../tools/catalog.js'
+import { grantedTools, TASK_TOOLS, parseTaskArgs, type ToolDefinition } from '../tools/catalog.js'
+import { NoEffectError } from '../tools/definition.js'
+import { modelPricing } from '../model/execution.js'
 import { appendResearchEvidence } from '../context/research-evidence.js'
 import { appendResourceCheck } from '../context/resource-checks.js'
 import { createTaskContract } from '../context/task-contract.js'
@@ -33,7 +35,7 @@ import type {
   RunEvent, SessionRecord, TurnContext, WorkCompletion, WorkItem,
 } from '../protocol/types.js'
 import { sessionKeyOf, actionKeyOf } from '../protocol/types.js'
-import { isGoalOutcome, type GoalOutcome } from '../protocol/outcome.js'
+import { isGoalOutcome, isWaitingOutcome, type GoalOutcome, type WaitingOutcome } from '../protocol/outcome.js'
 import type {
   ActionExecutor, ActionLedgerStore, ActionResolution, ArtifactStager, CapabilityResolver, ContextProvider,
   DeliveryPort, EventStore, ModelBudgetLimits, ModelBudgetStore, SessionStore, WorkStore,
@@ -44,13 +46,12 @@ export interface ControlPlaneDeps {
   modelBudget?: Required<import('../model/execution.js').RootModelBudgetOptions>
   verifyCandidate?: (work: Omit<WorkItem, 'leaseToken'>, candidate: Candidate) => Promise<CandidateVerification>
   tools?: readonly ToolDefinition[]
-  steps?: import('./steps.js').StepStore
-  lecture?: (work: WorkItem, command: import('../lecture-deck/transport.js').LectureCommand) => Promise<unknown>
+  steps: import('./steps.js').StepStore
   work: WorkStore
   sessions: SessionStore
   events: EventStore
   actions: ActionLedgerStore
-  modelBudgets?: ModelBudgetStore
+  modelBudgets: ModelBudgetStore
   contextProvider: ContextProvider
   actionExecutor: ActionExecutor
   capabilityResolver: CapabilityResolver
@@ -103,7 +104,8 @@ export class ControlPlaneService {
     candidate = { ...candidate, artifacts: snapshotArtifacts(candidate.artifacts) }
     const session = await this.getSession(proof, sessionKeyOf(work))
     if (!session?.request || session.request.workId !== work.id || candidate.requestVersion !== session.request.revisions.length + 1) throw new ControlPlaneError(409, 'candidate request version is stale')
-    const facts = snapshotArtifacts((await this.deps.steps?.list(work.id) ?? []).flatMap(step => step.artifacts))
+    const facts = snapshotArtifacts([...(await this.deps.steps.list(work.id)).flatMap(step => step.artifacts),
+      ...await this.deps.actions.artifacts(work.id)])
     if (candidate.artifacts.some(artifact => !facts.some(fact => isDeepStrictEqual(fact, artifact)))) throw new ControlPlaneError(409, 'candidate artifact has no execution record')
     if (!this.deps.verifyCandidate) return { requestVersion: candidate.requestVersion, candidateHash: candidateHash(candidate),
       records: [{ checker: 'availability', status: 'inconclusive', evidence: { reason: 'No authoritative checker is configured' } }] }
@@ -112,7 +114,6 @@ export class ControlPlaneService {
 
   async saveStep(proof: LeaseProof, step: import('./steps.js').ExecutionStep): Promise<void> {
     const work = await this.requireLease(proof, { rejectCancelled: true })
-    if (!this.deps.steps) throw new ControlPlaneError(501, 'durable steps are unavailable')
     if (!step || typeof step.id !== 'string' || !step.id || step.id.length > 512
       || !Number.isSafeInteger(step.requestVersion) || step.requestVersion < 1 || typeof step.kind !== 'string'
       || !step.input || typeof step.input !== 'object' || Array.isArray(step.input)
@@ -133,15 +134,8 @@ export class ControlPlaneService {
     this.logger = deps.logger ?? nullLogger
   }
 
-  async lecture(proof: LeaseProof, command: import('../lecture-deck/transport.js').LectureCommand): Promise<unknown> {
-    const work = await this.requireLease(proof, { rejectCancelled: true })
-    if (!this.deps.lecture) throw new ControlPlaneError(501, 'lecture capability is not configured')
-    return this.deps.lecture({ ...work, leaseToken: proof.leaseToken }, command)
-  }
-
   async reserveModelCall(proof: LeaseProof, callId: string, limits: ModelBudgetLimits) {
     const work = await this.requireLease(proof, { rejectCancelled: true })
-    if (!this.deps.modelBudgets) throw new ControlPlaneError(501, 'durable model budgets are unavailable')
     const rootWorkId = typeof work.meta?.['rootWorkId'] === 'string' ? work.meta['rootWorkId'] : work.id
     if (!await this.deps.work.ownsBudgetRoot(work, rootWorkId)) throw new ControlPlaneError(409, 'model budget root is outside this work lineage')
     if (!callId || callId.length > 256 || !Number.isSafeInteger(limits?.maxModelCalls) || limits.maxModelCalls < 1
@@ -156,6 +150,7 @@ export class ControlPlaneService {
       if (![input, output].every(value => Number.isSafeInteger(value) && Number(value) >= 0)
         || input! + output! !== limits.reservedTokens) throw new ControlPlaneError(400, 'reservation requires input and output token bounds')
       limits = { ...limits, maxModelCalls: Math.min(limits.maxModelCalls, policy.maxModelCalls),
+        pricing: modelPricing(policy),
         maxTokens: Math.min(limits.maxTokens, policy.maxTokens), maxCostMicros: Math.min(limits.maxCostMicros, policy.maxCostMicros),
         maxExecutionMs: Math.min(limits.maxExecutionMs ?? policy.wallClockMs, policy.wallClockMs),
         reservedCostMicros: Math.ceil((input! * policy.inputCostMicrosPerMillion + output! * policy.outputCostMicrosPerMillion) / 1_000_000) }
@@ -165,8 +160,7 @@ export class ControlPlaneService {
   }
 
   async recordModelUsage(proof: LeaseProof, callId: string, usage: { inputTokens: number; outputTokens: number; costMicros: number }, observation?: import('../model/execution.js').ModelCallObservation): Promise<void> {
-    const work = await this.deps.work.getAttempt?.(proof.id, proof.fence, hashToken(proof.leaseToken)) ?? await this.requireLease(proof)
-    if (!this.deps.modelBudgets) throw new ControlPlaneError(501, 'durable model budgets are unavailable')
+    const work = await this.deps.work.getAttempt(proof.id, proof.fence, hashToken(proof.leaseToken)) ?? await this.requireLease(proof)
     const rootWorkId = typeof work.meta?.['rootWorkId'] === 'string' ? work.meta['rootWorkId'] : work.id
     if (!await this.deps.work.ownsBudgetRoot(work, rootWorkId)) throw new ControlPlaneError(409, 'model budget root is outside this work lineage')
     if (!callId || callId.length > 256 || [usage?.inputTokens, usage?.outputTokens, usage?.costMicros]
@@ -209,6 +203,39 @@ export class ControlPlaneService {
     return this.deps.actions.recordResolution(structuredClone(resolution))
   }
 
+  private async reconcileNative(work: Omit<WorkItem, 'leaseToken'>, action: HostAction,
+    options: import('./stores.js').ActionExecutionOptions): Promise<HostActionResult | null> {
+    let result: HostActionResult | null | undefined
+    try { result = await this.deps.actionExecutor.reconcile?.(work, action, options) }
+    catch (error) {
+      this.logger.warn('action reconciliation unavailable', { runId: work.id, attempt: work.fence, actionKey: action.idempotencyKey,
+        requestVersion: options.requestVersion, action: action.action, error: errorMessage(error) })
+      this.deps.metrics?.counter('agentos_action_recovery_total', 'Actions settled by native readback').inc({ outcome: 'unavailable' })
+      return null
+    }
+    if (!result || result.approval || result.executionState === 'unknown' || !result.ok && result.executionState !== 'no_effect') return null
+    result = { ...result, executionState: result.ok ? 'succeeded' : 'no_effect' }
+    await this.deps.actions.recordResolution({ id: 'native:' + createHash('sha256').update(JSON.stringify([action.idempotencyKey,result])).digest('hex'),
+      actionKey: action.idempotencyKey, result, resolvedBy: `native:${action.action}`,
+      evidence: { source: 'native_reconciliation', action: action.action } })
+    this.deps.metrics?.counter('agentos_action_recovery_total', 'Actions settled by native readback').inc({ outcome: result.ok ? 'succeeded' : 'no_effect' })
+    return result
+  }
+
+  /** Read back uncertain effects under the newly issued lease before restoring the session. */
+  async reconcilePending(proof: LeaseProof) {
+    const work = await this.requireLease(proof, { rejectCancelled: true })
+    const unresolved = await this.deps.actions.unsettled(work.id)
+    if (unresolved.length > 64) throw new ControlPlaneError(409, 'action reconciliation exceeds 64 pending effects')
+    const signal = AbortSignal.timeout(10_000), deadlineAt = new Date(Date.now() + 10_000).toISOString()
+    for (const pending of unresolved) {
+      if (pending.state !== 'unknown') continue
+      const intent = await this.deps.actions.findIntent(pending.actionKey)
+      if (!intent || intent.workId !== work.id) continue
+      await this.reconcileNative(work, intent.action, { requestVersion: intent.requestVersion, signal, deadlineAt })
+    }
+  }
+
   // -------------------------------------------------------------------------
   // Work lifecycle
   // -------------------------------------------------------------------------
@@ -238,6 +265,8 @@ export class ControlPlaneService {
     const work = await this.deps.work.claim(workerId, requestId, workKinds)
     if (work) {
       this.deps.metrics?.counter('agentos_work_claimed_total', 'Work items claimed').inc({ lane: work.lane })
+      if (work.availableAt) this.deps.metrics?.histogram('agentos_queue_wait_seconds', 'Eligible queue wait at claim', [1,5,15,60,120,300,900])
+        .observe(Math.max(0,(Date.now()-Date.parse(work.availableAt))/1000), { lane: work.lane })
     }
     return work
   }
@@ -274,6 +303,7 @@ export class ControlPlaneService {
   }
 
   async complete(proof: LeaseProof, completion: WorkCompletion): Promise<void> {
+    if (isWaitingOutcome(completion.goalOutcome)) throw new ControlPlaneError(400, 'waiting requires waitWork')
     if (completion.goalOutcome !== undefined && !isGoalOutcome(completion.goalOutcome)) {
       throw new ControlPlaneError(400, 'invalid goal outcome')
     }
@@ -292,10 +322,9 @@ export class ControlPlaneService {
       const version = request?.workId === work.id ? request.revisions.length + 1 : 1
       if (completion.goalOutcome.requestVersion !== version) throw new ControlPlaneError(409, 'goal outcome request version mismatch')
       await this.validateWait(work, completion.goalOutcome)
-      if (completion.goalOutcome.status === 'satisfied' || completion.goalOutcome.status === 'delegated') {
+      if (completion.goalOutcome.status === 'satisfied') {
         const committed = await this.deps.delivery.getMessage?.(work)
-        if (!committed || !isDeepStrictEqual(committed.envelope.goalOutcome, completion.goalOutcome)
-          || committed.body !== completion.resultText) throw new ControlPlaneError(409, 'goal outcome requires the committed assessed response')
+        if (!committed || !isDeepStrictEqual(committed.envelope.goalOutcome, completion.goalOutcome)) throw new ControlPlaneError(409, 'goal outcome requires the committed assessed response')
         if (request) validateCompletion(committed.body, committed.envelope.assessment, request, completion.goalOutcome, [])
       }
     }
@@ -307,10 +336,22 @@ export class ControlPlaneService {
     this.deps.metrics?.counter('agentos_work_completed_total', 'Work attempts finished').inc({ status: completion.status })
   }
 
+  async waitWork(proof: LeaseProof, outcome: WaitingOutcome): Promise<void> {
+    if (!isGoalOutcome(outcome) || !isWaitingOutcome(outcome) || outcome.verification !== 'not_run') throw new ControlPlaneError(400, 'invalid waiting outcome')
+    const work = await this.requireLease(proof, { rejectCancelled: true })
+    const request = (await this.getSession(proof, sessionKeyOf(work)))?.request
+    if (!request || request.workId !== work.id || request.revisions.length + 1 !== outcome.requestVersion) throw new ControlPlaneError(409, 'wait request version mismatch')
+    await this.validateWait(work, outcome)
+    if (!await this.deps.work.wait(proof.id, proof.fence, hashToken(proof.leaseToken), outcome)) throw new ControlPlaneError(409, 'work cannot wait in its current state', 'work_state_conflict')
+    this.deps.metrics?.counter('agentos_work_waiting_total', 'Work released while awaiting an input or child').inc({ reason: outcome.status })
+  }
+
   async requestCancel(id: string): Promise<boolean> { return this.deps.work.requestCancel(id) }
 
   private async validateWait(work: Omit<WorkItem, 'leaseToken'>, outcome: GoalOutcome) {
-    if (outcome.status === 'awaiting_approval') {
+    if (outcome.status === 'delegated') {
+      if (!await this.deps.work.hasChild(work, outcome.taskRef, outcome.requestVersion)) throw new ControlPlaneError(409, 'wait requires a child of this request')
+    } else if (outcome.status === 'awaiting_approval') {
       if (!await this.deps.actions.hasWait(work.id, outcome.requestVersion, { approvalId: outcome.approvalId })) {
         throw new ControlPlaneError(409, 'approval wait requires its current durable pending receipt')
       }
@@ -339,7 +380,7 @@ export class ControlPlaneService {
       context.capabilities = [...new Set([...context.capabilities, 'task'])]
       if (context.promptContextCandidate) context.promptContextCandidate = { ...context.promptContextCandidate, capabilities: context.capabilities }
     }
-    const steps = await this.deps.steps?.list(work.id) ?? []
+    const steps = await this.deps.steps.list(work.id)
     const requestVersion = ((await this.deps.sessions.get(sessionKeyOf(work), work.id))?.request?.revisions.length ?? 0) + 1
     const checkpoint = steps.findLast(step => step.kind === 'runtime.checkpoint' && step.requestVersion === requestVersion)
     const priorArtifacts = new Map<string, KernelArtifact>()
@@ -350,17 +391,18 @@ export class ControlPlaneService {
           if (priorArtifacts.size > 512) throw new ControlPlaneError(409, 'prior artifact inventory exceeds the per-run limit')
         }
       }
+      for (const artifact of snapshotArtifacts(await this.deps.actions.artifacts(work.id))) priorArtifacts.set(artifact.path, artifact)
     }
     const grants = await this.deps.capabilityResolver.resolve(work)
     if (typeof work.meta?.['text'] === 'string' && !grants.some(grant => grant.name === 'task')) grants.push({ name: 'task', methods: TASK_TOOLS.map(tool => tool.action.split('.')[1]!) })
-    return { work: { ...work, leaseToken: proof.leaseToken }, ...context, executionSteps: steps, ...(checkpoint ? { executionCheckpoint: checkpoint.input as unknown as import('../runtime/corrections.js').ProgressCheckpoint } : {}), grants, dependencies: await this.deps.work.children?.(work) ?? [], tools: grantedTools(this.deps.tools ?? TASK_TOOLS, grants), priorArtifacts: [...priorArtifacts.values()] }
+    return { work: { ...work, leaseToken: proof.leaseToken }, ...context, executionSteps: steps, ...(checkpoint ? { executionCheckpoint: checkpoint.input as unknown as import('../runtime/corrections.js').ProgressCheckpoint } : {}), grants, dependencies: await this.deps.work.children(work), tools: grantedTools(this.deps.tools ?? TASK_TOOLS, grants), priorArtifacts: [...priorArtifacts.values()] }
   }
 
   // -------------------------------------------------------------------------
   // Host actions: grant enforcement + idempotency ledger
   // -------------------------------------------------------------------------
 
-  async executeAction(proof: LeaseProof, action: HostAction): Promise<HostActionResult> {
+  async executeAction(proof: LeaseProof, action: HostAction, signal?: AbortSignal): Promise<HostActionResult> {
     const work = await this.requireLease(proof, { rejectCancelled: true })
     if (
       !action || typeof action !== 'object'
@@ -380,13 +422,18 @@ export class ControlPlaneService {
       throw new ControlPlaneError(400, 'host action must be <namespace>.<method>')
     }
 
+    const reject = async (code: string, error: string): Promise<HostActionResult> => {
+      const prior = await this.deps.actions.find(action.idempotencyKey)
+      const result: HostActionResult = { ok: false, executionState: prior?.approval ? 'no_effect' : 'rejected', code, error }
+      return prior?.approval ? this.deps.actions.record(action.idempotencyKey, result) : result
+    }
     // Authoritative capability check. The kernel-side allowlist only shapes
     // what the model can conveniently express; this is the boundary.
     const grants = await this.deps.capabilityResolver.resolve(work)
     const grant = namespace === 'task' && typeof work.meta?.['text'] === 'string' ? grants.find(candidate => candidate.name === 'task') ?? { name: 'task', methods: ['contract', 'ask', 'check_receipt', 'check_resource', 'inspect'] } : grants.find((candidate) => candidate.name === namespace)
     if (!grant || (grant.methods && !grant.methods.includes(method))) {
       this.deps.metrics?.counter('agentos_actions_denied_total', 'Host actions denied by grant').inc({ namespace })
-      return { ok: false, error: `capability denied: ${action.action} is not granted to this work item` }
+      return reject('forbidden', `capability denied: ${action.action} is not granted to this work item`)
     }
     if (action.action === 'task.check_receipt' || action.action === 'task.check_resource') {
       const target = action.args['action']
@@ -398,15 +445,12 @@ export class ControlPlaneService {
       }
     }
 
-    let requestVersion: number | null = null
+    const current = await this.heartbeat(proof)
+    if (!current.ok) throw new ControlPlaneError(409, 'work lease lost before action', 'lease_lost')
+    if (current.cancelRequested) throw new ControlPlaneError(409, 'work is cancelled; no further actions are permitted', 'work_cancelled')
+    let requestVersion = (current.steer?.length ?? 0) + 1
     if (typeof work.meta?.['text'] === 'string') {
       const request = (await this.getSession(proof, sessionKeyOf(work)))?.request
-      const current = await this.heartbeat(proof)
-      if (!current.ok) {
-        await this.requireLease(proof)
-        throw new ControlPlaneError(409, 'work lease lost before action', 'lease_lost')
-      }
-      if (current.cancelRequested) throw new ControlPlaneError(409, 'work is cancelled; no further actions are permitted', 'work_cancelled')
       if (!request || request.workId !== work.id || !isDeepStrictEqual(request.revisions, current.steer ?? [])) {
         return { ok: false, error: 'request snapshot is stale or missing; process the latest user revisions before acting' }
       }
@@ -414,7 +458,17 @@ export class ControlPlaneService {
     }
 
     const tool = (this.deps.tools ?? TASK_TOOLS).find(tool => tool.action === action.action)
-    if (tool && Object.keys(action.args).some(key => !Object.hasOwn(tool.parameters.properties, key))) return { ok: false, error: 'unknown tool argument' }
+    const options = { requestVersion, deadlineAt: new Date(Date.now() + 30_000).toISOString(),
+      signal: AbortSignal.any([AbortSignal.timeout(30_000), ...(signal ? [signal] : [])]) }
+    if (tool && Object.keys(action.args).some(key => !Object.hasOwn(tool.parameters.properties, key))) return { ok: false, executionState: 'rejected', code: 'invalid_arguments', error: 'unknown tool argument' }
+    if (namespace === 'task') {
+      try { parseTaskArgs(action.action, action.args) }
+      catch (error) { return reject('invalid_arguments', errorMessage(error)) }
+    }
+    if (namespace !== 'task') {
+      try { await this.deps.actionExecutor.prepare(work, action, options) }
+      catch (error) { return reject(error instanceof NoEffectError ? error.code : 'invalid_arguments', errorMessage(error)) }
+    }
     if (tool?.effect !== 'read' && namespace !== 'task') {
       const pending = await this.deps.actions.unsettled(work.id)
       if (pending.some(item => item.actionKey !== action.idempotencyKey)) return {
@@ -427,17 +481,26 @@ export class ControlPlaneService {
       sessionId: work.sessionId, threadId: work.threadId ?? null, requestVersion, action: structuredClone(action),
     })
     const replayed = await this.deps.actions.find(action.idempotencyKey)
-    if (replayed) {
+    if (replayed && !replayed.approval) {
       this.deps.metrics?.counter('agentos_actions_replayed_total', 'Host actions served from the ledger').inc({ namespace })
-      return replayed
+      return replayed.executionState === 'unknown' ? await this.reconcileNative(work, action, options) ?? replayed : replayed
     }
-    if (reservation === 'existing') {
-      return { ok: false, executionState: 'unknown', error: 'action intent exists without a receipt; reconcile before retrying' }
+    if (reservation === 'existing' && (!tool || tool.effect === 'uncertain')) {
+      return await this.reconcileNative(work, action, options) ?? { ok: false, executionState: 'unknown', error: 'action intent exists without a receipt; reconcile before retrying' }
     }
     let result: HostActionResult
     try {
       if (action.action === 'task.inspect') {
-        if (Object.keys(action.args).length) throw new Error('task.inspect accepts no arguments')
+        for (const pending of (await this.deps.actions.unsettled(work.id)).slice(0, 64)) {
+          const intent = await this.deps.actions.findIntent(pending.actionKey)
+          const receipt = await this.deps.actions.find(pending.actionKey)
+          const allowed = intent && grants.find(grant => grant.name === intent.action.action.split('.')[0])
+          if (intent && !receipt?.approval && allowed && (!allowed.methods || allowed.methods.includes(intent.action.action.split('.')[1]!))
+            && intent.principalId === (work.principalId ?? null) && intent.tenantId === work.tenantId && intent.sessionId === work.sessionId
+            && intent.agentId === work.agentId && intent.threadId === (work.threadId ?? null)) {
+            await this.reconcileNative(work, intent.action, { ...options, requestVersion: intent.requestVersion })
+          }
+        }
         const pending = await this.deps.actions.unsettled(work.id)
         result = { ok: true, value: { requestVersion, pending: pending.slice(0, 64), truncated: pending.length > 64 } }
       } else if (action.action === 'task.contract') {
@@ -447,17 +510,14 @@ export class ControlPlaneService {
         result = { ok: true, value: { status: 'draft_validated', requestVersion: contract.requestVersion }, directive: { type: 'task_contract', data: { ...contract } } }
       } else if (action.action === 'task.check_receipt') {
         const { idempotencyKey, action: expectedAction, expected } = action.args
-        if (Object.keys(action.args).length !== 3 || typeof idempotencyKey !== 'string' || !idempotencyKey
-          || typeof expectedAction !== 'string' || !expectedAction || expectedAction.startsWith('task.')
-          || expected === undefined) throw new Error('task.check_receipt requires idempotencyKey, a business action and its complete expected value')
-        const intent = await this.deps.actions.findIntent(idempotencyKey)
+        const intent = await this.deps.actions.findIntent(idempotencyKey as string)
         if (!intent || intent.workId !== work.id || intent.tenantId !== work.tenantId
           || intent.principalId !== (work.principalId ?? null) || intent.agentId !== work.agentId
           || intent.sessionId !== work.sessionId || intent.threadId !== (work.threadId ?? null)
           || intent.requestVersion !== requestVersion || intent.action.action !== expectedAction) {
           throw new Error('receipt is unavailable for this request version and action')
         }
-        const receipt = await this.deps.actions.find(idempotencyKey)
+        const receipt = await this.deps.actions.find(idempotencyKey as string)
         const observed = receipt?.ok === true && receipt.executionState !== 'unknown'
           && receipt.directive === undefined && receipt.value !== undefined
         result = { ok: true, value: { scope: 'recorded_action_result', requestVersion, idempotencyKey,
@@ -467,18 +527,9 @@ export class ControlPlaneService {
       } else if (action.action === 'task.check_resource') {
         const { action: readAction, args, expected } = action.args
         if (!this.deps.actionExecutor.readResource) throw new Error('resource readback is unavailable')
-        if (Object.keys(action.args).length !== 3 || typeof readAction !== 'string'
-          || !args || typeof args !== 'object' || Array.isArray(args)
-          || !expected || typeof expected !== 'object' || Array.isArray(expected)) {
-          throw new Error('task.check_resource requires a read action, args and expected fields')
-        }
-        const fields = Object.entries(expected)
-        if (!fields.length || fields.length > 16 || JSON.stringify(expected).length > 16_384
-          || fields.some(([key]) => !key || key.length > 256 || ['__proto__', 'prototype', 'constructor'].includes(key))) {
-          throw new Error('expected must contain 1-16 resource fields within 16384 characters')
-        }
+        const fields = Object.entries(expected as Record<string, unknown>)
         const resource = await this.deps.actionExecutor.readResource(work,
-          { ...action, action: readAction, args: args as Record<string, unknown> })
+          { ...action, action: readAction as string, args: args as Record<string, unknown> }, options)
         const observed = resource && typeof resource === 'object' && !Array.isArray(resource)
           && fields.every(([key]) => Object.hasOwn(resource, key))
           ? Object.fromEntries(fields.map(([key]) => [key, (resource as Record<string, unknown>)[key]])) : undefined
@@ -490,11 +541,11 @@ export class ControlPlaneService {
           limitation: 'Only these fields at observation time were checked. Replaying this receipt does not refresh it; absence does not prove deletion or overall goal completion.' } }
       } else if (action.action === 'task.ask') {
         const question = action.args['question']
-        if (Object.keys(action.args).length !== 1 || typeof question !== 'string' || !question.trim() || question.length > 4_000) throw new Error('task.ask requires one non-empty question of at most 4000 characters')
         result = { ok: true, value: { question }, directive: { type: 'defer', reason: 'user', data: { question } } }
-      } else result = await this.deps.actionExecutor.execute(work, action)
+      } else result = await this.deps.actionExecutor.execute(work, action, options)
     } catch (error) {
-      result = { ok: false, ...(namespace === 'task' || tool?.effect === 'read' ? {} : { executionState: 'unknown' as const }), error: errorMessage(error) }
+      result = { ok: false, executionState: namespace === 'task' || tool?.effect === 'read' || error instanceof NoEffectError ? 'no_effect' : 'unknown',
+        ...(error instanceof NoEffectError ? { code: error.code } : {}), error: errorMessage(error) }
     }
     const recorded = await this.deps.actions.record(action.idempotencyKey, result)
     this.deps.metrics?.counter('agentos_actions_executed_total', 'Host actions executed').inc({
@@ -510,21 +561,26 @@ export class ControlPlaneService {
     if (!cellId || cellId.length > 512) throw new ControlPlaneError(400, 'invalid cellId')
     const request = typeof work.meta?.['text'] === 'string'
       ? (await this.getSession(proof, sessionKeyOf(work)))?.request : undefined
-    const requestVersion = request?.workId === work.id ? request.revisions.length + 1 : null
+    const requestVersion = request?.workId === work.id ? request.revisions.length + 1 : ((await this.heartbeat(proof)).steer?.length ?? 0) + 1
     const records = await this.deps.actions.listCell(work.id, cellId, requestVersion)
     if (!records.length || records.length > 100) return null
-    return records.map(({ intent, result }, index) => {
+    const recovered: Array<{ action: string; idempotencyKey: string; result: HostActionResult }> = []
+    for (const [index, { intent, result }] of records.entries()) {
       if (intent.tenantId !== work.tenantId || intent.principalId !== (work.principalId ?? null)
         || intent.agentId !== work.agentId || intent.sessionId !== work.sessionId
         || intent.threadId !== (work.threadId ?? null) || intent.action.callIndex !== index) {
         throw new ControlPlaneError(409, 'cell action history is inconsistent', 'reconciliation_conflict')
       }
-      return {
+      const tool = (this.deps.tools ?? TASK_TOOLS).find(tool => tool.action === intent.action.action)
+      const safe = tool && ['read', 'transaction', 'idempotent'].includes(tool.effect)
+      recovered.push({
         action: intent.action.action,
         idempotencyKey: intent.action.idempotencyKey,
-        result: result ?? { ok: false, executionState: 'unknown', error: 'action intent has no receipt; reconciliation required' },
-      }
-    })
+        result: result ?? (safe ? await this.executeAction(proof, intent.action)
+          : { ok: false, executionState: 'unknown', error: 'action intent has no receipt; reconciliation required' }),
+      })
+    }
+    return recovered
   }
 
   async recoverStep(proof: LeaseProof, cellId: string): Promise<{ output: string; artifacts: KernelArtifact[] } | null> {
@@ -533,7 +589,7 @@ export class ControlPlaneService {
     const request = (await this.getSession(proof, sessionKeyOf(work)))?.request
     const requestVersion = request?.workId === work.id ? request.revisions.length + 1 : null
     if (requestVersion === null || work.fence <= 1) return null
-    const step = await this.deps.steps?.get(work.id, cellId, requestVersion)
+    const step = await this.deps.steps.get(work.id, cellId, requestVersion)
     return step?.output === undefined ? null : { output: step.output, artifacts: snapshotArtifacts(step.artifacts) }
   }
 
@@ -609,7 +665,7 @@ export class ControlPlaneService {
 
   async commitResult(proof: LeaseProof, message: AssistantMessage): Promise<void> {
     if (!await this.deps.work.getLeased(proof.id, proof.fence, hashToken(proof.leaseToken))) {
-      const issued = await this.deps.work.getAttempt?.(proof.id, proof.fence, hashToken(proof.leaseToken))
+      const issued = await this.deps.work.getAttempt(proof.id, proof.fence, hashToken(proof.leaseToken))
       if (issued) {
         const prior = await this.deps.delivery.getMessage?.(issued)
         if (prior && isDeepStrictEqual(prior, message)) return
@@ -638,7 +694,7 @@ export class ControlPlaneService {
     if (!session?.request?.evidence) throw new ControlPlaneError(409, 'response requires a saved request and evidence snapshot')
     if (session.request.workId !== work.id) throw new ControlPlaneError(409, 'response request belongs to another work item')
     const evidence = session.request.evidence
-    const steps = await this.deps.steps?.list(work.id) ?? []
+    const steps = await this.deps.steps.list(work.id)
     const recordedArtifacts = snapshotArtifacts(steps.flatMap(step => step.artifacts))
     const artifacts = snapshotArtifacts(message.envelope.artifacts)
     if (artifacts.some(artifact => !recordedArtifacts.some(recorded => isDeepStrictEqual(recorded, artifact)))) {
@@ -650,7 +706,7 @@ export class ControlPlaneService {
     const latestRequest = await this.heartbeat(proof)
     if (message.envelope.requestVersion !== (latestRequest.steer?.length ?? 0) + 1) throw new ControlPlaneError(409, 'response request version is stale')
     if (message.envelope.goalOutcome.status === 'delegated'
-      && !await this.deps.work.hasPendingChild(work, message.envelope.goalOutcome.taskRef, message.envelope.requestVersion)) {
+      && !await this.deps.work.hasChild(work, message.envelope.goalOutcome.taskRef, message.envelope.requestVersion)) {
       throw new ControlPlaneError(409, 'delegated task is not pending for this request')
     }
     await this.validateWait(work, message.envelope.goalOutcome)
@@ -659,7 +715,7 @@ export class ControlPlaneService {
       const assessment = message.envelope.assessment
       const gaps: string[] = []
       if (requiresReview(session.request, steps, this.deps.tools ?? TASK_TOOLS, artifacts)
-        || (await this.deps.work.children?.(work) ?? []).length) {
+        || (await this.deps.work.children(work)).length) {
         const hash = candidateHash({ body: message.body, requestVersion: message.envelope.requestVersion, artifacts })
         const review = steps.findLast(step => step.kind === 'runtime.review' && step.requestVersion === message.envelope.requestVersion
           && step.input['workId'] === work.id && step.input['candidateHash'] === hash)
@@ -754,6 +810,15 @@ export class ControlPlaneService {
         })
         if (!isDeepStrictEqual(contract, expected)) throw new Error('contract provenance mismatch')
       } catch { throw new ControlPlaneError(400, 'invalid request task contract') }
+    }
+    if (session.request) {
+      const delegation = work.meta?.['delegation'] as { parentRequest?: import('../context/request.js').RequestSnapshot } | undefined
+      const parent = delegation?.parentRequest
+      if (parent ? session.request.originalText !== parent.originalText
+        || !isDeepStrictEqual(session.request.inheritedRevisions ?? [], [...(parent.inheritedRevisions ?? []), ...parent.revisions])
+        : Boolean(session.request.inheritedRevisions?.length)) {
+        throw new ControlPlaneError(400, 'inherited human requirements differ from the durable delegation')
+      }
     }
     if (session.request) {
       try {

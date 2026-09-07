@@ -84,9 +84,13 @@ it('refuses the process kernel as an implicit production security boundary', asy
   }), /OS-isolated kernel/)
 })
 
-it('rejects an unknown runtime policy deployment', async () => {
-  await assert.rejects(startWorker({
-    AGENT_OS_CONTROL_PLANE_URL: 'http://127.0.0.1:1', AGENT_OS_SERVICE_TOKEN: 'test-token',
-    AGENT_OS_MODEL_API_KEY: 'test-key', AGENT_OS_RUNTIME_POLICY: 'unknown',
-  }), /AGENT_OS_RUNTIME_POLICY/)
+it('bounds shutdown even if a claim ignores cancellation, including repeated stop calls', async () => {
+  const worker = new AgentWorker({ workerId: 'stuck', maxConcurrentRuns: 1, shutdownGraceMs: 10, healthPort: 0,
+    host: { claimWork: async () => new Promise<null>(() => {}) },
+    runtime: { runWork: async () => { assert.fail('no work was claimed') } },
+  })
+  await worker.start()
+  const first = worker.stop()
+  assert.equal(worker.stop(),first)
+  assert.deepEqual(await first,{ timedOut: false })
 })

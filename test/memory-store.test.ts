@@ -14,17 +14,17 @@ function input(overrides: Partial<EnqueueWorkInput> = {}): EnqueueWorkInput {
 }
 
 describe('MemoryWorkStore lease state machine', () => {
-  it('requires live delegation owned by the current parent request', async () => {
+  it('recognizes children of the current request even when they finish before the parent waits', async () => {
     const store = new MemoryWorkStore()
     await store.enqueue(input({ id: 'parent', principalId: 'human' }))
     const parent = (await store.claim('worker'))!
-    await store.enqueue(input({ id: 'child', agentId: 'child-agent', principalId: 'human',
+    await store.enqueue(input({ id: 'child', agentId: 'child-agent', sessionId: 'another-session', principalId: 'human',
       meta: { parentWorkId: parent.id, parentRequestVersion: 1 } }))
-    assert.equal(await store.hasPendingChild(parent, 'child', 1), true)
-    assert.equal(await store.hasPendingChild(parent, 'child', 2), false)
-    assert.equal(await store.hasPendingChild({ ...parent, tenantId: 'other' }, 'child', 1), false)
+    assert.equal(await store.hasChild(parent, 'child', 1), true)
+    assert.equal(await store.hasChild(parent, 'child', 2), false)
+    assert.equal(await store.hasChild({ ...parent, tenantId: 'other' }, 'child', 1), false)
     await store.requestCancel('child')
-    assert.equal(await store.hasPendingChild(parent, 'child', 1), false)
+    assert.equal(await store.hasChild(parent, 'child', 1), true)
   })
   it('rejects a completion outcome superseded by steering at the store boundary', async () => {
     const store = new MemoryWorkStore()
@@ -75,19 +75,14 @@ describe('MemoryWorkStore lease state machine', () => {
     assert.equal(second?.id, 'w-b')
   })
 
-  it('routes a session to one worker and bumps homeEpoch on takeover from a dead worker', async () => {
+  it('allows an idle session to move to another worker and advances its home epoch', async () => {
     const store = new MemoryWorkStore()
     await store.enqueue(input({ id: 'w-a', triggerRef: 'm1' }))
     const first = await store.claim('w1')
     assert.equal(first?.homeEpoch, 1)
     await store.complete('w-a', first!.fence, hashToken(first!.leaseToken), { status: 'completed' })
 
-    // While w1 is alive, w2 must not claim this session's work.
     await store.enqueue(input({ id: 'w-b', triggerRef: 'm2' }))
-    assert.equal(await store.claim('w2'), null)
-
-    // After w1 dies, w2 takes over and the home epoch advances.
-    store.markWorkerDead('w1')
     const takeover = await store.claim('w2')
     assert.equal(takeover?.id, 'w-b')
     assert.equal(takeover?.homeEpoch, 2)

@@ -6,10 +6,16 @@ export type GoalOutcome = {
   gaps?: string[]
   question?: string
 } & (
-  | { status: 'satisfied' | 'partial' | 'awaiting_input' | 'blocked' }
+  | { status: 'satisfied' | 'partial' | 'blocked' }
+  | { status: 'awaiting_input' }
   | { status: 'awaiting_approval'; approvalId: string }
   | { status: 'delegated'; taskRef: string }
 )
+
+export type WaitingOutcome = Extract<GoalOutcome, { status: 'awaiting_input' | 'awaiting_approval' | 'delegated' }>
+export function isWaitingOutcome(outcome: GoalOutcome | undefined): outcome is WaitingOutcome {
+  return !!outcome && ['awaiting_input','awaiting_approval','delegated'].includes(outcome.status)
+}
 
 export function isGoalOutcome(value: unknown): value is GoalOutcome {
   if (!value || typeof value !== 'object') return false

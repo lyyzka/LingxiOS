@@ -16,6 +16,7 @@ import { existsSync } from 'node:fs'
 import { lstat, mkdir, readFile, stat } from 'node:fs/promises'
 import { isAbsolute, relative, resolve } from 'node:path'
 import { createInterface, type Interface as ReadlineInterface } from 'node:readline'
+import { abortable } from '../deadline.js'
 import { fileURLToPath } from 'node:url'
 import { sandboxCommand, checkKernelIsolation, kernelIsolation, type KernelLimits } from './isolation.js'
 import {
@@ -27,7 +28,7 @@ import type { KernelToManager, ManagerToKernel } from '../protocol/kernel-wire.j
 import { sessionKeyOf, actionKeyOf, type CapabilityGrant, type HostAction, type HostActionResult, type KernelExecution, type WorkItem } from '../protocol/types.js'
 
 export interface KernelHostBridge {
-  execute(work: WorkItem, action: HostAction): Promise<HostActionResult>
+  execute(work: WorkItem, action: HostAction, signal?: AbortSignal): Promise<HostActionResult>
 }
 
 export interface HostActionObserver {
@@ -72,6 +73,7 @@ export interface KernelManagerOptions extends Partial<KernelLimits> {
 }
 
 interface PendingExecution {
+  signal: AbortSignal
   executionId: string
   work: WorkItem
   runId: string
@@ -254,19 +256,11 @@ class PersistentKernel {
       return
     }
     let result: HostActionResult
-    let hostTimer: NodeJS.Timeout | undefined
     try {
-      const deadline = new Promise<never>((_resolve, reject) => {
-        hostTimer = setTimeout(() => reject(new Error(
-          `host action exceeded ${this.options.hostActionTimeoutMs}ms; outcome requires reconciliation`,
-        )), this.options.hostActionTimeoutMs)
-        hostTimer.unref?.()
-      })
-      result = await Promise.race([this.bridge.execute(pending.work, action), deadline])
+      const signal = AbortSignal.any([pending.signal, AbortSignal.timeout(this.options.hostActionTimeoutMs)])
+      result = await abortable(this.bridge.execute(pending.work, action, signal), signal)
     } catch (error) {
-      result = { ok: false, executionState: 'unknown', error: asError(error).message }
-    } finally {
-      if (hostTimer) clearTimeout(hostTimer)
+      result = { ok: false, executionState: 'unknown', code: 'transport_unknown', error: `${asError(error).message}; outcome requires reconciliation` }
     }
     try {
       await pending.options?.onHostAction?.({ stage: 'completed', action, result })
@@ -288,9 +282,11 @@ class PersistentKernel {
       await this.startForExecution(signal, cellId)
       this.lastUsedAt = Date.now()
       const executionId = randomUUID()
+      const execution = new AbortController()
       return await new Promise<KernelExecution>((resolveExecution, rejectExecution) => {
         const settle = (settleFn: () => void) => {
           signal?.removeEventListener('abort', onAbort)
+          execution.abort(new KernelCancelledError(cellId))
           settleFn()
         }
         const timer = setTimeout(() => {
@@ -308,6 +304,7 @@ class PersistentKernel {
         if (signal?.aborted) { onAbort(); return }
         signal?.addEventListener('abort', onAbort, { once: true })
         this.pending = {
+          signal: execution.signal,
           executionId, work, runId, cellId,
           ...(options ? { options } : {}),
           timer,

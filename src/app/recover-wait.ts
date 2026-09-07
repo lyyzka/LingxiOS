@@ -27,14 +27,18 @@ export async function recoverWait(database: SqlPool, service: ControlPlaneServic
     ORDER BY (intent.intent->'action'->>'callIndex')::integer LIMIT 101`,
   [work.id, work.tenantId, work.agentId, work.sessionId, work.principalId ?? null, work.threadId ?? null, call.stepId ?? call.callId, requestVersion])
   if (!rows.length) return false
-  if (rows.length > 100 || rows.some(row => !row['result'])) {
+  const continuedAfterWait = rows.some((row, index) => index < rows.length - 1
+    && (row['result'] as HostActionResult | null)?.directive?.type === 'defer')
+  if (rows.length > 100 || continuedAfterWait) {
     const goalOutcome: GoalOutcome = { status: 'blocked', verification: 'inconclusive', requestVersion,
-      gaps: [rows.length > 100 ? 'Action recovery exceeds the bounded receipt limit' : 'An action intent has no receipt; reconciliation is required'] }
+      gaps: [continuedAfterWait ? 'Actions followed a terminal wait; reconcile before continuing' : 'Action recovery exceeds the bounded receipt limit'] }
     await service.recordEvent(work, { runId: work.id, seq: (work.fence - 1) * RUN_SEQUENCE_SPAN + 1,
       kind: 'run.completed', stage: 'completed', visibility: 'user', data: { recovered: true, goalOutcome } })
     await service.complete(work, { status: 'completed', goalOutcome })
     return true
   }
+  // The executor decides whether an interrupted read, transaction or idempotent action can resume.
+  if (rows.some(row => !row['result'])) return false
   const receipts = rows.map(row => ({ action: row['action'] as { action: string; args: Record<string, unknown>; callIndex: number; idempotencyKey: string }, result: row['result'] as HostActionResult }))
   if (receipts.some((receipt, index) => receipt.action.callIndex !== index)) return false
   const last = receipts.at(-1)!
@@ -47,6 +51,18 @@ export async function recoverWait(database: SqlPool, service: ControlPlaneServic
     && last.result.directive.reason === 'user' && typeof question === 'string' && question.trim() && question.length <= 4000
     && last.result.directive.data?.['question'] === question) {
     goalOutcome = { status: 'awaiting_input', verification: 'not_run', requestVersion, question }
+  } else if (last.result.ok && last.result.directive?.type === 'defer' && last.result.directive.reason === 'child'
+    && typeof last.result.directive.data?.['taskRef'] === 'string') {
+    goalOutcome = { status: 'delegated', verification: 'not_run', requestVersion, taskRef: last.result.directive.data['taskRef'] }
+    const child = await database.query(`SELECT status FROM lingxios.agent_work_items WHERE id=$1 AND tenant_id=$2
+      AND principal_id IS NOT DISTINCT FROM $3 AND meta->>'parentWorkId'=$4 AND meta->'parentRequestVersion'=$5::jsonb`,
+    [goalOutcome.taskRef,work.tenantId,work.principalId ?? null,work.id,JSON.stringify(requestVersion)])
+    if (child.rows[0] && !['queued','leased','waiting'].includes(String(child.rows[0]['status']))) {
+      const active = await database.query(`SELECT 1 FROM lingxios.agent_work_items WHERE tenant_id=$1
+        AND principal_id IS NOT DISTINCT FROM $2 AND meta->>'parentWorkId'=$3 AND meta->'parentRequestVersion'=$4::jsonb
+        AND status IN ('queued','leased','waiting') LIMIT 1`, [work.tenantId,work.principalId ?? null,work.id,JSON.stringify(requestVersion)])
+      if (!active.rows.length) return false
+    }
   } else return false
   const callIndex = session.history.lastIndexOf(call)
   if (!session.history.slice(callIndex + 1).some(item => 'type' in item && item.type === 'function_call_output' && item.callId === call.callId)) {
@@ -60,6 +76,6 @@ export async function recoverWait(database: SqlPool, service: ControlPlaneServic
   await service.recordEvent(work, { runId: work.id, seq: (work.fence - 1) * RUN_SEQUENCE_SPAN + 1,
     kind: goalOutcome.status === 'awaiting_approval' ? 'approval.pending' : 'goal.waiting', stage: 'completed', visibility: 'user',
     data: { recovered: true, goalOutcome, ...(goalOutcome.status === 'awaiting_approval' ? { approvalId: goalOutcome.approvalId, cellId: call.callId } : {}) } })
-  await service.complete(work, { status: 'completed', goalOutcome })
+  await service.waitWork(work, goalOutcome as import('../protocol/outcome.js').WaitingOutcome)
   return true
 }

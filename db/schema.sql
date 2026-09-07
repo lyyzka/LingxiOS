@@ -1,4 +1,4 @@
--- LingxiOS Agent OS — control-plane schema (protocol v4)
+-- LingxiOS Agent OS — control-plane schema (protocol v5)
 --
 -- Apply with: psql -f db/schema.sql
 -- All tables are owned by the control plane; workers never touch the database.
@@ -39,7 +39,8 @@ CREATE TABLE lingxios.agent_work_items (
   cancel_requested_at  TIMESTAMPTZ,
   preempt_requested_at TIMESTAMPTZ,
   steer_inputs         JSONB NOT NULL DEFAULT '[]'::jsonb,
-  result_text          TEXT,
+  result_id            TEXT,
+  strategy_snapshot    JSONB,
   goal_outcome         JSONB,
   error                TEXT,
   meta                 JSONB,
@@ -50,6 +51,7 @@ CREATE TABLE lingxios.agent_work_items (
 CREATE INDEX agent_work_items_claim_idx
   ON lingxios.agent_work_items (status, available_at)
   WHERE status IN ('queued','leased');
+CREATE INDEX agent_work_items_created_idx ON lingxios.agent_work_items(created_at DESC,id DESC);
 
 CREATE TABLE lingxios.agent_attempts (
   work_id TEXT NOT NULL REFERENCES lingxios.agent_work_items(id) ON DELETE CASCADE,
@@ -88,6 +90,7 @@ CREATE TABLE lingxios.agent_steps (
   request_version INT NOT NULL CHECK(request_version>0),
   kind TEXT NOT NULL,
   input_hash TEXT NOT NULL,
+  progress_hash TEXT,
   input JSONB NOT NULL,
   output JSONB,
   artifacts JSONB NOT NULL DEFAULT '[]',
@@ -121,12 +124,15 @@ CREATE TABLE lingxios.agent_model_budgets (
 );
 
 CREATE TABLE lingxios.agent_model_budget_calls (
+  pricing JSONB,
   root_work_id TEXT NOT NULL REFERENCES lingxios.agent_model_budgets(root_work_id) ON DELETE CASCADE,
   call_id      TEXT NOT NULL,
   work_id TEXT REFERENCES lingxios.agent_work_items(id),
   fence BIGINT,
   lease_token_hash TEXT,
   observation JSONB,
+  failed_at TIMESTAMPTZ,
+  last_error TEXT,
   delivered_at TIMESTAMPTZ,
   available_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   claim_token TEXT,
@@ -139,33 +145,7 @@ CREATE TABLE lingxios.agent_model_budget_calls (
   PRIMARY KEY (root_work_id, call_id)
 );
 
--- Native professional HTML lecture decks. The record is versioned as one
--- immutable JSON document; checkpoints make long generation resumable.
-CREATE TABLE lingxios.lecture_decks (
-  id           TEXT PRIMARY KEY,
-  tenant_id    TEXT NOT NULL,
-  principal_id TEXT NOT NULL,
-  revision     INT NOT NULL CHECK (revision > 0),
-  status       TEXT NOT NULL CHECK (status IN ('planning','awaiting_outline_approval','generating','validating','publishing','ready','failed','cancelled')),
-  record       JSONB NOT NULL CHECK (jsonb_typeof(record) = 'object'),
-  created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  UNIQUE (tenant_id, id)
-);
-CREATE INDEX lecture_decks_owner_idx ON lingxios.lecture_decks(tenant_id,principal_id,updated_at DESC);
-
-CREATE TABLE lingxios.lecture_checkpoints (
-  deck_id      TEXT NOT NULL REFERENCES lingxios.lecture_decks(id) ON DELETE CASCADE,
-  revision     INT NOT NULL CHECK (revision > 0),
-  stage        TEXT NOT NULL CHECK (stage IN ('plan-course','plan-chapter','author-slide','validate-slide','repair-slide','validate-deck','publish-deck')),
-  stage_key    TEXT NOT NULL,
-  input_hash   TEXT NOT NULL,
-  output_hash  TEXT NOT NULL,
-  attempts     INT NOT NULL DEFAULT 1 CHECK (attempts > 0),
-  result       JSONB NOT NULL,
-  completed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  PRIMARY KEY (deck_id,revision,stage,stage_key)
-);
+CREATE INDEX agent_model_budget_calls_work_idx ON lingxios.agent_model_budget_calls(work_id);
 
 -- A retried claim returns the original answer, including null, instead of
 -- leasing another work item after the first response was lost.
@@ -179,41 +159,6 @@ CREATE TABLE lingxios.agent_claim_requests (
 );
 CREATE INDEX agent_claim_requests_created_idx
   ON lingxios.agent_claim_requests(created_at) WHERE completed=TRUE;
-
--- Package-owned schedules; no dependency on the retired product agent runtime.
-CREATE TABLE lingxios.agent_routines (
-  id TEXT PRIMARY KEY,
-  tenant_id TEXT NOT NULL,
-  agent_id TEXT NOT NULL,
-  session_id TEXT NOT NULL,
-  principal_id TEXT NOT NULL,
-  project_id TEXT,
-  course_id TEXT,
-  thread_id TEXT,
-  kind TEXT NOT NULL,
-  title TEXT,
-  instructions TEXT,
-  schedule JSONB NOT NULL,
-  timezone TEXT NOT NULL,
-  status TEXT NOT NULL CHECK (status IN ('active','paused')),
-  version INT NOT NULL DEFAULT 1 CHECK (version>0),
-  next_run_at TIMESTAMPTZ,
-  pause_reason TEXT,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  CHECK (kind<>'teacher_digest' OR (project_id IS NOT NULL AND course_id IS NOT NULL AND thread_id IS NULL)),
-  CHECK (kind='teacher_digest' OR (title IS NOT NULL AND instructions IS NOT NULL AND course_id IS NULL)),
-  CHECK ((status='active' AND next_run_at IS NOT NULL) OR (status='paused' AND next_run_at IS NULL))
-);
-CREATE UNIQUE INDEX agent_teacher_digest_scope_idx ON lingxios.agent_routines(tenant_id,agent_id,session_id,kind) WHERE kind='teacher_digest';
-CREATE INDEX agent_routines_due_idx ON lingxios.agent_routines(next_run_at) WHERE status='active';
-CREATE TABLE lingxios.agent_routine_runs (
-  routine_id TEXT NOT NULL REFERENCES lingxios.agent_routines(id) ON DELETE CASCADE,
-  routine_version INT NOT NULL,
-  scheduled_at TIMESTAMPTZ NOT NULL,
-  work_id TEXT NOT NULL UNIQUE REFERENCES lingxios.agent_work_items(id) ON DELETE CASCADE,
-  PRIMARY KEY(routine_id,routine_version,scheduled_at)
-);
 
 -- One live lease per session key.
 CREATE TABLE lingxios.agent_os_session_leases (
@@ -270,6 +215,8 @@ CREATE TABLE lingxios.agent_run_events (
   recorded_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   expires_at  TIMESTAMPTZ,
   delivery_work JSONB,
+  failed_at TIMESTAMPTZ,
+  last_error TEXT,
   delivered_at TIMESTAMPTZ,
   available_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   claim_token TEXT,
@@ -287,6 +234,8 @@ CREATE TABLE lingxios.agent_action_intents (
   recorded_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+CREATE INDEX agent_action_intents_work_idx ON lingxios.agent_action_intents((intent->>'workId'));
+
 -- Receipts complement pre-execution intents; missing receipts require reconciliation.
 CREATE TABLE lingxios.agent_action_ledger (
   idempotency_key TEXT PRIMARY KEY REFERENCES lingxios.agent_action_intents(idempotency_key),
@@ -294,33 +243,40 @@ CREATE TABLE lingxios.agent_action_ledger (
   recorded_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-CREATE TABLE lingxios.agent_messages (
-  run_id TEXT PRIMARY KEY,
-  tenant_id TEXT NOT NULL,
-  agent_id TEXT NOT NULL,
-  session_id TEXT NOT NULL,
-  message JSONB NOT NULL,
-  home_epoch BIGINT NOT NULL DEFAULT 1 CHECK (home_epoch > 0),
-  committed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+CREATE TABLE lingxios.agent_approvals (
+  id TEXT PRIMARY KEY,
+  action_key TEXT NOT NULL UNIQUE REFERENCES lingxios.agent_action_intents(idempotency_key),
+  preview JSONB NOT NULL,
+  decision BOOLEAN,
+  decided_by TEXT,
+  decided_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  CHECK ((decision IS NULL) = (decided_at IS NULL)),
+  CHECK ((decision IS NULL) = (decided_by IS NULL))
 );
 
+-- Immutable submitted responses. Work and delivery rows refer to this one record.
 CREATE TABLE lingxios.agent_results (
+  id TEXT PRIMARY KEY,
   work_id TEXT NOT NULL REFERENCES lingxios.agent_work_items(id),
-  candidate_hash TEXT NOT NULL,
-  request_version INT NOT NULL,
+  request_version INT NOT NULL CHECK (request_version>0),
   fence BIGINT NOT NULL,
+  home_epoch BIGINT NOT NULL CHECK (home_epoch>0),
   message JSONB NOT NULL,
   committed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  PRIMARY KEY(work_id,candidate_hash)
+  UNIQUE(work_id,id)
 );
+ALTER TABLE lingxios.agent_work_items ADD CONSTRAINT agent_work_result_fkey
+  FOREIGN KEY(id,result_id) REFERENCES lingxios.agent_results(work_id,id);
 
 CREATE TABLE lingxios.agent_delivery_outbox (
-  run_id TEXT PRIMARY KEY REFERENCES lingxios.agent_messages(run_id),
-  work JSONB NOT NULL,
+  result_id TEXT PRIMARY KEY REFERENCES lingxios.agent_results(id),
+  failed_at TIMESTAMPTZ,
+  last_error TEXT,
   delivered_at TIMESTAMPTZ,
   available_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   claim_token TEXT,
-  attempts INTEGER NOT NULL DEFAULT 0
+  attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts BETWEEN 0 AND 30)
 );
 
 -- Each unfinished request owns its snapshot; the session row only keeps the
@@ -373,57 +329,49 @@ CREATE UNIQUE INDEX agent_action_resolutions_seq_idx
 CREATE INDEX agent_action_resolutions_action_idx
   ON lingxios.agent_action_resolutions(idempotency_key, resolution_seq DESC);
 
-CREATE TABLE lingxios.agent_calendar_outbox (
-  id TEXT PRIMARY KEY REFERENCES lingxios.agent_action_intents(idempotency_key),
-  work_id TEXT NOT NULL REFERENCES lingxios.agent_work_items(id),
-  event JSONB NOT NULL CHECK (jsonb_typeof(event)='object' AND event->>'type'='calendar.changed'),
-  delivered_at TIMESTAMPTZ,
-  available_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  claim_token TEXT,
-  attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts BETWEEN 0 AND 30)
-);
-CREATE INDEX agent_calendar_outbox_pending
-  ON lingxios.agent_calendar_outbox(available_at,id) WHERE delivered_at IS NULL;
-
-CREATE TABLE lingxios.agent_canvas_outbox (
-  id TEXT PRIMARY KEY,
-  event JSONB NOT NULL CHECK (jsonb_typeof(event)='object' AND event->>'type'='canvas.changed'),
-  delivered_at TIMESTAMPTZ,
-  available_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  claim_token TEXT,
-  attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts BETWEEN 0 AND 30)
-);
-CREATE INDEX agent_canvas_outbox_pending
-  ON lingxios.agent_canvas_outbox(available_at,id) WHERE delivered_at IS NULL;
-
-CREATE TABLE lingxios.agent_document_outbox (
-  id TEXT PRIMARY KEY,
-  event JSONB NOT NULL CHECK (jsonb_typeof(event)='object' AND event->>'type' IN ('doc.changed','doc.update')),
-  delivered_at TIMESTAMPTZ,
-  available_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  claim_token TEXT,
-  attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts BETWEEN 0 AND 30)
-);
-CREATE INDEX agent_document_outbox_pending
-  ON lingxios.agent_document_outbox(available_at,id) WHERE delivered_at IS NULL;
-
 CREATE TABLE lingxios.agent_memories (
   tenant_id TEXT NOT NULL,
   id TEXT NOT NULL,
-  scope_type TEXT NOT NULL CHECK (scope_type IN ('learner','course','agent_role')),
+  scope_type TEXT NOT NULL CHECK (length(scope_type) BETWEEN 1 AND 1000),
   scope_id TEXT NOT NULL,
   body TEXT NOT NULL CHECK (length(body) BETWEEN 1 AND 2000),
   kind TEXT NOT NULL,
-  origin TEXT NOT NULL CHECK (origin IN ('explicit','synthesized')),
+  origin TEXT NOT NULL CHECK (origin IN ('explicit','synthesized','evolved')),
   pinned BOOLEAN NOT NULL DEFAULT FALSE,
   version INTEGER NOT NULL DEFAULT 1 CHECK (version > 0),
-  status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','expired')),
+  status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('candidate','active','retired','expired')),
   source_refs JSONB NOT NULL CHECK (jsonb_typeof(source_refs)='array' AND jsonb_array_length(source_refs) BETWEEN 1 AND 64),
   valid_until TIMESTAMPTZ,
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   PRIMARY KEY (tenant_id,id)
 );
 CREATE INDEX agent_memories_scope ON lingxios.agent_memories(tenant_id,scope_type,scope_id,updated_at DESC);
+CREATE UNIQUE INDEX agent_evolution_active ON lingxios.agent_memories(tenant_id,scope_type,scope_id,kind)
+  WHERE origin='evolved' AND status='active';
+
+CREATE TABLE lingxios.agent_evolution_benchmarks (
+  tenant_id TEXT NOT NULL,
+  id TEXT NOT NULL,
+  hash TEXT NOT NULL,
+  definition JSONB NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  PRIMARY KEY(tenant_id,id)
+);
+
+CREATE TABLE lingxios.agent_evolution_evaluations (
+  tenant_id TEXT NOT NULL,
+  memory_id TEXT NOT NULL,
+  candidate_version INT NOT NULL,
+  benchmark_id TEXT NOT NULL,
+  baseline JSONB NOT NULL,
+  records JSONB NOT NULL DEFAULT '{}',
+  verdict TEXT NOT NULL DEFAULT 'pending' CHECK (verdict IN ('pending','passed','failed','stale')),
+  summary JSONB,
+  evaluated_at TIMESTAMPTZ,
+  PRIMARY KEY(tenant_id,memory_id),
+  FOREIGN KEY(tenant_id,memory_id) REFERENCES lingxios.agent_memories(tenant_id,id) ON DELETE CASCADE,
+  FOREIGN KEY(tenant_id,benchmark_id) REFERENCES lingxios.agent_evolution_benchmarks(tenant_id,id)
+);
 
 CREATE TABLE lingxios.agent_memory_embeddings (
   tenant_id TEXT NOT NULL,
@@ -465,7 +413,8 @@ CREATE TRIGGER agent_memory_version_history
   EXECUTE FUNCTION lingxios.archive_memory_version();
 
 CREATE TABLE lingxios.agent_memory_evidence (
-  source_run_id TEXT PRIMARY KEY REFERENCES lingxios.agent_messages(run_id),
+  scopes JSONB NOT NULL CHECK (jsonb_typeof(scopes)='array' AND jsonb_array_length(scopes) BETWEEN 1 AND 12),
+  source_run_id TEXT PRIMARY KEY REFERENCES lingxios.agent_work_items(id),
   tenant_id TEXT NOT NULL,
   agent_id TEXT NOT NULL,
   principal_id TEXT NOT NULL,
@@ -493,8 +442,9 @@ BEGIN
         OR request_version<>jsonb_array_length(NEW.steer_inputs)+1)
     RETURNING source_run_id,tenant_id)
   UPDATE lingxios.agent_memories memory SET status='expired',version=version+1,updated_at=NOW()
-    FROM superseded source WHERE memory.tenant_id=source.tenant_id AND memory.origin='synthesized'
-      AND NOT memory.pinned AND memory.status='active'
+    FROM superseded source WHERE memory.tenant_id=source.tenant_id
+      AND ((memory.origin='synthesized' AND NOT memory.pinned AND memory.status='active')
+        OR (memory.origin='evolved' AND memory.status<>'expired'))
       AND memory.source_refs @> jsonb_build_array(jsonb_build_object('workId',source.source_run_id));
   RETURN NEW;
 END;
@@ -506,5 +456,5 @@ CREATE TRIGGER agent_work_memory_evidence
     OR OLD.status IS DISTINCT FROM NEW.status OR OLD.steer_inputs IS DISTINCT FROM NEW.steer_inputs)
   EXECUTE FUNCTION lingxios.supersede_memory_evidence();
 
-INSERT INTO lingxios.schema_version(singleton, version) VALUES(TRUE, 6);
+INSERT INTO lingxios.schema_version(singleton, version) VALUES(TRUE, 7);
 COMMIT;

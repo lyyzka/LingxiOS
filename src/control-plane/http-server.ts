@@ -99,6 +99,8 @@ export class ControlPlaneServer {
     const path = url.pathname
     const method = req.method ?? 'GET'
     const service = this.options.service
+    const disconnected = new AbortController()
+    res.once('close', () => { if (!res.writableFinished) disconnected.abort(new Error('worker connection closed')) })
 
     if (method === 'GET' && path === '/healthz') {
       json(res, 200, { ok: true })
@@ -121,17 +123,17 @@ export class ControlPlaneServer {
       return
     }
 
-    const maxBody = path.endsWith('/artifacts') || path.endsWith('/lecture') ? 24 * 1024 * 1024 : this.options.maxBodyBytes ?? 8 * 1024 * 1024
+    const maxBody = path.endsWith('/artifacts') ? 24 * 1024 * 1024 : this.options.maxBodyBytes ?? 8 * 1024 * 1024
     const parsed = method === 'GET' ? {} : await readBody(req, maxBody)
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new ControlPlaneError(400, 'request body must be a JSON object')
     const body = parsed as Record<string, unknown>
 
     // Route table -----------------------------------------------------------
-    if (method === 'POST' && path === '/v4/work') {
+    if (method === 'POST' && path === '/v5/work') {
       json(res, 200, await service.enqueue(body as unknown as EnqueueWorkInput))
       return
     }
-    if (method === 'POST' && path === '/v4/work/claim') {
+    if (method === 'POST' && path === '/v5/work/claim') {
       if (body['requestId'] !== undefined && typeof body['requestId'] !== 'string') {
         throw new ControlPlaneError(400, 'requestId must be a string')
       }
@@ -142,7 +144,7 @@ export class ControlPlaneServer {
       return
     }
 
-    const workMatch = /^\/v4\/work\/([^/]+)\/([a-z-]+)$/.exec(path)
+    const workMatch = /^\/v5\/work\/([^/]+)\/([a-z-]+)$/.exec(path)
     if (workMatch) {
       const id = decodeURIComponent(workMatch[1]!)
       const operation = workMatch[2]!
@@ -158,8 +160,6 @@ export class ControlPlaneServer {
       if (method === 'POST') {
         const proof = leaseProofOf(id, body)
         switch (operation) {
-          case 'lecture':
-            json(res, 200, await service.lecture(proof, body['command'] as never)); return
           case 'heartbeat':
             json(res, 200, await service.heartbeat(proof)); return
           case 'model-budget':
@@ -172,7 +172,7 @@ export class ControlPlaneServer {
           case 'yield':
             await service.yieldWork(proof); json(res, 200, { ok: true }); return
           case 'actions':
-            json(res, 200, await service.executeAction(proof, body['action'] as never)); return
+            json(res, 200, await service.executeAction(proof, body['action'] as never, disconnected.signal)); return
           case 'reconcile':
             json(res, 200, await service.recoverCell(proof, stringField(body, 'cellId'))); return
           case 'step':
@@ -191,10 +191,12 @@ export class ControlPlaneServer {
           case 'complete':
             await service.complete(proof, {
               status: body['status'] as WorkCompletion['status'],
-              ...(typeof body['resultText'] === 'string' ? { resultText: body['resultText'] } : {}),
               ...(typeof body['error'] === 'string' ? { error: body['error'] } : {}),
               ...(body['goalOutcome'] === undefined ? {} : { goalOutcome: body['goalOutcome'] as NonNullable<WorkCompletion['goalOutcome']> }),
             })
+            json(res, 200, { ok: true }); return
+          case 'wait':
+            await service.waitWork(proof, body['goalOutcome'] as import('../protocol/outcome.js').WaitingOutcome)
             json(res, 200, { ok: true }); return
           case 'cancel':
             json(res, 200, { ok: await service.requestCancel(id) }); return
@@ -206,7 +208,7 @@ export class ControlPlaneServer {
       }
     }
 
-    if (method === 'PUT' && path === '/v4/sessions') {
+    if (method === 'PUT' && path === '/v5/sessions') {
       const proof = leaseProofOf(stringField(body, 'workId'), body)
       json(res, 200, await service.saveSession(proof, body['session'] as SessionRecord))
       return

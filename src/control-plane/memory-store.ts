@@ -44,7 +44,6 @@ interface WorkRow {
   cancelRequestedAt: string | null
   preemptRequestedAt: string | null
   steerInputs: Array<{ id: string; text: string; createdAt: string }>
-  resultText: string | null
   error: string | null
   meta?: Record<string, unknown>
 }
@@ -61,10 +60,14 @@ interface SessionLease {
 }
 
 export class MemoryWorkStore implements WorkStore {
+  private readonly attempts = new Map<string, Omit<WorkItem, 'leaseToken'>>()
+  async getAttempt(id: string, fence: number, leaseTokenHash: string) {
+    return structuredClone(this.attempts.get(JSON.stringify([id, fence, leaseTokenHash])) ?? null)
+  }
   async children(parent: Omit<WorkItem, 'leaseToken'>) {
     return [...this.rows.values()].filter(row => row.meta?.['parentWorkId'] === parent.id
       && row.tenantId === parent.tenantId && row.principalId === parent.principalId).slice(0, 64)
-      .map(row => ({ id: row.id, status: row.status, resultText: row.resultText, goalOutcome: row.goalOutcome ?? null }))
+      .map(row => ({ id: row.id, status: row.status, resultText: null, goalOutcome: row.goalOutcome ?? null }))
   }
   async ownsBudgetRoot(work: Omit<WorkItem, 'leaseToken'>, rootWorkId: string): Promise<boolean> {
     if (rootWorkId === work.id) return true
@@ -81,10 +84,9 @@ export class MemoryWorkStore implements WorkStore {
     }
     return false
   }
-  async hasPendingChild(parent: Omit<WorkItem, 'leaseToken'>, childId: string, requestVersion: number): Promise<boolean> {
+  async hasChild(parent: Omit<WorkItem, 'leaseToken'>, childId: string, requestVersion: number): Promise<boolean> {
     const child = this.rows.get(childId)
-    return Boolean(child && ['queued', 'leased', 'waiting'].includes(child.status) && !child.cancelRequestedAt
-      && child.tenantId === parent.tenantId && child.sessionId === parent.sessionId && child.principalId === parent.principalId
+    return Boolean(child && child.tenantId === parent.tenantId && child.principalId === parent.principalId
       && child.meta?.['parentWorkId'] === parent.id && child.meta?.['parentRequestVersion'] === requestVersion)
   }
   private readonly rows = new Map<string, WorkRow>()
@@ -138,7 +140,6 @@ export class MemoryWorkStore implements WorkStore {
       cancelRequestedAt: null,
       preemptRequestedAt: null,
       steerInputs: [],
-      resultText: null,
       error: null,
       ...(input.meta ? { meta: structuredClone(input.meta) } : {}),
     })
@@ -173,20 +174,25 @@ export class MemoryWorkStore implements WorkStore {
     const candidates = [...this.rows.values()]
       .filter((row) => {
         if (kinds && !kinds.includes(row.kind)) return false
-        if ((row.kind === 'memory_synthesis' || row.kind === 'memory_index') && row.attempts >= 3) return false
+        if (['memory_synthesis','memory_index','memory_evaluation'].includes(row.kind) && row.attempts >= 3) return false
         const claimable = row.status === 'queued'
           || (row.status === 'leased' && (row.leaseExpiresAt ?? 0) <= now)
         if (!claimable || row.cancelRequestedAt !== null) return false
+        if (Array.isArray(row.meta?.['dependsOn']) && row.meta['dependsOn'].some(id => {
+          const dependency = this.rows.get(String(id))
+          return !dependency || dependency.tenantId !== row.tenantId || dependency.principalId !== row.principalId
+            || ['queued','leased','waiting'].includes(dependency.status)
+        })) return false
         if (Date.parse(row.availableAt) > now) return false
         const sessionKey = this.sessionKey(row)
         if (this.sessionLeases.has(sessionKey)) return false
-        const route = this.routes.get(sessionKey)
-        if (route && route.workerId !== workerId && this.workerAlive(route.workerId, now)) return false
         return true
       })
       .sort((a, b) =>
-        (WORK_LANE_PRIORITY[b.lane] - WORK_LANE_PRIORITY[a.lane])
+        (WORK_LANE_PRIORITY[b.lane] + Math.floor(Math.max(0, now - Date.parse(b.availableAt)) / 60_000)
+          - WORK_LANE_PRIORITY[a.lane] - Math.floor(Math.max(0, now - Date.parse(a.availableAt)) / 60_000))
         || (b.priority - a.priority)
+        || (Number(this.routes.get(this.sessionKey(b))?.workerId === workerId) - Number(this.routes.get(this.sessionKey(a))?.workerId === workerId))
         || (Date.parse(a.createdAt) - Date.parse(b.createdAt)))
     const row = candidates[0]
     if (!row) {
@@ -203,7 +209,7 @@ export class MemoryWorkStore implements WorkStore {
     } else if (existingRoute.workerId === workerId) {
       homeEpoch = existingRoute.homeEpoch
     } else {
-      // Taking over from a dead worker: the old filesystem home is suspect.
+      // Another worker must restore from committed snapshots, not the previous home.
       homeEpoch = existingRoute.homeEpoch + 1
       this.routes.set(sessionKey, { workerId, homeEpoch })
     }
@@ -217,6 +223,8 @@ export class MemoryWorkStore implements WorkStore {
     row.attempts += 1
     this.sessionLeases.set(sessionKey, { workId: row.id, fence: row.fence, expiresAt: now + this.leaseTtlMs })
     const work = this.toWorkItem(row, token, homeEpoch)
+    const { leaseToken: _token, ...issued } = work
+    this.attempts.set(JSON.stringify([work.id, work.fence, row.leaseTokenHash]), structuredClone(issued))
     if (requestId) this.claims.set(requestId, { workerId, work: structuredClone(work), kinds })
     return work
   }
@@ -289,18 +297,30 @@ export class MemoryWorkStore implements WorkStore {
   }
 
   async complete(id: string, fence: number, leaseTokenHash: string, completion: WorkCompletion): Promise<boolean> {
+    const status = workStatusOf(completion)
+    if (status === 'waiting') throw new Error('waiting requires wait')
+    return this.settle(id, fence, leaseTokenHash, status, completion)
+  }
+
+  async wait(id: string, fence: number, leaseTokenHash: string, goalOutcome: import('../protocol/outcome.js').WaitingOutcome): Promise<boolean> {
+    return this.settle(id, fence, leaseTokenHash, 'waiting', { goalOutcome })
+  }
+
+  private async settle(id: string, fence: number, leaseTokenHash: string, status: WorkRow['status'], completion: Omit<WorkCompletion, 'status'>): Promise<boolean> {
     const row = this.validLease(id, fence, leaseTokenHash)
     if (!row) return false
-    if (completion.status === 'completed' && row.cancelRequestedAt !== null) return false
-    if (completion.status === 'completed' && typeof row.meta?.['text'] === 'string' && !completion.goalOutcome) return false
-    if (completion.status === 'completed' && completion.goalOutcome && completion.goalOutcome.requestVersion !== row.steerInputs.length + 1) return false
-    row.status = workStatusOf(completion)
-    row.resultText = completion.resultText ?? null
+    if (!['failed','cancelled'].includes(status) && row.cancelRequestedAt !== null) return false
+    if (!['failed','cancelled'].includes(status) && typeof row.meta?.['text'] === 'string' && !completion.goalOutcome) return false
+    if (!['failed','cancelled'].includes(status) && completion.goalOutcome && completion.goalOutcome.requestVersion !== row.steerInputs.length + 1) return false
+    row.status = status
     row.error = completion.error ?? null
     if (completion.goalOutcome) row.goalOutcome = structuredClone(completion.goalOutcome)
     row.leaseTokenHash = null
     row.leaseExpiresAt = null
     this.releaseSessionLease(row, fence)
+    if (row.status !== 'waiting') for (const child of this.rows.values()) {
+      if (child.meta?.['parentWorkId'] === row.id && child.tenantId === row.tenantId && child.principalId === row.principalId) await this.requestCancel(child.id)
+    }
     return true
   }
 
@@ -345,8 +365,12 @@ export class MemoryWorkStore implements WorkStore {
 
   async addSteer(id: string, text: string): Promise<boolean> {
     const row = this.rows.get(id)
-    if (!row || row.status !== 'leased') return false
+    if (!row || !['queued','leased','waiting'].includes(row.status) || row.cancelRequestedAt) return false
     row.steerInputs.push({ id: randomUUID(), text, createdAt: new Date(this.now()).toISOString() })
+    if (row.status === 'waiting') row.status = 'queued'
+    delete row.goalOutcome
+    for (const child of this.rows.values()) if (child.meta?.['parentWorkId'] === id
+      && child.tenantId === row.tenantId && child.principalId === row.principalId) await this.requestCancel(child.id)
     return true
   }
 
@@ -356,7 +380,7 @@ export class MemoryWorkStore implements WorkStore {
     if (!row) return null
     return {
       status: row.status, fence: row.fence, attempts: row.attempts,
-      preemptions: row.preemptions, resultText: row.resultText, error: row.error,
+      preemptions: row.preemptions, resultText: null, error: row.error,
       ...(row.goalOutcome ? { goalOutcome: structuredClone(row.goalOutcome) } : {}),
     }
   }
@@ -428,6 +452,10 @@ export class MemoryEventStore implements EventStore {
 }
 
 export class MemoryActionLedger implements ActionLedgerStore {
+  async artifacts(workId: string) {
+    return [...this.intentDetails].filter(([, intent]) => intent.workId === workId)
+      .flatMap(([key]) => { const result = this.effectiveResult(key); return result?.ok ? structuredClone(result.artifacts ?? []) : [] })
+  }
   async hasWait(workId: string, requestVersion: number, wait: { approvalId: string } | { question: string }): Promise<boolean> {
     for (const [key, intent] of this.intentDetails) {
       if (intent.workId !== workId || intent.requestVersion !== requestVersion) continue
@@ -492,7 +520,7 @@ export class MemoryActionLedger implements ActionLedgerStore {
   async record(idempotencyKey: string, result: HostActionResult): Promise<HostActionResult> {
     if (!this.intents.has(idempotencyKey)) throw new Error('action intent is required before recording a receipt')
     const existing = this.results.get(idempotencyKey)
-    if (existing) return structuredClone(existing)
+    if (existing && !existing.approval) return structuredClone(existing)
     this.results.set(idempotencyKey, structuredClone(result))
     return result
   }

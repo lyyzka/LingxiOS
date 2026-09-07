@@ -1,78 +1,31 @@
-/**
- * Worker entrypoint: wire the HTTP host client, model driver, kernel manager,
- * and runtime together from environment configuration, then run until
- * SIGINT/SIGTERM drains the process.
- */
 import { boolEnv, loadWorkerConfig, loadModelBudget } from '../config.js'
-import { HttpHostClient } from '../host/http-client.js'
-import { KernelManager, type KernelHostBridge, type ManagedKernelExecutor } from '../kernel/manager.js'
-import { createLogger } from '../logging.js'
-import { MetricsRegistry } from '../metrics.js'
-import { DEFAULT_SMALL_MODEL, OpenAIChatDriver } from '../model/openai.js'
-import { AgentRuntime } from '../runtime/runtime.js'
-import { AgentWorker } from './worker.js'
-import { registerProcessors } from './processors.js'
-import { ConfigError } from '../errors.js'
-import type { RuntimePolicy } from '../runtime/policy.js'
-import { createLingxiLoopRuntimePolicy } from '../integrations/lingxiloop/policy.js'
+import { KernelManager } from '../kernel/manager.js'
 import { kernelIsolation } from '../kernel/isolation.js'
+import { createWorker, type WorkerOptions } from './factory.js'
 
-export async function startWorker(env: NodeJS.ProcessEnv = process.env, options: {
-  kernelFactory?: (bridge: KernelHostBridge) => ManagedKernelExecutor
-  policy?: RuntimePolicy
-} = {}): Promise<AgentWorker> {
-  const config = loadWorkerConfig(env)
-  const logger = createLogger().child({ service: 'agent-os-worker' })
-  const metrics = new MetricsRegistry()
-
-  const supportedKinds: string[] = []
-  const host = new HttpHostClient({
-    baseUrl: config.controlPlaneUrl,
-    serviceToken: config.serviceToken,
-    workerId: config.workerId, workKinds: supportedKinds,
-  })
-  const model = new OpenAIChatDriver(config.model.id, {
-    apiKey: config.model.apiKey,
-    baseUrl: config.model.baseUrl,
-    ...(config.model.reasoningEffort ? { reasoningEffort: config.model.reasoningEffort } : {}),
-  })
-  const smallModel = new OpenAIChatDriver(config.smallModel.id, { ...DEFAULT_SMALL_MODEL, ...config.smallModel })
-  const bridge: KernelHostBridge = { execute: (work, action) => host.executeAction(work, action) }
-  const kernels = options.kernelFactory?.(bridge) ?? new KernelManager(
-    bridge, { logger, maxKernels: config.maxConcurrentRuns,
-      isolation: kernelIsolation(env['AGENT_OS_KERNEL_ISOLATION'], env['NODE_ENV'] === 'production', boolEnv('AGENT_OS_TRUST_PROCESS_KERNEL', false, env)) }, env,
-  )
-  const policyName = env['AGENT_OS_RUNTIME_POLICY']?.trim()
-  if (policyName && policyName !== 'lingxiloop') throw new ConfigError('AGENT_OS_RUNTIME_POLICY must be lingxiloop when set')
-  const policy = options.policy ?? (policyName === 'lingxiloop' ? createLingxiLoopRuntimePolicy() : undefined)
-  const runtime = new AgentRuntime(host, model, kernels, { logger, smallModel, ...(policy ? { policy } : {}),
-    rootModelBudget: loadModelBudget(env),
-    recordModelPayloads: boolEnv('AGENT_OS_RECORD_MODEL_PAYLOADS', false, env) })
-  registerProcessors(runtime)
-  supportedKinds.push(...runtime.workKinds)
-  const worker = new AgentWorker({
-    host,
-    runtime,
-    kernels,
-    workerId: config.workerId,
-    maxConcurrentRuns: config.maxConcurrentRuns,
-    shutdownGraceMs: config.shutdownGraceMs,
-    pollIdleMs: config.pollIdleMs,
-    healthPort: config.healthPort,
-    logger,
-    metrics,
-    lastContactAt: () => host.lastContactAt,
-  })
-
-  try {
-    await worker.start()
-  } catch (error) {
-    kernels.close()
-    throw error
-  }
-
-  return worker
-}
-
+export { createWorker, type WorkerConnection, type WorkerOptions } from './factory.js'
+export type { EvolutionEvaluator } from '../memory/processor.js'
+export type { WorkProcessor, WorkProcessorContext } from '../runtime/runtime.js'
+export type { ModelDriver, ModelUsage, ModelTurnRequest, ModelTurnResult } from '../model/driver.js'
+export type { HostPort } from '../host/port.js'
 export type { AgentWorker } from './worker.js'
 export type { KernelExecutor, ManagedKernelExecutor, KernelHostBridge } from '../kernel/manager.js'
+
+/** Standalone HTTP worker; products register their processors through createWorker. */
+export async function startWorker(env: NodeJS.ProcessEnv = process.env,
+  options: Pick<WorkerOptions, 'kernelFactory' | 'policy' | 'processors'> = {}) {
+  const config = loadWorkerConfig(env)
+  const worker = createWorker({ ...options,
+    controlPlane: { url: config.controlPlaneUrl, serviceToken: config.serviceToken },
+    model: config.model, smallModel: config.smallModel, modelBudget: loadModelBudget(env),
+    recordModelPayloads: boolEnv('AGENT_OS_RECORD_MODEL_PAYLOADS', false, env),
+    kernelFactory: options.kernelFactory ?? (bridge => new KernelManager(bridge, {
+      maxKernels: config.maxConcurrentRuns,
+      isolation: kernelIsolation(env['AGENT_OS_KERNEL_ISOLATION'], env['NODE_ENV'] === 'production', boolEnv('AGENT_OS_TRUST_PROCESS_KERNEL', false, env)),
+    }, env)),
+    worker: { id: config.workerId, concurrency: config.maxConcurrentRuns, shutdownGraceMs: config.shutdownGraceMs,
+      pollIdleMs: config.pollIdleMs, healthPort: config.healthPort },
+  })
+  try { await worker.start(); return worker }
+  catch (error) { await worker.stop(); throw error }
+}

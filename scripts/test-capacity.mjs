@@ -40,7 +40,7 @@ function worker(id, port) {
 try {
   assert.equal((await pool.query("SELECT 1 FROM pg_tables WHERE schemaname NOT IN ('pg_catalog','information_schema') LIMIT 1")).rows.length, 0)
   await pool.query(await readFile(packageResources().schema, 'utf8'))
-  app = await createLingxiOS({ database: pool, kernel: { homesRoot: join(directory, 'control') } })
+  app = await createLingxiOS({ database: pool, homesRoot: join(directory, 'control') })
   const port = await app.listenControlPlane({ serviceToken: 'capacity', port: 0 })
   model.listen(0, '127.0.0.1'); await once(model, 'listening')
   for (let i = 0; i < 100; i++) await app.enqueue({ id: `capacity-${i}`, tenantId: 't', agentId: 'a', sessionId: `s-${i}`, principalId: 'p', text: 'Return 4.' })
@@ -53,9 +53,9 @@ try {
   await pool.query("UPDATE lingxios.agent_os_session_leases SET expires_at=NOW()-INTERVAL '1 minute' WHERE work_id IN (SELECT id FROM lingxios.agent_work_items WHERE leased_by='capacity-a')")
   await pool.query("UPDATE lingxios.agent_os_workers SET last_seen_at=NOW()-INTERVAL '1 day' WHERE worker_id='capacity-a'")
   hold = false; worker('capacity-replacement', port)
-  await until(async () => (await pool.query("SELECT count(*)::int AS n FROM lingxios.agent_work_items WHERE status IN ('completed','failed','cancelled')")).rows[0].n === 100)
-  assert.deepEqual((await pool.query('SELECT status,count(*)::int AS n FROM lingxios.agent_work_items GROUP BY status')).rows, [{ status: 'completed', n: 100 }])
-  assert.equal((await pool.query('SELECT count(*)::int AS n FROM lingxios.agent_messages')).rows[0].n, 100)
+  await until(async () => (await pool.query("SELECT count(*)::int AS n FROM lingxios.agent_work_items WHERE status IN ('succeeded','partial','blocked','failed','cancelled')")).rows[0].n === 100)
+  assert.deepEqual((await pool.query('SELECT status,count(*)::int AS n FROM lingxios.agent_work_items GROUP BY status')).rows, [{ status: 'succeeded', n: 100 }])
+  assert.equal((await pool.query('SELECT count(*)::int AS n FROM lingxios.agent_results')).rows[0].n, 100)
   assert.ok(peak <= 4, `observed ${peak} concurrent model calls`)
   console.log('Capacity passed: 100 queued tasks, two Workers x two slots, SIGKILL takeover, 100 unique committed messages.')
 } finally {

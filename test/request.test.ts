@@ -38,4 +38,12 @@ it('preserves exact long input and ordered revisions independently of history', 
   snapshot.revisions.push({ id: 'r2', text: 'New constraint', createdAt: 'later' })
   assert.equal(requestItems(snapshot).length, 3)
   assert.equal(JSON.stringify(requestItems(snapshot)).includes('Derived task checklist'), false)
+  const child = snapshotRequest({ ...context, work: { ...context.work, id: 'child', sessionId: 'another-room', principalId: 'u',
+    meta: { delegation: { parentRequest: snapshot, parentWorkId: snapshot.workId, parentRequestVersion: 3,
+      instructionAuthorId: 'helper', assignment: 'Check the revised request' } } } })
+  assert.equal(child.sessionId, 'another-room')
+  assert.deepEqual(child.revisions, [])
+  assert.deepEqual(child.inheritedRevisions, snapshot.revisions)
+  assert.equal(child.originalText, text)
+  assert.ok(JSON.stringify(requestItems(child)).includes('New constraint'))
 })

@@ -2,15 +2,19 @@ import assert from 'node:assert/strict'
 import { readFile } from 'node:fs/promises'
 import { it } from 'node:test'
 import { PGlite } from '@electric-sql/pglite'
-import { PgWorkStore, type SqlPool } from '../src/control-plane/pg-store.js'
+import { PgWorkStore, withTransaction, type SqlPool } from '../src/control-plane/pg-store.js'
 import { sessionKeyOf, type WorkItem } from '../src/protocol/types.js'
 import { captureMemoryEvidence, retryMemorySynthesis } from '../src/memory/evidence.js'
-import { executeMemorySynthesis, parseMemoryChanges, type MemoryBatch } from '../src/memory/synthesis.js'
+import { executeMemorySynthesis as synthesize, parseMemoryChanges, type MemoryBatch } from '../src/memory/synthesis.js'
 import { memorySynthesisProcessor } from '../src/memory/processor.js'
 import { recallMemories } from '../src/memory/store.js'
 import { createResponseEnvelope } from '../src/outcome/envelope.js'
 import { snapshotEvidence } from '../src/context/evidence.js'
 import type { WorkProcessorContext } from '../src/runtime/runtime.js'
+
+const scopes = [{ tenantId: 't', scopeType: 'learner', scopeId: 'u' }, { tenantId: 't', scopeType: 'course', scopeId: 's' }, { tenantId: 't', scopeType: 'agent_role', scopeId: 'a' }]
+const executeMemorySynthesis = (database: SqlPool, work: WorkItem, method: string, args: Record<string, unknown>) =>
+  withTransaction(database, client => synthesize(client, work, method, args, scopes))
 
 it('executes durable memory synthesis with independent verification, fenced atomic writes and bounded retries', async () => {
   const db = new PGlite()
@@ -32,8 +36,7 @@ it('executes durable memory synthesis with independent verification, fenced atom
     [sessionKeyOf(work), JSON.stringify(request)])
     const message = { version: 2 as const, runId: work.id, agentId: 'a', sessionId: 's', body: 'Understood.',
       envelope: createResponseEnvelope('Understood.', { status: 'partial', verification: 'not_run', requestVersion: revisions.length + 1 }, snapshotEvidence('e', [])) }
-    await db.query("INSERT INTO lingxios.agent_messages(run_id,tenant_id,agent_id,session_id,message) VALUES($1,'t','a','s',$2::jsonb)", [work.id, JSON.stringify(message)])
-    await captureMemoryEvidence(pool, work, message)
+    await captureMemoryEvidence(pool, work, message, scopes)
     const job = { ...work, id: `memory-synthesis:${work.id}`, kind: 'memory_synthesis', lane: 'background' as const, meta: { sourceRunId: work.id } }
     await db.query("UPDATE lingxios.agent_work_items SET status='leased',fence=1,attempts=1,lease_expires_at=NOW()+INTERVAL '1 hour' WHERE id=$1", [job.id])
     return job
@@ -45,6 +48,7 @@ it('executes durable memory synthesis with independent verification, fenced atom
   try {
     await db.exec(await readFile(new URL('../../db/schema.sql', import.meta.url), 'utf8'))
     const first = await source()
+    await assert.rejects(withTransaction(pool, client => synthesize(client,first,'load',{},[])), /scope is unavailable/)
     let calls = 0
     const events: Array<Record<string, unknown>> = []
     const context = { signal: new AbortController().signal, emit: async (event: Record<string, unknown>) => { events.push(event) },
@@ -72,6 +76,7 @@ it('executes durable memory synthesis with independent verification, fenced atom
 
     const update = await source()
     await load(update)
+    await assert.rejects(apply(update,[{ ...create(update), scopeType: 'unauthorized' }]), /unauthorized scope/)
     const change = { ...create(update), action: 'update', id: memory.id, expectedVersion: 1, body: 'Prefers diagrams for examples' }
     await assert.rejects(apply(update, [{ ...create(update), sourceRunIds: ['foreign'] }]), /unknown evidence/)
     await assert.rejects(apply(update, [{ ...change, expectedVersion: 2 }]), /loaded snapshot/)

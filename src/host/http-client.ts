@@ -8,6 +8,7 @@
  * surfaced as {@link LeaseLostError} so the runtime can stop cleanly.
  */
 import { randomUUID } from 'node:crypto'
+import { abortable } from '../deadline.js'
 import { AgentOSError, LeaseLostError, errorMessage } from '../errors.js'
 import type {
   AssistantMessage, HeartbeatResult, HostAction, HostActionResult,
@@ -36,16 +37,13 @@ export class HostRequestError extends AgentOSError {
 }
 
 export class HttpHostClient implements HostPort {
-  async verifyCandidate(work: WorkItem, candidate: import('../outcome/verification.js').Candidate): Promise<import('../outcome/verification.js').CandidateVerification> {
-    return this.request('POST', `/v4/work/${encodeURIComponent(work.id)}/verify`, { ...this.proof(work), candidate })
+  async verifyCandidate(work: WorkItem, candidate: import('../outcome/verification.js').Candidate, signal?: AbortSignal): Promise<import('../outcome/verification.js').CandidateVerification> {
+    return this.request('POST', `/v5/work/${encodeURIComponent(work.id)}/verify`, { ...this.proof(work), candidate }, signal)
   }
-  async saveStep(work: WorkItem, step: import('../control-plane/steps.js').ExecutionStep): Promise<void> {
-    await this.request('POST', `/v4/work/${encodeURIComponent(work.id)}/checkpoint`, { ...this.proof(work), step })
+  async saveStep(work: WorkItem, step: import('../control-plane/steps.js').ExecutionStep, signal?: AbortSignal): Promise<void> {
+    await this.request('POST', `/v5/work/${encodeURIComponent(work.id)}/checkpoint`, { ...this.proof(work), step }, signal)
   }
   lastContactAt = 0
-  lecture(work: WorkItem, command: import('../lecture-deck/transport.js').LectureCommand): Promise<unknown> {
-    return this.request('POST', `/v4/work/${encodeURIComponent(work.id)}/lecture`, { ...this.proof(work), command })
-  }
   private readonly baseUrl: string
   private readonly timeoutMs: number
   private readonly maxAttempts: number
@@ -65,13 +63,14 @@ export class HttpHostClient implements HostPort {
   }
 
   private async request<T>(method: string, path: string, body?: unknown, signal?: AbortSignal): Promise<T> {
+    signal = AbortSignal.any([AbortSignal.timeout(this.timeoutMs),...signal ? [signal] : []])
     let lastError: unknown
     for (let attempt = 1; attempt <= this.maxAttempts; attempt++) {
       signal?.throwIfAborted()
       const timeout = AbortSignal.timeout(this.timeoutMs)
       const combined = signal ? AbortSignal.any([signal, timeout]) : timeout
       try {
-        const response = await this.fetchImpl(`${this.baseUrl}${path}`, {
+        const response = await abortable(this.fetchImpl(`${this.baseUrl}${path}`, {
           method,
           headers: {
             authorization: `Bearer ${this.options.serviceToken}`,
@@ -79,8 +78,8 @@ export class HttpHostClient implements HostPort {
           },
           ...(body === undefined ? {} : { body: JSON.stringify(body) }),
           signal: combined,
-        })
-        const detail = await readBody(response, this.maxResponseBytes)
+        }), combined)
+        const detail = await readBody(response, this.maxResponseBytes, combined)
         if (response.ok) { this.lastContactAt = Date.now(); return JSON.parse(detail) as T }
         let message = detail
         let responseCode: string | undefined
@@ -97,13 +96,13 @@ export class HttpHostClient implements HostPort {
         signal?.throwIfAborted()
         lastError = error
         if (attempt < this.maxAttempts) {
-          await this.sleep(this.retryBaseMs * 2 ** (attempt - 1))
+          await abortable(this.sleep(this.retryBaseMs * 2 ** (attempt - 1)),signal)
           continue
         }
         break
       }
       if (attempt < this.maxAttempts) {
-        await this.sleep(this.retryBaseMs * 2 ** (attempt - 1))
+        await abortable(this.sleep(this.retryBaseMs * 2 ** (attempt - 1)),signal)
         continue
       }
     }
@@ -115,99 +114,105 @@ export class HttpHostClient implements HostPort {
   }
 
   async claimWork(signal?: AbortSignal): Promise<WorkItem | null> {
-    return this.request<WorkItem | null>('POST', '/v4/work/claim', {
+    return this.request<WorkItem | null>('POST', '/v5/work/claim', {
       workerId: this.options.workerId, requestId: randomUUID(), workKinds: this.options.workKinds ?? ['turn', 'resume'],
     }, signal)
   }
 
-  async heartbeat(work: WorkItem): Promise<HeartbeatResult> {
-    return this.request<HeartbeatResult>('POST', `/v4/work/${encodeURIComponent(work.id)}/heartbeat`, this.proof(work))
+  async heartbeat(work: WorkItem, signal?: AbortSignal): Promise<HeartbeatResult> {
+    return this.request<HeartbeatResult>('POST', `/v5/work/${encodeURIComponent(work.id)}/heartbeat`, this.proof(work), signal)
   }
 
-  async loadContext(work: WorkItem): Promise<TurnContext> {
+  async loadContext(work: WorkItem, signal?: AbortSignal): Promise<TurnContext> {
     const query = new URLSearchParams({ fence: String(work.fence), leaseToken: work.leaseToken })
-    const context = await this.request<TurnContext>('GET', `/v4/work/${encodeURIComponent(work.id)}/context?${query}`)
+    const context = await this.request<TurnContext>('GET', `/v5/work/${encodeURIComponent(work.id)}/context?${query}`, undefined, signal)
     // The wire strips the lease token from the embedded work item; restore it.
     context.work = { ...context.work, leaseToken: work.leaseToken, homeEpoch: work.homeEpoch }
     return context
   }
 
-  async executeAction(work: WorkItem, action: HostAction): Promise<HostActionResult> {
-    return this.request<HostActionResult>('POST', `/v4/work/${encodeURIComponent(work.id)}/actions`, {
+  async executeAction(work: WorkItem, action: HostAction, signal?: AbortSignal): Promise<HostActionResult> {
+    return this.request<HostActionResult>('POST', `/v5/work/${encodeURIComponent(work.id)}/actions`, {
       ...this.proof(work), action,
-    })
+    }, signal)
   }
 
-  async reserveModelCall(work: WorkItem, callId: string, limits: ModelBudgetLimits): Promise<ModelBudgetReservation> {
-    return this.request('POST', `/v4/work/${encodeURIComponent(work.id)}/model-budget`, { ...this.proof(work), callId, limits })
+  async reserveModelCall(work: WorkItem, callId: string, limits: ModelBudgetLimits, signal?: AbortSignal): Promise<ModelBudgetReservation> {
+    return this.request('POST', `/v5/work/${encodeURIComponent(work.id)}/model-budget`, { ...this.proof(work), callId, limits }, signal)
   }
 
-  async recordModelUsage(work: WorkItem, callId: string, usage: { inputTokens: number; outputTokens: number; costMicros: number }, observation?: import('../model/execution.js').ModelCallObservation): Promise<void> {
-    await this.request('POST', `/v4/work/${encodeURIComponent(work.id)}/model-usage`, { ...this.proof(work), callId, usage, observation })
+  async recordModelUsage(work: WorkItem, callId: string, usage: { inputTokens: number; outputTokens: number; costMicros: number }, observation?: import('../model/execution.js').ModelCallObservation, signal?: AbortSignal): Promise<void> {
+    await this.request('POST', `/v5/work/${encodeURIComponent(work.id)}/model-usage`, { ...this.proof(work), callId, usage, observation }, signal)
   }
 
-  async recoverCell(work: WorkItem, cellId: string) {
+  async recoverCell(work: WorkItem, cellId: string, signal?: AbortSignal) {
     return this.request<Array<{ action: string; idempotencyKey: string; result: HostActionResult }> | null>(
-      'POST', `/v4/work/${encodeURIComponent(work.id)}/reconcile`, { ...this.proof(work), cellId })
+      'POST', `/v5/work/${encodeURIComponent(work.id)}/reconcile`, { ...this.proof(work), cellId }, signal)
   }
 
-  async recoverStep(work: WorkItem, cellId: string) {
+  async recoverStep(work: WorkItem, cellId: string, signal?: AbortSignal) {
     return this.request<{ output: string; artifacts: import('../protocol/types.js').KernelArtifact[] } | null>(
-      'POST', `/v4/work/${encodeURIComponent(work.id)}/step`, { ...this.proof(work), cellId })
+      'POST', `/v5/work/${encodeURIComponent(work.id)}/step`, { ...this.proof(work), cellId }, signal)
   }
 
-  async stageArtifact(work: WorkItem, artifact: import('../protocol/types.js').KernelArtifact, bytes: Uint8Array): Promise<void> {
-    await this.request('POST', `/v4/work/${encodeURIComponent(work.id)}/artifacts`, {
+  async stageArtifact(work: WorkItem, artifact: import('../protocol/types.js').KernelArtifact, bytes: Uint8Array, signal?: AbortSignal): Promise<void> {
+    await this.request('POST', `/v5/work/${encodeURIComponent(work.id)}/artifacts`, {
       ...this.proof(work), artifact, contentBase64: Buffer.from(bytes).toString('base64'),
-    })
+    }, signal)
   }
 
-  async emitEvent(work: WorkItem, event: RunEvent): Promise<void> {
-    await this.request('POST', `/v4/work/${encodeURIComponent(work.id)}/events`, { ...this.proof(work), event })
+  async emitEvent(work: WorkItem, event: RunEvent, signal?: AbortSignal): Promise<void> {
+    await this.request('POST', `/v5/work/${encodeURIComponent(work.id)}/events`, { ...this.proof(work), event }, signal)
   }
 
-  async loadSession(work: WorkItem, key: string): Promise<SessionRecord | null> {
-    const payload = await this.request<{ session: SessionRecord | null }>('POST', `/v4/work/${encodeURIComponent(work.id)}/session`, { ...this.proof(work), key })
+  async loadSession(work: WorkItem, key: string, signal?: AbortSignal): Promise<SessionRecord | null> {
+    const payload = await this.request<{ session: SessionRecord | null }>('POST', `/v5/work/${encodeURIComponent(work.id)}/session`, { ...this.proof(work), key }, signal)
     return payload.session
   }
 
-  async saveSession(work: WorkItem, session: SessionRecord): Promise<void> {
-    const saved = await this.request<{ revision: number }>('PUT', '/v4/sessions', {
+  async saveSession(work: WorkItem, session: SessionRecord, signal?: AbortSignal): Promise<void> {
+    const saved = await this.request<{ revision: number }>('PUT', '/v5/sessions', {
       workId: work.id, ...this.proof(work), session,
-    })
+    }, signal)
     session.revision = saved.revision
   }
 
-  async commitResult(work: WorkItem, message: AssistantMessage): Promise<void> {
-    await this.request('POST', `/v4/work/${encodeURIComponent(work.id)}/result`, { ...this.proof(work), message })
+  async commitResult(work: WorkItem, message: AssistantMessage, signal?: AbortSignal): Promise<void> {
+    await this.request('POST', `/v5/work/${encodeURIComponent(work.id)}/result`, { ...this.proof(work), message }, signal)
   }
 
-  async completeWork(work: WorkItem, completion: WorkCompletion): Promise<void> {
-    await this.request('POST', `/v4/work/${encodeURIComponent(work.id)}/complete`, { ...this.proof(work), ...completion })
+  async completeWork(work: WorkItem, completion: WorkCompletion, signal?: AbortSignal): Promise<void> {
+    await this.request('POST', `/v5/work/${encodeURIComponent(work.id)}/complete`, { ...this.proof(work), ...completion }, signal)
   }
 
-  async yieldWork(work: WorkItem): Promise<void> {
-    await this.request('POST', `/v4/work/${encodeURIComponent(work.id)}/yield`, this.proof(work))
+  async waitWork(work: WorkItem, goalOutcome: import('../protocol/outcome.js').WaitingOutcome, signal?: AbortSignal): Promise<void> {
+    await this.request('POST', `/v5/work/${encodeURIComponent(work.id)}/wait`, { ...this.proof(work), goalOutcome }, signal)
+  }
+
+  async yieldWork(work: WorkItem, signal?: AbortSignal): Promise<void> {
+    await this.request('POST', `/v5/work/${encodeURIComponent(work.id)}/yield`, this.proof(work), signal)
   }
 }
 
-async function readBody(response: Response, maxBytes: number): Promise<string> {
+async function readBody(response: Response, maxBytes: number, signal: AbortSignal): Promise<string> {
   const declared = Number(response.headers.get('content-length'))
   if (Number.isFinite(declared) && declared > maxBytes) throw new Error(`control plane response exceeds ${maxBytes} bytes`)
   if (!response.body) return ''
   const reader = response.body.getReader()
+  const cancel = () => { void reader.cancel(signal.reason).catch(() => {}) }
+  signal.addEventListener('abort',cancel,{ once: true })
   const chunks: Uint8Array[] = []
   let size = 0
-  for (;;) {
-    const { done, value } = await reader.read()
+  try { for (;;) {
+    const { done, value } = await abortable(reader.read(),signal)
     if (done) break
     size += value.byteLength
     if (size > maxBytes) {
-      await reader.cancel()
+      void reader.cancel().catch(() => {})
       throw new Error(`control plane response exceeds ${maxBytes} bytes`)
     }
     chunks.push(value)
-  }
+  } } finally { signal.removeEventListener('abort',cancel); reader.releaseLock() }
   const bytes = new Uint8Array(size)
   let offset = 0
   for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength }

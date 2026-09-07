@@ -9,6 +9,10 @@ export async function resumeDependents(database: SqlQueryable) {
       AND child.meta->'parentRequestVersion'=parent.goal_outcome->'requestVersion'
     WHERE parent.status='waiting' AND parent.goal_outcome->>'status'='delegated' AND parent.cancel_requested_at IS NULL
       AND child.status IN ('succeeded','partial','blocked','failed','cancelled')
+      AND NOT EXISTS (SELECT 1 FROM lingxios.agent_work_items sibling WHERE sibling.meta->>'parentWorkId'=parent.id
+        AND sibling.tenant_id=parent.tenant_id AND sibling.principal_id IS NOT DISTINCT FROM parent.principal_id
+        AND sibling.meta->'parentRequestVersion'=parent.goal_outcome->'requestVersion'
+        AND sibling.status IN ('queued','leased','waiting'))
     ORDER BY parent.created_at LIMIT 128 FOR UPDATE OF parent SKIP LOCKED
   ) UPDATE lingxios.agent_work_items parent SET status='queued',available_at=NOW(),finished_at=NULL,
     goal_outcome=NULL,updated_at=NOW() FROM ready WHERE parent.id=ready.id`)

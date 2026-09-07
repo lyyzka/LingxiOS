@@ -7,7 +7,7 @@
  */
 
 /** Control-plane HTTP API and worker claim protocol. */
-export const AGENT_OS_PROTOCOL_VERSION = 4 as const
+export const AGENT_OS_PROTOCOL_VERSION = 5 as const
 
 /** Kernel stdio (NDJSON) protocol between the manager and `kernel/runner.py`. */
 export const KERNEL_PROTOCOL_VERSION = 2 as const

@@ -2,11 +2,11 @@ import { createHash } from 'node:crypto'
 import { auxiliaryInstructions } from '../context/compiler.js'
 import type { ModelDriver } from '../model/driver.js'
 import { DEFAULT_MODEL, OpenAIChatDriver } from '../model/openai.js'
-import type { LingxiOSOptions } from '../app/index.js'
+import type { ModelConfiguration } from '../worker/factory.js'
 import type { ResourceObservation } from './index.js'
 
 /** Optional evaluation pipeline, never an automatic runtime completion gate. */
-export async function reviewAnswer(source: ModelDriver | NonNullable<LingxiOSOptions['model']>, input: { originalInput: string; revisions: string[]; answer: string; rubric: string; observations?: readonly ResourceObservation[] }, signal?: AbortSignal) {
+export async function reviewAnswer(source: ModelDriver | ModelConfiguration, input: { originalInput: string; revisions: string[]; answer: string; rubric: string; observations?: readonly ResourceObservation[] }, signal?: AbortSignal) {
   if (!('structured' in source) && ((source.id !== undefined && !source.id.trim()) || !source.apiKey?.trim())) throw new Error('review apiKey is required and any explicit model id must be non-empty')
   const model = 'structured' in source ? source : new OpenAIChatDriver(source.id ?? DEFAULT_MODEL.id, source)
   for (const value of [input.originalInput, input.answer, input.rubric]) {

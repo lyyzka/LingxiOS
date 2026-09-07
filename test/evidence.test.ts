@@ -1,3 +1,5 @@
+import { MemoryModelBudgetStore } from '../src/control-plane/memory-store.js'
+import { durableProtocol } from './protocol-fixture.js'
 import { MemoryStepStore } from '../src/control-plane/steps.js'
 import { appendResearchEvidence } from '../src/context/research-evidence.js'
 import { createTaskContract } from '../src/context/task-contract.js'
@@ -28,15 +30,15 @@ it('delivers the latest recorded version of each artifact path', () => {
   assert.deepEqual(snapshotArtifacts([{ ...first, path: '报告/章节 1.txt' }]), [{ ...first, path: '报告/章节 1.txt' }])
 })
 
-it('restores prior artifact records without silently adding them to current delivery', async () => {
+it('restores prior artifact records for current verification and keeps uncertainty visible', async () => {
   let now = Date.now()
   const workStore = new MemoryWorkStore({}, () => now)
   const steps = new MemoryStepStore()
   const messages: AssistantMessage[] = []
-  const service = new ControlPlaneService({ work: workStore, steps, sessions: new MemorySessionStore(), events: new MemoryEventStore(), actions: new MemoryActionLedger(),
+  const service = new ControlPlaneService({ modelBudgets: new MemoryModelBudgetStore(), steps, work: workStore, sessions: new MemorySessionStore(), events: new MemoryEventStore(), actions: new MemoryActionLedger(),
     contextProvider: { loadContext: async () => ({ persona: { name: 'A', role: 'assistant', instructions: '' }, capabilities: [],
       messages: [{ ref: 'm', authorId: 'u', authorName: 'U', authorKind: 'human', body: 'Deliver the report', createdAt: 'now' }] }) },
-    capabilityResolver: { resolve: async () => [] }, actionExecutor: { execute: async () => ({ ok: false }) },
+    capabilityResolver: { resolve: async () => [] }, actionExecutor: { prepare: async () => {}, execute: async () => ({ ok: false }) },
     delivery: { onEvent: async () => {}, deliverMessage: async (_work, message) => { messages.push(message) } } })
   await service.enqueue({ id: 'artifacts', tenantId: 't', agentId: 'a', sessionId: 's', principalId: 'u', kind: 'turn', lane: 'interactive', triggerRef: 'm', meta: { text: 'Deliver the report' } })
   const first = (await service.claim('worker'))!
@@ -54,7 +56,7 @@ it('restores prior artifact records without silently adding them to current deli
   assert.ok(resumed.fence > first.fence)
   assert.deepEqual((await service.loadContext(resumed)).priorArtifacts, [artifact])
   await assert.rejects(service.loadContext(first), /lease lost/)
-  const host: HostPort = {
+  const host: HostPort = { ...durableProtocol(),
     claimWork: async () => null, heartbeat: work => service.heartbeat(work), loadContext: work => service.loadContext(work),
     executeAction: (work, action) => service.executeAction(work, action), emitEvent: (work, event) => service.recordEvent(work, event),
     loadSession: (work, key) => service.getSession(work, key), saveSession: async (work, session) => { session.revision = (await service.saveSession(work, session)).revision },
@@ -70,7 +72,9 @@ it('restores prior artifact records without silently adding them to current deli
   }
   await new AgentRuntime(host, model, { execute: async () => { throw new Error('unexpected') } }).runWork(resumed)
   assert.equal(messages.length, 1)
-  assert.deepEqual(messages[0]!.envelope!.artifacts, [])
+  assert.deepEqual(messages[0]!.envelope!.artifacts, [artifact])
+  assert.equal(messages[0]!.envelope.goalOutcome.status, 'partial')
+  assert.equal(messages[0]!.envelope.goalOutcome.verification, 'inconclusive')
 })
 
 it('freezes source versions, allows prose around citations and does not invent semantic support', () => {
@@ -94,7 +98,7 @@ it('uses the original evidence across hops and rejects a tampered final envelope
   const sessions = new MemorySessionStore()
   const messages: AssistantMessage[] = []
   let contextLoads = 0
-  const service = new ControlPlaneService({
+  const service = new ControlPlaneService({ modelBudgets: new MemoryModelBudgetStore(), steps: new MemoryStepStore(),
     work: new MemoryWorkStore(), sessions, events: new MemoryEventStore(), actions: new MemoryActionLedger(),
     contextProvider: { loadContext: async () => {
       contextLoads++
@@ -104,12 +108,12 @@ it('uses the original evidence across hops and rejects a tampered final envelope
         evidence: [{ marker: contextLoads === 1 ? 'S1' : 'S2', sourceId: 'source', sourceVersion: contextLoads === 1 ? 'v1' : 'v2', chunkId: 'chunk', title: 'Title', excerpt: contextLoads === 1 ? 'ORIGINAL_EVIDENCE' : 'REPLACED_EVIDENCE' }],
       }
     } },
-    capabilityResolver: { resolve: async () => [] }, actionExecutor: { execute: async () => ({ ok: false }) },
+    capabilityResolver: { resolve: async () => [] }, actionExecutor: { prepare: async () => {}, execute: async () => ({ ok: false }) },
     delivery: { onEvent: async () => {}, deliverMessage: async (_work, message) => { messages.push(message) } },
   })
   await service.enqueue({ id: 'w', tenantId: 't', agentId: 'a', principalId: 'u', sessionId: 's', threadId: '', kind: 'turn', lane: 'interactive', triggerRef: 'm', meta: { text: 'Explain with sources.' } })
   const work = (await service.claim('worker'))!
-  const host: HostPort = {
+  const host: HostPort = { ...durableProtocol(),
     claimWork: async () => null, heartbeat: (item) => service.heartbeat(item), loadContext: (item) => service.loadContext(item),
     executeAction: (item, action) => service.executeAction(item, action), emitEvent: (item, event) => service.recordEvent(item, event),
     loadSession: (item, key) => service.getSession(item, key), saveSession: async (item, session) => { session.revision = (await service.saveSession(item, session)).revision },
@@ -178,14 +182,14 @@ it('promotes recorded research text into the next model input and validates fina
   const messages: AssistantMessage[] = []
   let completion: unknown
   const source = { text: 'Observed research finding.', finalUrl: 'https://example.com/paper', sha256: 'a'.repeat(64) }
-  const service = new ControlPlaneService({ work: new MemoryWorkStore(), sessions: new MemorySessionStore(), events: new MemoryEventStore(), actions: new MemoryActionLedger(),
+  const service = new ControlPlaneService({ modelBudgets: new MemoryModelBudgetStore(), steps: new MemoryStepStore(), work: new MemoryWorkStore(), sessions: new MemorySessionStore(), events: new MemoryEventStore(), actions: new MemoryActionLedger(),
     contextProvider: { loadContext: async () => ({ persona: { name: 'A', role: 'assistant', instructions: '' }, capabilities: ['research'],
       messages: [{ ref: 'm', authorId: 'u', authorName: 'U', authorKind: 'human', body: 'Read the paper and cite its finding.', createdAt: 'now' }] }) },
-    capabilityResolver: { resolve: async () => [{ name: 'research', methods: ['read'] }] }, actionExecutor: { execute: async () => ({ ok: true, value: source }) },
+    capabilityResolver: { resolve: async () => [{ name: 'research', methods: ['read'] }] }, actionExecutor: { prepare: async () => {}, execute: async () => ({ ok: true, value: source }) },
     delivery: { onEvent: async () => {}, deliverMessage: async (_work, message) => { messages.push(message) } } })
   await service.enqueue({ id: 'research', tenantId: 't', agentId: 'a', sessionId: 's', principalId: 'u', kind: 'turn', lane: 'interactive', triggerRef: 'm', meta: { text: 'Read the paper and cite its finding.' } })
   const work = (await service.claim('worker'))!
-  const host: HostPort = {
+  const host: HostPort = { ...durableProtocol(),
     claimWork: async () => null, heartbeat: work => service.heartbeat(work), loadContext: work => service.loadContext(work),
     executeAction: (work, action) => service.executeAction(work, action), emitEvent: (work, event) => service.recordEvent(work, event),
     loadSession: (work, key) => service.getSession(work, key), saveSession: async (work, session) => { session.revision = (await service.saveSession(work, session)).revision },

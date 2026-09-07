@@ -35,11 +35,11 @@ export function gradeResources(requestVersion: number, expectations: readonly Re
 }
 
 /** Run only against an isolated evaluation app/queue. This executes real work, not trace replay. */
-export async function executeRequest(app: Awaited<ReturnType<typeof createLingxiOS>>, input: RequestInput) {
+export async function executeRequest(app: Awaited<ReturnType<typeof createLingxiOS>>, worker: { runNext(): Promise<boolean> }, input: RequestInput) {
   const work = await app.enqueue(input)
   if (work.deduplicated) throw new Error('evaluation request already exists; use a new request identity for a fresh execution')
   const identity = { runId: work.id, tenantId: input.tenantId, agentId: input.agentId, sessionId: input.sessionId }
-  const workDequeued = await app.runNext()
+  const workDequeued = await worker.runNext()
   const [message, outcome, externalDelivery] = await Promise.all([app.readMessage(identity), app.readOutcome(identity), app.readDelivery(identity)])
   return { mode: 'runtime_execution' as const, identity, workDequeued, message, outcome, externalDelivery,
     delivery: message ? 'observed' as const : 'not_observed' as const,

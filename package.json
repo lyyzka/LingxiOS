@@ -1,7 +1,7 @@
 {
   "name": "lingxios",
   "version": "2.0.0",
-  "description": "LingxiOS — a purpose-built, production-grade Agent OS: durable work orchestration, sandboxed code-act kernels, and a policy-extensible agent runtime.",
+  "description": "Durable agent execution for PostgreSQL with fenced workers, native tools, verified outcomes, and sandboxed Python.",
   "type": "module",
   "license": "MIT",
   "repository": {
@@ -34,14 +34,6 @@
     "./ui": {
       "types": "./dist/src/ui/index.d.ts",
       "import": "./dist/src/ui/index.js"
-    },
-    "./lingxiloop": {
-      "types": "./dist/src/integrations/lingxiloop/index.d.ts",
-      "import": "./dist/src/integrations/lingxiloop/index.js"
-    },
-    "./lecture-deck": {
-      "types": "./dist/src/lecture-deck/index.d.ts",
-      "import": "./dist/src/lecture-deck/index.js"
     }
   },
   "bin": {
@@ -52,28 +44,16 @@
   "scripts": {
     "build": "node scripts/build.mjs",
     "prepack": "npm run build",
-    "prepublishOnly": "npm run check:release",
+    "prepublishOnly": "node scripts/check-release.mjs --package-only",
     "check:release": "node scripts/check-release.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "npm run build && node --test --test-concurrency=1 \"dist/test/**/*.test.js\"",
     "test:only": "node --test --test-concurrency=1 \"dist/test/**/*.test.js\"",
     "eval:live": "npm run build && node scripts/eval-live.mjs",
-    "test:contracts": "node scripts/check-lingxiloop-contracts.mjs",
     "test:postgres-stores": "npm run build && node scripts/test-postgres-stores.mjs",
-    "test:native-missions": "npm run build && node scripts/test-native-missions.mjs",
-    "test:native-learning": "node scripts/test-native-learning.mjs",
-    "test:native-evidence": "npm run build && node scripts/test-native-evidence.mjs",
-    "test:native-polls": "npm run build && node scripts/test-native-polls.mjs",
-    "test:native-presentations": "npm run build && node scripts/test-native-presentations.mjs",
     "worker": "node dist/src/worker/main.js",
     "test:worker-image": "node scripts/test-worker-image.mjs",
-    "test:worker-recovery": "npm run build && node scripts/test-worker-recovery.mjs",
-    "test:native-teacher": "node scripts/test-native-teacher.mjs",
-    "test:native-canvas": "node scripts/test-native-canvas.mjs",
-    "test:native-canvas-work": "npm run build && node scripts/test-native-canvas-work.mjs",
-    "test:native-documents": "npm run build && node scripts/test-native-documents.mjs",
-    "test:native-document-content": "npm run build && node scripts/test-native-document-content.mjs",
-    "test:native-calendar": "npm run build && node scripts/test-native-calendar.mjs"
+    "test:worker-recovery": "npm run build && node scripts/test-worker-recovery.mjs"
   },
   "devDependencies": {
     "@electric-sql/pglite": "0.5.8",

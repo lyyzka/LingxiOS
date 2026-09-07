@@ -42,13 +42,13 @@ const { extractDocumentText } = await import(new URL(${JSON.stringify(`./node_mo
 const parsedPdf = await extractDocumentText(Buffer.from(${JSON.stringify(pdfFixture(['中文安装验证'], true).toString('base64'))}, 'base64'), 'pdf')
 assert.match(parsedPdf, /中文安装验证/)
 assert.match(parsedPdf, /OCR are not represented/)
-import { startWorker } from ${JSON.stringify(`${pkg.name}/worker`)}
-import { createLingxiLoop } from ${JSON.stringify(`${pkg.name}/lingxiloop`)}
+import { startWorker, createWorker } from ${JSON.stringify(`${pkg.name}/worker`)}
 import { gradeResources } from ${JSON.stringify(`${pkg.name}/eval`)}
 assert.deepEqual(gradeResources(1, [{ id: 'saved', resource: 'doc', expected: true }], [{ resource: 'doc', requestVersion: 1, value: true }]), [{ checkId: 'saved', status: 'pass' }])
 assert.equal(typeof createLingxiOS, 'function')
 assert.equal(typeof startWorker, 'function')
-assert.equal(typeof createLingxiLoop, 'function')
+assert.equal(typeof createWorker, 'function')
+for (const retired of ['lingxiloop','lecture-deck']) await assert.rejects(import(${JSON.stringify(pkg.name)} + '/' + retired), { code: 'ERR_PACKAGE_PATH_NOT_EXPORTED' })
 const browserContext = vm.createContext({ structuredClone })
 async function browserModule(url) {
   const module = new vm.SourceTextModule(await readFile(url, 'utf8'), { context: browserContext, identifier: url.href })
@@ -94,17 +94,19 @@ const modelServer = http.createServer((request, response) => {
   })
 })
 await new Promise(resolve => modelServer.listen(0, '127.0.0.1', resolve))
-const application = await createLingxiOS({ database: pool, model: { id: 'fixture', apiKey: 'fixture', baseUrl: 'http://127.0.0.1:' + modelServer.address().port },
+const application = await createLingxiOS({ database: pool, homesRoot: join(process.cwd(), 'app-homes') })
+const localWorker = createWorker({ controlPlane: application, model: { id: 'fixture', apiKey: 'fixture', baseUrl: 'http://127.0.0.1:' + modelServer.address().port },
   kernel: { homesRoot: join(process.cwd(), 'app-homes') } })
 try {
   const identity = { runId: 'packaged-work', tenantId: 'tenant', agentId: 'agent', sessionId: 'session' }
   await application.enqueue({ ...identity, id: identity.runId, principalId: 'user', text: 'Calculate six times seven using Python.' })
-  assert.equal(await application.runNext(), true)
+  assert.equal(application.runNext, undefined)
+  assert.equal(await localWorker.runNext(), true)
   assert.equal((await application.readMessage(identity)).body, '42')
   assert.equal((await application.readMessage(identity)).version, releaseVersions.assistantMessage)
   assert.equal((await application.readOutcome(identity)).status, 'satisfied')
   assert.equal(modelCalls, 2)
-  const control = await createLingxiOS({ database: pool, kernel: { homesRoot: join(process.cwd(), 'remote-homes') } })
+  const control = await createLingxiOS({ database: pool, homesRoot: join(process.cwd(), 'remote-homes') })
   let remoteWorker
   try {
     modelCalls = 0
@@ -124,6 +126,7 @@ try {
     await control.stop()
   }
 } finally {
+  await localWorker.stop()
   await application.stop()
   await database.close()
   await new Promise(resolve => modelServer.close(resolve))

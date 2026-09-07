@@ -42,7 +42,7 @@ for (const [code, expected] of [
   assert.equal(exhausted.error, undefined, 'kernel must terminate within its own CPU limit')
   if (expected) assert.match(exhausted.stderr, expected)
 }
-for (const name of ['lingxios', 'lingxios/worker', 'lingxios/lingxiloop', 'lingxios/eval', 'lingxios/ui']) await import(name)
+for (const name of ['lingxios', 'lingxios/worker', 'lingxios/eval', 'lingxios/ui']) await import(name)
 const invalid = spawnSync(process.execPath, ['dist/src/worker/main.js'], { encoding: 'utf8', timeout: 5000 })
 assert.equal(invalid.status, 1)
 assert.match(invalid.stderr, /missing required environment variable: AGENT_OS_CONTROL_PLANE_URL/)
@@ -86,7 +86,7 @@ try {
     await delay(50)
   }
   assert.ok(ready, logs)
-  assert.ok(requests.every(request => JSON.stringify(request) === JSON.stringify(['POST', '/v4/work/claim', 'Bearer image-test'])))
+  assert.ok(requests.every(request => JSON.stringify(request) === JSON.stringify(['POST', '/v5/work/claim', 'Bearer image-test'])))
   assert.equal((await fetch('http://127.0.0.1:5190/healthz')).status, 200)
   assert.equal((await fetch('http://127.0.0.1:5190/metrics')).status, 200)
   worker.kill('SIGTERM')
