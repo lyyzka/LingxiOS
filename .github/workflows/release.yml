@@ -17,11 +17,11 @@ jobs:
         with:
           repository: lyyzka/LingxiLoop
           ref: 27295d82137ae6bcfb96d09ab139d5b780e0806b
-          path: ../LingxiLoop
+          path: .native/LingxiLoop
       - run: npm ci --ignore-scripts
       - run: npm run check:release -- --deterministic
         env:
-          LINGXILOOP_SOURCE: ${{ github.workspace }}/../LingxiLoop/server/src
+          LINGXILOOP_SOURCE: ${{ github.workspace }}/.native/LingxiLoop/server/src
 
   windows-package:
     runs-on: windows-2025
