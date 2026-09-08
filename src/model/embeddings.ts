@@ -33,12 +33,22 @@ export class OpenAIEmbeddingDriver {
     // UTF-8 bytes conservatively bound input tokens without a tokenizer dependency.
     if (!Array.isArray(input) || !input.length || input.length > 32
       || input.some(text => typeof text !== 'string' || !text.trim() || Buffer.byteLength(text) > 8000)) throw new Error('embedding input requires 1-32 nonempty strings of at most 8000 UTF-8 bytes')
-    const combined = AbortSignal.any([...(signal ? [signal] : []), AbortSignal.timeout(this.timeoutMs)])
+    const timeout = new AbortController()
+    const timer = setTimeout(() => timeout.abort(new Error(`embedding request timeout after ${this.timeoutMs}ms`)), this.timeoutMs)
+    timer.unref?.()
+    const combined = AbortSignal.any([...(signal ? [signal] : []), timeout.signal])
     combined.throwIfAborted()
-    const response = await fetch(this.endpoint, { method: 'POST', redirect: 'error', signal: combined,
-      headers: { 'content-type': 'application/json', authorization: `Bearer ${this.options.apiKey}` },
-      body: JSON.stringify({ model: this.options.id, input, encoding_format: 'float',
-        ...(this.options.dimensions === undefined ? {} : { dimensions: this.options.dimensions }) }) })
+    try {
+    let response: Response
+    try {
+      response = await fetch(this.endpoint, { method: 'POST', redirect: 'error', signal: combined,
+        headers: { 'content-type': 'application/json', authorization: `Bearer ${this.options.apiKey}` },
+        body: JSON.stringify({ model: this.options.id, input, encoding_format: 'float',
+          ...(this.options.dimensions === undefined ? {} : { dimensions: this.options.dimensions }) }) })
+    } catch (error) {
+      combined.throwIfAborted()
+      throw error
+    }
     if (!response.ok) {
       await response.body?.cancel()
       // Provider error bodies may echo credentials or input; never persist them in work errors.
@@ -78,5 +88,6 @@ export class OpenAIEmbeddingDriver {
     const prompt = result.usage?.prompt_tokens, total = result.usage?.total_tokens
     const available = Number.isSafeInteger(prompt) && Number(prompt) >= 0 && Number.isSafeInteger(total) && Number(total) >= Number(prompt)
     return { model: result.model, vectors, usage: { available, inputTokens: available ? Number(prompt) : 0, totalTokens: available ? Number(total) : 0 } }
+    } finally { clearTimeout(timer) }
   }
 }
