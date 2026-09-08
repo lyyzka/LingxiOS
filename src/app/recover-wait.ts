@@ -7,7 +7,8 @@ import { isDeepStrictEqual } from 'node:util'
 import type { GoalOutcome } from '../protocol/outcome.js'
 
 /** Durable terminal receipts recover a wait without rerunning Python or any business action. */
-export async function recoverWait(database: SqlPool, service: ControlPlaneService, work: WorkItem): Promise<boolean> {
+export async function recoverWait(database: SqlPool, service: ControlPlaneService, work: WorkItem, signal?: AbortSignal): Promise<boolean> {
+  signal?.throwIfAborted()
   const session = await service.getSession(work, sessionKeyOf(work))
   if (!session?.request || session.request.workId !== work.id) return false
   const current = await service.heartbeat(work)
@@ -29,6 +30,7 @@ export async function recoverWait(database: SqlPool, service: ControlPlaneServic
   if (!rows.length) return false
   const continuedAfterWait = rows.some((row, index) => index < rows.length - 1
     && (row['result'] as HostActionResult | null)?.directive?.type === 'defer')
+  signal?.throwIfAborted()
   if (rows.length > 100 || continuedAfterWait) {
     const goalOutcome: GoalOutcome = { status: 'blocked', verification: 'inconclusive', requestVersion,
       gaps: [continuedAfterWait ? 'Actions followed a terminal wait; reconcile before continuing' : 'Action recovery exceeds the bounded receipt limit'] }
@@ -66,6 +68,7 @@ export async function recoverWait(database: SqlPool, service: ControlPlaneServic
       if (!active.rows.length) return false
     }
   } else return false
+  signal?.throwIfAborted()
   const callIndex = session.history.lastIndexOf(call)
   if (!session.history.slice(callIndex + 1).some(item => 'type' in item && item.type === 'function_call_output' && item.callId === call.callId)) {
     session.history.push({ type: 'function_call_output', callId: call.callId, output: boundedToolOutput({

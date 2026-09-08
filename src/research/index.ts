@@ -74,22 +74,7 @@ export function parseOpenAlex(value: unknown, count: number): ResearchSearchResu
   return results
 }
 
-export function decodeHtml(value: string): string {
-  return value
-    .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, ' ')
-    .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, ' ')
-    .replace(/<noscript\b[^>]*>[\s\S]*?<\/noscript>/gi, ' ')
-    .replace(/<[^>]+>/g, ' ')
-    .replace(/&nbsp;/gi, ' ')
-    .replace(/&amp;/gi, '&')
-    .replace(/&lt;/gi, '<')
-    .replace(/&gt;/gi, '>')
-    .replace(/&quot;/gi, '"')
-    .replace(/&#39;|&apos;/gi, "'")
-    .replace(/&#(\d+);/g, (_match, code: string) => Number(code) <= 0x10ffff ? String.fromCodePoint(Number(code)) : '\uFFFD')
-    .replace(/\s+/g, ' ')
-    .trim()
-}
+export { decodeHtml } from '../context/html.js'
 
 export async function readResearch(rawUrl: string, options: ResearchOptions = {}): Promise<{
   url: string; finalUrl: string; contentType: string; text: string; bytes: number; sha256: string; truncated: boolean
@@ -98,9 +83,9 @@ export async function readResearch(rawUrl: string, options: ResearchOptions = {}
   if (contentType !== 'application/pdf' && !contentType.startsWith('text/') && contentType !== 'application/json' && contentType !== 'application/xhtml+xml') {
     throw new Error(`unsupported research content type: ${contentType}`)
   }
-  const raw = contentType === 'application/pdf' ? await extractDocumentText(body, 'pdf') : decodeSourceText(body)
+  const format = contentType === 'application/pdf' ? 'pdf' : contentType.includes('html') ? 'html' : 'source'
+  const text = await extractDocumentText(body, format, options.signal)
   options.signal?.throwIfAborted()
-  const text = contentType.includes('html') || contentType.includes('xhtml') ? decodeHtml(raw) : raw.trim()
   return {
     url: rawUrl,
     finalUrl,

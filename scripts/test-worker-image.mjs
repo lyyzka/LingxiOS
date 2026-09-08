@@ -70,10 +70,10 @@ let claims = 0
 const requests = []
 const host = createServer((req, res) => {
   requests.push([req.method, req.url, req.headers.authorization])
-  claims++
   req.resume()
-  // Leave the wake wait pending to exercise HTTP cancellation on SIGTERM.
-  if (claims === 1) res.writeHead(200, { 'content-type': 'application/json' }).end('null')
+  // Control notifications have an independent wait, including while the claim loop is busy.
+  if (req.url === '/v5/work/claim') { claims++; res.writeHead(200, { 'content-type': 'application/json' }).end('null') }
+  // Leave wake waits pending to exercise HTTP cancellation on SIGTERM.
 })
 host.listen(0, '127.0.0.1')
 await once(host, 'listening')
@@ -93,16 +93,15 @@ try {
     try {
       const response = await fetch('http://127.0.0.1:5190/readyz')
       const status = await response.json()
-      ready = response.ok && status.ok && status.activeRuns === 0 && claims >= 2
+      ready = response.ok && status.ok && status.activeRuns === 0 && claims === 1 && requests.some(request => request[1] === '/v5/work/wait')
     } catch {}
     if (ready || worker.exitCode !== null) break
     await delay(50)
   }
   assert.ok(ready, logs)
-  assert.deepEqual(requests, [
-    ['POST', '/v5/work/claim', 'Bearer image-test'],
-    ['POST', '/v5/work/wait', 'Bearer image-test'],
-  ])
+  assert.equal(claims, 1)
+  assert.ok(requests.every(request => request[0] === 'POST' && request[2] === 'Bearer image-test'
+    && ['/v5/work/claim', '/v5/work/wait'].includes(request[1])))
   assert.equal((await fetch('http://127.0.0.1:5190/healthz')).status, 200)
   assert.equal((await fetch('http://127.0.0.1:5190/metrics')).status, 200)
   worker.kill('SIGTERM')

@@ -10,7 +10,8 @@ import { candidateActions, inspectActions } from '../outcome/action-check.js'
 import { workStatusOf } from '../protocol/types.js'
 import { ControlPlaneServer } from '../control-plane/http-server.js'
 import { checkStorage } from './storage.js'
-import { captureMemoryEvidence, retryMemorySynthesis, scheduleMemoryReflection } from '../memory/evidence.js'
+import { drainMemoryCapture } from '../memory/capture.js'
+import { retryMemorySynthesis, scheduleMemoryReflection } from '../memory/evidence.js'
 import { readArtifact, persistArtifacts, stageArtifact, inspectArtifacts, createNativeArtifact } from './artifacts.js'
 import { resolve } from 'node:path'
 import { snapshotAttachments, type RequestAttachment } from '../context/attachments.js'
@@ -92,6 +93,8 @@ export interface LingxiOSOptions {
 }
 
 export interface RequestInput {
+  /** Trusted admission class, not inferred from user text. Long tools belong to operation jobs. */
+  executionClass?: import('../protocol/types.js').ExecutionClass
   id?: string
   sourceRef?: string
   tenantId: string
@@ -140,13 +143,16 @@ export interface RunVerificationContext {
   deadlineAt: string
 }
 
-function requestPolicyMeta(input: Pick<RequestInput, 'codeExecution' | 'deliveryMode' | 'mode' | 'obligations'>): {
+function requestPolicyMeta(input: Pick<RequestInput, 'codeExecution' | 'deliveryMode' | 'mode' | 'obligations' | 'executionClass'>): {
+  executionClass: import('../protocol/types.js').ExecutionClass;
   codeExecution?: CodeExecutionMode; deliveryMode?: DeliveryMode; mode?: HarnessMode; obligations?: DeliveryObligation[]
 } {
+  if (input.executionClass !== undefined && !['conversation', 'operation'].includes(input.executionClass)) throw new Error('invalid execution class')
   if (input.mode !== undefined) executionMode({ meta: { mode: input.mode } })
   if (input.codeExecution !== undefined && !['enabled','disabled'].includes(input.codeExecution)) throw new Error('invalid codeExecution policy')
   if (input.deliveryMode !== undefined && !['auto','text','action'].includes(input.deliveryMode)) throw new Error('invalid deliveryMode policy')
   return {
+    executionClass: input.executionClass ?? (input.mode === 'chat' ? 'conversation' : 'operation'),
     ...(input.mode ? { mode: input.mode } : {}),
     ...(input.obligations ? { obligations: snapshotObligations(input.obligations) } : {}),
     ...(input.codeExecution ? { codeExecution: input.codeExecution } : {}),
@@ -218,15 +224,15 @@ export async function createLingxiOS(options: LingxiOSOptions) {
     behavior.presentations = presentations.map(({ type, version, description, actions }) => ({ type, version, description, actions }))
     behavior.hash = textSha256(canonicalJson({ ...behavior, tools: definitions.map(toolContractHash) }))
   }
-  const policyMeta = (input: Pick<RequestInput, 'mode' | 'codeExecution' | 'deliveryMode' | 'obligations'>) => {
+  const policyMeta = (input: Pick<RequestInput, 'mode' | 'codeExecution' | 'deliveryMode' | 'obligations' | 'executionClass'>) => {
     const mode = input.mode ?? options.harness?.mode
     if (options.harness && ['chat','read','execute'].indexOf(mode!) > ['chat','read','execute'].indexOf(options.harness.mode)) throw new Error('request cannot widen its harness mode')
     return { ...requestPolicyMeta({ ...input, ...(mode ? { mode } : {}) }), ...(behavior ? { harnessHash: behavior.hash } : {}) }
   }
   const integration = {
     tools: [...TASK_TOOLS, ...definitions.map(toolSpecification)],
-    actionExecutor: toolExecutor(options.database, definitions, (work, input) => createNativeArtifact(
-      resolve(options.homesRoot ?? process.env['AGENT_OS_HOMES_ROOT'] ?? '.agent-os/homes'), work, input), options.memory),
+    actionExecutor: toolExecutor(options.database, definitions, (work, input, signal) => createNativeArtifact(
+      resolve(options.homesRoot ?? process.env['AGENT_OS_HOMES_ROOT'] ?? '.agent-os/homes'), work, input, signal), options.memory),
     capabilityResolver: { async resolve(work: Omit<WorkItem, 'leaseToken'>) {
       await authorizeConversationWork(options.database, work)
       if (memory && ['memory_synthesis','memory_index','memory_evaluation'].includes(work.kind)) return [{ name: work.kind,
@@ -252,9 +258,9 @@ export async function createLingxiOS(options: LingxiOSOptions) {
         ...helperTools.map(tool => ({ name: tool.action.split('.')[0]!, methods: [tool.action.split('.')[1]!] })),
         ...memory?[{name:'memory',methods:memory.tools.filter(tool=>tool.action.startsWith('memory.')).map(tool=>tool.action.split('.')[1]!)}]:[]]
     } },
-    contextProvider: { async loadContext(work: Omit<WorkItem, 'leaseToken'>) {
+    contextProvider: { async loadContext(work: Omit<WorkItem, 'leaseToken'>, signal?: AbortSignal) {
       if (behavior && !['memory_synthesis','memory_index','memory_evaluation'].includes(work.kind) && work.meta?.['harnessHash'] !== behavior.hash) throw new Error('harness version mismatch; resume with the pinned deployment or drain the old run')
-      const context = { ...await contextProvider.loadContext(work), ...(behavior ? { harness: structuredClone(behavior) } : {}) }
+      const context = { ...await contextProvider.loadContext(work, signal), ...(behavior ? { harness: structuredClone(behavior) } : {}) }
       if (work.conversation) {
         if ((context.evidence?.length || context.memory || context.dynamic) && (!context.audience || !containsAudience(context.audience, work.conversation.audience))) {
           throw new Error('IM context evidence, memory and dynamic data require an authorized audience')
@@ -275,7 +281,7 @@ export async function createLingxiOS(options: LingxiOSOptions) {
       const previewVersion = options.realtime?.allowDraft ? Number((await options.database.query(
         'SELECT jsonb_array_length(steer_inputs)+1 AS version FROM lingxios.agent_work_items WHERE id=$1', [work.id])).rows[0]?.['version']) : 1
       return { ...context, previewAllowed: await realtime.allowed(work, previewVersion), ...(discoveredTools ? { discoveredTools } : {}),
-        ...(memory && !['memory_synthesis','memory_index','memory_evaluation'].includes(work.kind) ? { memory: await memory.context(work) } : {}) }
+        ...(memory && !['memory_synthesis','memory_index','memory_evaluation'].includes(work.kind) ? { memory: await memory.context(work, signal) } : {}) }
     } },
     ...(options.delivery ? { delivery: options.delivery } : {}),
   }
@@ -340,8 +346,8 @@ export async function createLingxiOS(options: LingxiOSOptions) {
     ...memory ? { memory } : {},
     ...(integration?.tools ? { tools: integration.tools } : {}),
     steps: new PgStepStore(options.database),
-    verifyCandidate: async (work, candidate) => {
-      const records = [...await inspectArtifacts(homesRoot, work, candidate.artifacts),
+    verifyCandidate: async (work, candidate, signal) => {
+      const records = [...await inspectArtifacts(homesRoot, work, candidate.artifacts, signal),
         ...await inspectActions(options.database, work, candidate.requestVersion, integration?.tools ?? [], integration?.actionExecutor)]
       const hash = candidateHash(candidate)
       await withTransaction(options.database, async client => {
@@ -363,8 +369,10 @@ export async function createLingxiOS(options: LingxiOSOptions) {
     work: new PgWorkStore(options.database), sessions,
     events: new PgEventStore(options.database, Boolean(integration?.delivery)), actions: new PgActionLedger(options.database),
     modelBudgets: new PgModelBudgetStore(options.database), modelBudget,
-    artifactStager: { stage: (work, artifact, bytes) => stageArtifact(
-      resolve(options.homesRoot ?? process.env['AGENT_OS_HOMES_ROOT'] ?? '.agent-os/homes'), work, artifact, bytes) },
+    artifactStager: {
+      stage: (work, artifact, bytes, signal) => stageArtifact(homesRoot, work, artifact, bytes, signal),
+      stream: (work, artifact, bytes, signal) => stageArtifact(homesRoot, work, artifact, bytes, signal),
+    },
     contextProvider: integration.contextProvider,
     ...options.performance?.contextSnapshot === false ? {} : { contextSnapshot: (work: Omit<WorkItem, 'leaseToken'>) => sessions.context(work) },
     capabilityResolver: integration.capabilityResolver,
@@ -437,8 +445,9 @@ export async function createLingxiOS(options: LingxiOSOptions) {
                 OR COALESCE(resolved.result,receipt.result)->'approval'->>'status'='PENDING') LIMIT 1`, [work.id])
             if (unresolved.rows.length) throw new Error('unresolved effects prevent successful completion')
           }
-          if (recordMemory && !['awaiting_input','awaiting_approval','delegated'].includes(message.envelope.goalOutcome.status)) await captureMemoryEvidence(client, work, message,
-            await authorizedScopes(options.memory!,identityOf(work),client),options.memory!.writePolicy)
+          if (recordMemory && !['awaiting_input','awaiting_approval','delegated'].includes(message.envelope.goalOutcome.status)) {
+            await client.query('INSERT INTO lingxios.agent_memory_capture(result_id) VALUES($1) ON CONFLICT DO NOTHING', [resultId])
+          }
           const status = workStatusOf({ status: 'completed', goalOutcome: message.envelope.goalOutcome })
           await client.query(`UPDATE lingxios.agent_work_items SET status=$3,result_id=$4,goal_outcome=$5::jsonb,
             lease_token_hash=NULL,lease_expires_at=NULL,finished_at=CASE WHEN $3='waiting' THEN NULL ELSE NOW() END,
@@ -456,36 +465,49 @@ export async function createLingxiOS(options: LingxiOSOptions) {
             integration.delivery ? JSON.stringify(work) : null])
         })
         if (options.performance?.notifications !== false) { runWakeup.notify(); workWakeup.notify() }
+        if (memory) background('memory capture', () => drainMemoryCapture(options.database, options.memory!, shutdown.signal))
+        background(`dependencies:${work.id}`, () => resumeDependents(options.database, work.id))
         background('deliveries', flushDeliveries)
         background('events', flushEvents)
       },
     },
   })
-  async function claimWork(claimingWorkerId: string, requestId?: string, workKinds?: readonly string[], lanes?: readonly WorkItem['lane'][]) {
-    const work = await service.claim(claimingWorkerId, requestId, workKinds, lanes)
-    if (!work) return null
-    await service.reconcilePending(work)
-    await executeDecidedApprovals(options.database, service, work)
-    if (await recoverWait(options.database, service, work)) return null
-    return work
+  const claimWork = service.claim.bind(service)
+  const recoveries = new Map<string, Promise<boolean>>()
+  async function recoverWork(proof: import('../control-plane/service.js').LeaseProof, external?: AbortSignal) {
+    const leased = await service.requireLease(proof, { rejectCancelled: true })
+    const key = JSON.stringify([proof.id, proof.fence])
+    const prior = recoveries.get(key)
+    if (prior) return prior
+    const signal = AbortSignal.any([shutdown.signal, AbortSignal.timeout(30_000), ...external ? [external] : []])
+    const db = deadlinePool(options.database, signal)
+    const work = { ...leased, leaseToken: proof.leaseToken }
+    const recovery = (async () => {
+      await service.reconcilePending(work, signal)
+      signal.throwIfAborted()
+      await executeDecidedApprovals(db, service, work, signal)
+      signal.throwIfAborted()
+      return recoverWait(db, service, work, signal)
+    })().finally(() => recoveries.delete(key))
+    recoveries.set(key, recovery)
+    return recovery
   }
   const host: HostPort = {
-    waitForWork,
+    waitForWork, recoverWork,
     streamPreview: (work, frames, signal) => realtime.receive(work, frames, signal ?? shutdown.signal),
     prepareMemoryReview: (work,action) => service.prepareMemoryReview(work,action),
     recordMemoryReview: (work,action,hash,review) => service.recordMemoryReview(work,action,hash,review),
-    verifyCandidate: (work, candidate) => service.verifyCandidate(work, candidate),
+    verifyCandidate: (work, candidate, signal) => service.verifyCandidate(work, candidate, signal),
     saveStep: (work, step) => service.saveStep(work, step),
     claimWork: async () => { throw new Error('connect a worker before claiming work') },
     heartbeat: work => service.heartbeat(work),
-    loadContext: (work) => service.loadContext(work), executeAction: (work, action, signal) => service.executeAction(work, action, signal),
-    loadInitialContext: work => service.loadContext(work, true),
+    loadContext: (work, signal) => service.loadContext(work, false, signal), executeAction: (work, action, signal) => service.executeAction(work, action, signal),
+    loadInitialContext: (work, signal) => service.loadContext(work, true, signal),
     reserveModelCall: (work, callId, limits) => service.reserveModelCall(work, callId, limits),
     recordModelUsage: (work, callId, usage, observation) => service.recordModelUsage(work, callId, usage, observation),
-    recoverCell: (work, cellId) => service.recoverCell(work, cellId),
+    recoverCell: (work, cellId, signal) => service.recoverCell(work, cellId, signal),
     recoverStep: (work, cellId) => service.recoverStep(work, cellId),
-    stageArtifact: (work, artifact, bytes) => stageArtifact(
-      resolve(options.homesRoot ?? process.env['AGENT_OS_HOMES_ROOT'] ?? '.agent-os/homes'), work, artifact, bytes),
+    stageArtifact: (work, artifact, bytes, signal) => service.stageArtifact(work, artifact, bytes, signal),
     emitEvent: (work, event) => service.recordEvent(work, event), loadSession: (work, key) => service.getSession(work, key),
     saveSession: async (work, session) => { session.revision = (await service.saveSession(work, session)).revision },
     commitResult: (work, message) => service.commitResult(work, message), completeWork: (work, completion) => service.complete(work, completion),
@@ -493,10 +515,16 @@ export async function createLingxiOS(options: LingxiOSOptions) {
     yieldWork: (work) => service.yieldWork(work),
   }
   const jobs = new Map<string, Promise<unknown>>()
+  const dirtyJobs = new Set<string>()
   const background = (name: string, operation: () => Promise<unknown>) => {
-    if (jobs.has(name) || stopped) return
-    const running = operation().catch(error => logger.warn(`${name} failed`, { error: error instanceof Error ? error.message : String(error) }))
-      .finally(() => { jobs.delete(name) })
+    if (stopped) return
+    if (jobs.has(name)) { dirtyJobs.add(name); return }
+    const running = (async () => {
+      do {
+        dirtyJobs.delete(name)
+        await operation().catch(error => logger.warn(`${name} failed`, { error: error instanceof Error ? error.message : String(error) }))
+      } while (!stopped && dirtyJobs.has(name))
+    })().finally(() => { jobs.delete(name); dirtyJobs.delete(name) })
     jobs.set(name, running)
   }
   const flushDeliveryChannels = () => {
@@ -511,6 +539,7 @@ export async function createLingxiOS(options: LingxiOSOptions) {
     background('dependencies', () => resumeDependents(options.database))
     background('approvals', () => resumeDecidedApprovals(options.database))
     background('queue fairness', () => sweepQueuedWork(options.database))
+    if (memory) background('memory capture', () => drainMemoryCapture(options.database, options.memory!, shutdown.signal))
     if (memory) background('memory synthesis', async () => {
       await retryMemorySynthesis(options.database)
       await scheduleMemoryReflection(options.database,options.memory!)
@@ -523,7 +552,11 @@ export async function createLingxiOS(options: LingxiOSOptions) {
   deliveryTimer.unref(); maintenanceTimer.unref()
   let stopped = false
   const notificationListener = options.performance?.notifications === false ? Promise.resolve() : listenWakeups(notificationPool, channel => {
-    if (channel === 'work') workWakeup.notify()
+    if (channel === 'work') {
+      workWakeup.notify()
+      background('dependencies', () => resumeDependents(options.database))
+      background('approvals', () => resumeDecidedApprovals(options.database))
+    }
     runWakeup.notify()
     if (channel === 'outbox') flushDeliveryChannels()
   }, shutdown.signal, logger)
@@ -535,17 +568,19 @@ export async function createLingxiOS(options: LingxiOSOptions) {
     connectWorker(input: { workerId: string; workKinds: readonly string[] }): HostPort {
       if (stopped) throw new Error('application has stopped')
       if (!input.workerId.trim()) throw new Error('workerId is required')
-      return { ...host, claimWork: async (signal, lanes) => {
+      return { ...host, claimWork: async (signal, lanes, executionClass) => {
         signal?.throwIfAborted()
         if (stopped) throw new Error('application has stopped')
-        return claimWork(input.workerId, undefined, input.workKinds, lanes)
+        return claimWork(input.workerId, undefined, input.workKinds, lanes, executionClass)
       } }
     },
     memory: memory?.api,
     conversations: {
       sync: (policy: import('../collaboration/types.js').ConversationPolicy) => syncConversation(options.database, policy),
       registerThread: (scope: import('../collaboration/types.js').ConversationIdentity & { threadId: string; policyVersion: number }) => registerThread(options.database, scope),
-      ingest: (input: import('../collaboration/types.js').IMMessageInput) => ingestMessage(options.database, input, policyMeta({})),
+      ingest: (input: import('../collaboration/types.js').IMMessageInput,
+        policy: Pick<RequestInput, 'mode' | 'codeExecution' | 'deliveryMode' | 'obligations' | 'executionClass'> = {}) =>
+        ingestMessage(options.database, input, policyMeta(policy)),
     },
     ...createCollaborationAPI(options.database),
     metrics: () => metrics.expose(),
@@ -572,7 +607,7 @@ export async function createLingxiOS(options: LingxiOSOptions) {
       ? reviseRun(transaction, identity, text, author) : withTransaction(options.database, db => reviseRun(db, identity, text, author)),
     async enqueueJob(input: JobInput, transaction?: SqlQueryable) {
       if (!input.principalId?.trim() || !input.text?.trim() || input.text.length > 100_000) throw new Error('job requires its authenticated principal and original request text')
-      const { mode: _reservedMode, obligations: _reservedObligations, codeExecution: _reservedCodeExecution, deliveryMode: _reservedDeliveryMode, ...jobMeta } = input.meta ?? {}
+      const { executionClass: _reservedClass, mode: _reservedMode, obligations: _reservedObligations, codeExecution: _reservedCodeExecution, deliveryMode: _reservedDeliveryMode, ...jobMeta } = input.meta ?? {}
       const work = { ...input, triggerRef: input.sourceRef ?? input.id ?? randomUUID(),
         meta: { ...jobMeta, ...policyMeta(input), text: input.text, authorName: input.authorName ?? 'User', attachments: snapshotAttachments(input.attachments ?? []) } }
       if (transaction) return enqueueWork(transaction, work)
@@ -666,7 +701,8 @@ export async function createLingxiOS(options: LingxiOSOptions) {
         if (canonicalJson(request) !== canonicalJson(delegation.parentRequest) || delegation.rootWorkId !== (parent.meta?.['rootWorkId'] ?? parent.id)
           || delegation.instructionAuthorId !== parent.agentId) throw new Error('delegation differs from its durable parent')
         return enqueueChild(db, parent, delegation.parentRequestVersion, { id: input.id ?? randomUUID(), agentId: input.agentId, text: input.text,
-          sessionId: input.sessionId, ...(input.threadId === undefined ? {} : { threadId: input.threadId }), meta: policyMeta(input) })
+          sessionId: input.sessionId, ...(input.executionClass ? { executionClass: input.executionClass } : {}),
+          ...(input.threadId === undefined ? {} : { threadId: input.threadId }), meta: policyMeta(input) })
       })
     },
     async readMessage(identity: MessageIdentity): Promise<AssistantMessage | null> {
@@ -731,7 +767,7 @@ export async function createLingxiOS(options: LingxiOSOptions) {
       if (controlPlane) throw new Error('control plane is already listening or starting')
       if (!input.serviceToken?.trim()) throw new ConfigError('control plane service token is required')
       if (!Number.isSafeInteger(input.port) || input.port < 0 || input.port > 65535) throw new ConfigError('control plane port must be 0-65535')
-      const server = new ControlPlaneServer({ service, claimWork, waitForWork, streamPreview: realtime.receive, serviceToken: input.serviceToken, logger, metrics,
+      const server = new ControlPlaneServer({ service, claimWork, recoverWork, waitForWork, streamPreview: realtime.receive, serviceToken: input.serviceToken, logger, metrics,
         ready: async () => {
           if (stopped) return false
           await checkStorage(options.database)

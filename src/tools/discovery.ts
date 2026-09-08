@@ -4,9 +4,9 @@ import type { ActionContext, ToolDefinition } from './definition.js'
 import { grantedTools, type ToolDefinition as ToolSpecification } from './catalog.js'
 import { permitsTool } from '../runtime/execution-policy.js'
 
-export function toolSpecification({ name, action, description, parameters, effect, approval, readback, semanticVersion, observation, preconditions, deferred }: ToolSpecification): ToolSpecification {
+export function toolSpecification({ name, action, description, parameters, effect, approval, readback, semanticVersion, observation, preconditions, deferred, execution }: ToolSpecification): ToolSpecification {
   return { name, action, description, parameters, effect, approval, ...(readback ? { readback } : {}), ...(semanticVersion ? { semanticVersion } : {}),
-    ...(observation ? { observation } : {}), ...(preconditions ? { preconditions } : {}), ...(deferred ? { deferred } : {}) }
+    ...(observation ? { observation } : {}), ...(preconditions ? { preconditions } : {}), ...(deferred ? { deferred } : {}), ...(execution ? { execution } : {}) }
 }
 export function discoveryTool(tools: readonly ToolDefinition[], grants: (context: ActionContext) => Promise<CapabilityGrant[]>): ToolDefinition {
   return {

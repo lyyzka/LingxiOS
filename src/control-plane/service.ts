@@ -1,3 +1,4 @@
+import { abortable } from '../deadline.js'
 import { candidateHash, type Candidate, type CandidateVerification } from '../outcome/verification.js'
 import { grantedTools, TASK_TOOLS, parseTaskArgs, type ToolDefinition } from '../tools/catalog.js'
 import { readRequestAttachment } from '../context/request.js'
@@ -57,7 +58,7 @@ export interface ControlPlaneDeps {
     recordReview(work: Omit<WorkItem,'leaseToken'>,action: HostAction,hash: string,review: import('../memory/types.js').MemoryReview): Promise<void>
   }
   modelBudget?: Required<import('../model/execution.js').RootModelBudgetOptions>
-  verifyCandidate?: (work: Omit<WorkItem, 'leaseToken'>, candidate: Candidate) => Promise<CandidateVerification>
+  verifyCandidate?: (work: Omit<WorkItem, 'leaseToken'>, candidate: Candidate, signal?: AbortSignal) => Promise<CandidateVerification>
   tools?: readonly ToolDefinition[]
   steps: import('./steps.js').StepStore
   work: WorkStore
@@ -119,7 +120,7 @@ export class ControlPlaneService {
     if (typeof hash!=='string' || !/^[a-f0-9]{64}$/.test(hash)) throw new ControlPlaneError(400,'invalid memory review hash')
     await this.deps.memory!.recordReview(work,action,hash,review)
   }
-  async verifyCandidate(proof: LeaseProof, candidate: Candidate): Promise<CandidateVerification> {
+  async verifyCandidate(proof: LeaseProof, candidate: Candidate, signal?: AbortSignal): Promise<CandidateVerification> {
     const work = await this.requireLease(proof, { rejectCancelled: true })
     if (!candidate || typeof candidate.body !== 'string' || candidate.body.length > 100_000
       || !Number.isSafeInteger(candidate.requestVersion) || candidate.requestVersion < 1) throw new ControlPlaneError(400, 'invalid candidate')
@@ -131,7 +132,7 @@ export class ControlPlaneService {
     if (candidate.artifacts.some(artifact => !facts.some(fact => isDeepStrictEqual(fact, artifact)))) throw new ControlPlaneError(409, 'candidate artifact has no execution record')
     if (!this.deps.verifyCandidate) return { requestVersion: candidate.requestVersion, candidateHash: candidateHash(candidate),
       records: [{ checker: 'availability', status: 'inconclusive', evidence: { reason: 'No authoritative checker is configured' } }] }
-    return this.deps.verifyCandidate(work, candidate)
+    return this.deps.verifyCandidate(work, candidate, signal)
   }
 
   async saveStep(proof: LeaseProof, step: import('./steps.js').ExecutionStep): Promise<void> {
@@ -246,16 +247,17 @@ export class ControlPlaneService {
   }
 
   /** Read back uncertain effects under the newly issued lease before restoring the session. */
-  async reconcilePending(proof: LeaseProof) {
+  async reconcilePending(proof: LeaseProof, external?: AbortSignal) {
     const work = await this.requireLease(proof, { rejectCancelled: true })
     const unresolved = await this.deps.actions.unsettled(work.id)
     if (unresolved.length > 64) throw new ControlPlaneError(409, 'action reconciliation exceeds 64 pending effects')
-    const signal = AbortSignal.timeout(10_000), deadlineAt = new Date(Date.now() + 10_000).toISOString()
+    const signal = AbortSignal.any([AbortSignal.timeout(10_000), ...external ? [external] : []]), deadlineAt = new Date(Date.now() + 10_000).toISOString()
     for (const pending of unresolved) {
       if (pending.state !== 'unknown') continue
       const intent = await this.deps.actions.findIntent(pending.actionKey)
       if (!intent || intent.workId !== work.id) continue
-      await this.reconcileNative(work, intent.action, { requestVersion: intent.requestVersion, signal, deadlineAt })
+      signal.throwIfAborted()
+      await abortable(this.reconcileNative(work, intent.action, { requestVersion: intent.requestVersion, signal, deadlineAt }), signal)
     }
   }
 
@@ -277,7 +279,7 @@ export class ControlPlaneService {
     return result
   }
 
-  async claim(workerId: string, requestId?: string, workKinds?: readonly string[], lanes?: readonly WorkItem['lane'][]): Promise<WorkItem | null> {
+  async claim(workerId: string, requestId?: string, workKinds?: readonly string[], lanes?: readonly WorkItem['lane'][], executionClass?: import('../protocol/types.js').ExecutionClass): Promise<WorkItem | null> {
     if (typeof workerId !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(workerId)) {
       throw new ControlPlaneError(400, 'workerId must be 1-128 safe identifier characters')
     }
@@ -287,7 +289,8 @@ export class ControlPlaneService {
     if (workKinds && (workKinds.length < 1 || workKinds.length > 64 || workKinds.some(kind => typeof kind !== 'string' || !/^[a-z][a-z0-9_]{0,63}$/.test(kind)))) throw new ControlPlaneError(400, 'invalid worker task types')
     if (lanes && (!Array.isArray(lanes) || !lanes.length || lanes.length > 4
       || lanes.some(lane => !['interactive','approval','collaboration','background'].includes(lane)))) throw new ControlPlaneError(400, 'invalid worker lanes')
-    const work = await this.deps.work.claim(workerId, requestId, workKinds, lanes)
+    if (executionClass !== undefined && !['conversation', 'operation'].includes(executionClass)) throw new ControlPlaneError(400, 'invalid execution class')
+    const work = await this.deps.work.claim(workerId, requestId, workKinds, lanes, executionClass)
     if (work) {
       this.deps.metrics?.counter('agentos_work_claimed_total', 'Work items claimed').inc({ lane: work.lane })
       if (work.availableAt) this.deps.metrics?.histogram('agentos_queue_wait_seconds', 'Eligible queue wait at claim', LATENCY_BUCKETS)
@@ -296,7 +299,7 @@ export class ControlPlaneService {
     return work
   }
 
-  private async requireLease(proof: LeaseProof, options: { rejectCancelled?: boolean } = {}): Promise<Omit<WorkItem, 'leaseToken'>> {
+  async requireLease(proof: LeaseProof, options: { rejectCancelled?: boolean } = {}): Promise<Omit<WorkItem, 'leaseToken'>> {
     if (!proof.id || !Number.isSafeInteger(proof.fence) || !proof.leaseToken) {
       throw new ControlPlaneError(400, 'work lease proof required')
     }
@@ -398,11 +401,11 @@ export class ControlPlaneService {
   // Context
   // -------------------------------------------------------------------------
 
-  async loadContext(proof: LeaseProof, includeSession = false): Promise<TurnContext> {
+  async loadContext(proof: LeaseProof, includeSession = false, signal?: AbortSignal): Promise<TurnContext> {
     const work = await this.requireLease(proof)
     await this.deps.authorizeWork?.(work)
     const [context, snapshot, grants, dependencies] = await Promise.all([
-      this.deps.contextProvider.loadContext(work),
+      this.deps.contextProvider.loadContext(work, signal),
       this.deps.contextSnapshot?.(work) ?? (async () => {
         const [session, steps] = await Promise.all([this.deps.sessions.get(sessionKeyOf(work), work.id), this.deps.steps.list(work.id)])
         return { session, steps, requestVersion: (session?.request?.revisions.length ?? 0) + 1 }
@@ -504,8 +507,9 @@ export class ControlPlaneService {
     if (action.action !== 'task.inspect' && (tool ? !permitsTool(work, tool) : executionMode(work) !== 'execute')) {
       return reject('mode_forbidden', `execution mode ${executionMode(work)} does not permit ${action.action}`)
     }
-    const options = { requestVersion, deadlineAt: new Date(Date.now() + 30_000).toISOString(),
-      signal: AbortSignal.any([AbortSignal.timeout(30_000), ...(signal ? [signal] : [])]) }
+    const timeoutMs = tool?.execution?.timeoutMs ?? 30_000
+    const options = { requestVersion, deadlineAt: new Date(Date.now() + timeoutMs).toISOString(),
+      signal: AbortSignal.any([AbortSignal.timeout(timeoutMs), ...(signal ? [signal] : [])]) }
     if (tool && Object.keys(action.args).some(key => !Object.hasOwn(tool.parameters.properties, key))) return { ok: false, executionState: 'rejected', code: 'invalid_arguments', error: 'unknown tool argument' }
     if (namespace === 'task') {
       try { parseTaskArgs(action.action, action.args) }
@@ -613,7 +617,7 @@ export class ControlPlaneService {
     return recorded
   }
 
-  async recoverCell(proof: LeaseProof, cellId: string): Promise<Array<{
+  async recoverCell(proof: LeaseProof, cellId: string, signal?: AbortSignal): Promise<Array<{
     action: string; idempotencyKey: string; result: HostActionResult
   }> | null> {
     const work = await this.requireLease(proof, { rejectCancelled: true })
@@ -635,7 +639,7 @@ export class ControlPlaneService {
       recovered.push({
         action: intent.action.action,
         idempotencyKey: intent.action.idempotencyKey,
-        result: result ?? (safe ? await this.executeAction(proof, intent.action)
+        result: result ?? (safe ? await this.executeAction(proof, intent.action, signal)
           : { ok: false, executionState: 'unknown', error: 'action intent has no receipt; reconciliation required' }),
       })
     }
@@ -652,7 +656,28 @@ export class ControlPlaneService {
     return step?.output === undefined ? null : { output: step.output, artifacts: snapshotArtifacts(step.artifacts) }
   }
 
-  async stageArtifact(proof: LeaseProof, artifact: KernelArtifact, content: string | Uint8Array): Promise<void> {
+  async stageArtifactStream(proof: LeaseProof, artifact: KernelArtifact, content: AsyncIterable<Uint8Array>, signal?: AbortSignal): Promise<void> {
+    const work = await this.requireLease(proof, { rejectCancelled: true })
+    let checked: KernelArtifact
+    try { checked = snapshotArtifacts([artifact])[0]! }
+    catch { throw new ControlPlaneError(400, 'invalid artifact metadata') }
+    if (checked.size > 16 * 1024 * 1024) throw new ControlPlaneError(413, 'artifact upload exceeds 16 MiB')
+    if (this.deps.artifactStager?.stream) await this.deps.artifactStager.stream(work, checked, content, signal)
+    else {
+      // Compatibility for embedded stagers; the HTTP adapter reserves the full upload byte budget first.
+      const bytes = Buffer.alloc(checked.size)
+      let size = 0
+      for await (const chunk of content) {
+        signal?.throwIfAborted()
+        if (size + chunk.byteLength > bytes.length) throw new ControlPlaneError(413, 'artifact content exceeds metadata')
+        bytes.set(chunk, size); size += chunk.byteLength
+      }
+      await this.stageArtifact(proof, checked, bytes.subarray(0, size), signal)
+    }
+    await this.requireLease(proof, { rejectCancelled: true })
+  }
+
+  async stageArtifact(proof: LeaseProof, artifact: KernelArtifact, content: string | Uint8Array, signal?: AbortSignal): Promise<void> {
     const work = await this.requireLease(proof, { rejectCancelled: true })
     if (!this.deps.artifactStager) throw new ControlPlaneError(501, 'artifact upload is unavailable')
     let checked: KernelArtifact
@@ -662,13 +687,13 @@ export class ControlPlaneService {
       || content.length > (typeof content === 'string' ? 22_369_624 : 16 * 1024 * 1024)) {
       throw new ControlPlaneError(413, 'artifact upload exceeds 16 MiB')
     }
-    const bytes = typeof content === 'string' ? Buffer.from(content, 'base64') : Buffer.from(content)
+    const bytes = typeof content === 'string' ? Buffer.from(content, 'base64') : Buffer.from(content.buffer, content.byteOffset, content.byteLength)
     if (bytes.length !== checked.size || bytes.length > 16 * 1024 * 1024
       || typeof content === 'string' && bytes.toString('base64') !== content
       || createHash('sha256').update(bytes).digest('hex') !== checked.sha256.toLowerCase()) {
       throw new ControlPlaneError(409, 'artifact content does not match its metadata', 'artifact_mismatch')
     }
-    await this.deps.artifactStager.stage(work, checked, bytes)
+    await this.deps.artifactStager.stage(work, checked, bytes, signal)
   }
 
   // -------------------------------------------------------------------------

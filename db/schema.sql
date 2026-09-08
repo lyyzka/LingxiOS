@@ -613,7 +613,7 @@ BEGIN
   PERFORM pg_notify(TG_ARGV[0], '');
   RETURN NULL;
 END $$;
-CREATE TRIGGER agent_work_wakeup AFTER INSERT OR UPDATE OF status,available_at,steer_inputs
+CREATE TRIGGER agent_work_wakeup AFTER INSERT OR UPDATE OF status,available_at,steer_inputs,cancel_requested_at,preempt_requested_at
   ON lingxios.agent_work_items FOR EACH ROW EXECUTE FUNCTION lingxios.notify_runtime('lingxios_work');
 CREATE TRIGGER agent_events_wakeup AFTER INSERT
   ON lingxios.agent_run_events FOR EACH ROW EXECUTE FUNCTION lingxios.notify_runtime('lingxios_outbox');
@@ -621,5 +621,11 @@ CREATE TRIGGER agent_delivery_wakeup AFTER INSERT
   ON lingxios.agent_delivery_outbox FOR EACH ROW EXECUTE FUNCTION lingxios.notify_runtime('lingxios_outbox');
 CREATE TRIGGER agent_usage_wakeup AFTER UPDATE OF observation
   ON lingxios.agent_model_budget_calls FOR EACH ROW EXECUTE FUNCTION lingxios.notify_runtime('lingxios_outbox');
+CREATE TABLE lingxios.agent_memory_capture (
+  result_id TEXT PRIMARY KEY REFERENCES lingxios.agent_results(id) ON DELETE CASCADE,
+  available_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts>=0),
+  claim_token TEXT, claim_until TIMESTAMPTZ, completed_at TIMESTAMPTZ
+);
 INSERT INTO lingxios.schema_version(singleton, version) VALUES(TRUE, 10);
 COMMIT;

@@ -27,6 +27,7 @@ export interface ModelTurnResult {
 }
 
 export interface ModelTurnRequest {
+  admission?: import('../resource-quota.js').ResourcePriority
   purpose?: Extract<ModelPurpose, 'execute' | 'approval-explanation'>
   tools?: readonly import('../tools/catalog.js').ToolDefinition[]
   /** Whether the built-in Python tool is structurally available for this turn. */
@@ -43,6 +44,7 @@ export interface ModelTurnRequest {
 }
 
 export interface StructuredCallRequest {
+  admission?: import('../resource-quota.js').ResourcePriority
   purpose?: Extract<ModelPurpose, 'content-review' | 'memory-synthesis' | 'approval-explanation'>
   instructions: string
   /** Local diagnostics, never sent as provider request fields. */
@@ -58,6 +60,9 @@ export interface StructuredCallResult {
 }
 
 export interface CompactionRequest {
+  /** Only optional candidates may be interrupted to admit foreground work. */
+  interruptible?: boolean
+  admission?: import('../resource-quota.js').ResourcePriority
   instructions: string
   /** Local diagnostics, never sent as provider request fields. */
   prompt?: import('../context/compiler.js').PromptManifest

@@ -14,6 +14,7 @@ export function deadlinePool(pool: SqlPool, signal?: AbortSignal, timeoutMs = 30
     async connect() {
       const bounded = AbortSignal.any([AbortSignal.timeout(timeoutMs),...signal ? [signal] : []])
       bounded.throwIfAborted()
+      const acquiring = performance.now()
       const pending = pool.connect()
       let client: SqlClient
       try { client = await abortable(pending,bounded) }
@@ -21,6 +22,9 @@ export function deadlinePool(pool: SqlPool, signal?: AbortSignal, timeoutMs = 30
         void pending.then(late => late.release(error instanceof Error ? error : new Error('connection acquisition cancelled')), () => {})
         throw error
       }
+      metrics?.histogram('agentos_database_connection_wait_seconds', 'Database pool acquisition latency', LATENCY_BUCKETS)
+        .observe((performance.now() - acquiring) / 1000)
+      let transactionStarted: number | undefined
       let released = false
       const release = (error?: Error) => {
         if (released) return
@@ -39,8 +43,15 @@ export function deadlinePool(pool: SqlPool, signal?: AbortSignal, timeoutMs = 30
         metrics?.counter('agentos_database_queries_total', 'Database statements sent').inc({ operation })
         metrics?.counter('agentos_database_parameter_bytes_total', 'String and binary SQL parameter bytes').inc({ operation },
           (params ?? []).reduce<number>((sum, value) => sum + (typeof value === 'string' ? Buffer.byteLength(value) : value instanceof Uint8Array ? value.byteLength : 0), 0))
+        if (/^\s*BEGIN\b/i.test(sql)) transactionStarted = performance.now()
         try { return await abortable(client.query(sql,params),bounded) }
-        finally { metrics?.histogram('agentos_database_query_seconds', 'Database query latency', LATENCY_BUCKETS)
+        finally {
+          if (/^\s*(COMMIT|ROLLBACK)\b/i.test(sql) && transactionStarted !== undefined) {
+            metrics?.histogram('agentos_database_transaction_seconds', 'Transaction duration, including lock and hook waits', LATENCY_BUCKETS)
+              .observe((performance.now() - transactionStarted) / 1000)
+            transactionStarted = undefined
+          }
+          metrics?.histogram('agentos_database_query_seconds', 'Database query latency', LATENCY_BUCKETS)
           .observe((performance.now() - began) / 1000, { operation }) }
       }, release }
     },

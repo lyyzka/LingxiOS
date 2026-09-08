@@ -96,7 +96,8 @@ export async function readOperations(database: SqlQueryable) {
       COALESCE(SUM((SELECT SUM(COALESCE(input_tokens+output_tokens,reserved_tokens)) FROM lingxios.agent_model_budget_calls WHERE work_id=work.id)),0) AS tokens,
       COALESCE(SUM((SELECT SUM(COALESCE(cost_micros,reserved_cost_micros)) FROM lingxios.agent_model_budget_calls WHERE work_id=work.id)),0) AS cost_micros,
       (SELECT COUNT(*) FROM lingxios.agent_delivery_outbox WHERE delivered_at IS NULL AND failed_at IS NOT NULL) AS failed_deliveries,
-      (SELECT COUNT(*) FROM lingxios.agent_model_budget_calls WHERE failed_at IS NOT NULL) AS failed_usage_deliveries
+      (SELECT COUNT(*) FROM lingxios.agent_model_budget_calls WHERE failed_at IS NOT NULL) AS failed_usage_deliveries,
+      (SELECT COUNT(*) FROM lingxios.agent_memory_capture WHERE completed_at IS NULL AND attempts>=5) AS failed_memory_captures
       FROM lingxios.agent_work_items work WHERE created_at>=NOW()-INTERVAL '24 hours'`),
     database.query(`WITH hours AS (SELECT generate_series(date_trunc('hour',NOW())-INTERVAL '23 hours',date_trunc('hour',NOW()),INTERVAL '1 hour') AS time)
       SELECT hours.time,COUNT(work.id) AS runs,COUNT(work.id) FILTER(WHERE status='failed') AS failures FROM hours
@@ -113,6 +114,7 @@ export async function readOperations(database: SqlQueryable) {
     failures: Number(value['failures']), cancelled: Number(value['cancelled']), active: Number(value['active']), waiting: Number(value['waiting']), queued: Number(value['queued']),
     averageExecutionMs: Number(value['average_execution_ms']), tokens: Number(value['tokens']), costMicros: Number(value['cost_micros']),
     failedDeliveries: Number(value['failed_deliveries']), failedUsageDeliveries: Number(value['failed_usage_deliveries']),
+    failedMemoryCaptures: Number(value['failed_memory_captures']),
     trend: trend.rows.map(row => ({ time: new Date(row['time'] as Date | string).toISOString(), runs: Number(row['runs']), failures: Number(row['failures']) })),
     models: models.rows.map(row => ({ model: row['model'] as string | null, calls: Number(row['calls']), tokens: Number(row['tokens']),
       costMicros: Number(row['cost_micros']), unmeasuredCalls: Number(row['unmeasured_calls']) })) }
@@ -177,6 +179,7 @@ export async function refreshMetrics(database: SqlQueryable, metrics: MetricsReg
       WHERE outbox.delivered_at IS NULL AND outbox.failed_at IS NULL AND work.cancel_requested_at IS NULL) AS delivery_pending,
     (SELECT COUNT(*) FROM lingxios.agent_delivery_outbox WHERE failed_at IS NOT NULL) AS delivery_failed,
     (SELECT COUNT(*) FROM lingxios.agent_model_budget_calls WHERE failed_at IS NOT NULL) AS usage_failed,
+    (SELECT COUNT(*) FROM lingxios.agent_memory_capture WHERE completed_at IS NULL AND attempts>=5) AS capture_failed,
     (SELECT COALESCE(SUM(cost_micros),0) FROM lingxios.agent_model_budget_calls) AS cost_micros`)
   const row = rows[0]!
   for (const [field,name,help] of [
@@ -185,6 +188,7 @@ export async function refreshMetrics(database: SqlQueryable, metrics: MetricsReg
     ['delivery_pending','agentos_delivery_pending','Current results awaiting delivery'],
     ['delivery_failed','agentos_delivery_failed','Deliveries requiring intervention'],
     ['usage_failed','agentos_usage_delivery_failed','Model observations requiring ledger redelivery'],
+    ['capture_failed','agentos_memory_capture_failed','Committed memory references requiring operator retry'],
     ['cost_micros','agentos_recorded_cost_micros','Durable settled model cost in USD millionths'],
   ]) metrics.gauge(name!,help!).set(Number(row[field!]))
 }

@@ -1,7 +1,9 @@
+import { abortable } from '../deadline.js'
 import type { MemoryScope } from './store.js'
 import { MEMORY_BODY_BYTES } from './text.js'
 
 export interface MemoryWriteInput {
+  signal?: AbortSignal
   scope: Readonly<MemoryScope>
   principalId: string
   sourceWorkId: string
@@ -14,8 +16,10 @@ export type MemoryWritePolicy = (input: Readonly<MemoryWriteInput>) => MemoryWri
 export class MemoryContentRejected extends Error {}
 
 /** Shared final boundary for explicit notes, synthesis and evolution candidates. */
-export async function memoryWriteBody(input: MemoryWriteInput, policy?: MemoryWritePolicy): Promise<string> {
-  const decision = policy ? await policy(Object.freeze({ ...input, scope: Object.freeze({ ...input.scope }) })) : { action: 'allow' as const }
+export async function memoryWriteBody(input: MemoryWriteInput, policy?: MemoryWritePolicy, external?: AbortSignal): Promise<string> {
+  const signal = AbortSignal.any([AbortSignal.timeout(10_000), ...external ? [external] : [], ...input.signal ? [input.signal] : []])
+  signal.throwIfAborted()
+  const decision = policy ? await abortable(Promise.resolve(policy(Object.freeze({ ...input, signal, scope: Object.freeze({ ...input.scope }) }))), signal) : { action: 'allow' as const }
   if (!decision || !['allow', 'redact', 'reject'].includes(decision.action)) throw new Error('invalid memory write policy decision')
   if (decision.action === 'reject') throw new MemoryContentRejected('memory write rejected by content policy')
   const body = decision.action === 'redact' ? decision.body : input.body

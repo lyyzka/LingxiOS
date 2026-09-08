@@ -10,6 +10,8 @@ it('publishes empty wake hints after commit only, with no idle-claim notificatio
     await db.exec(await readFile(new URL('../../db/schema.sql', import.meta.url), 'utf8'))
     const migration = await readFile(new URL('../../db/migrations/011-performance-notifications.sql', import.meta.url), 'utf8')
     await db.exec(migration); await db.exec(migration)
+    const admission = await readFile(new URL('../../db/migrations/012-async-admission.sql', import.meta.url), 'utf8')
+    await db.exec(admission); await db.exec(admission)
     const payloads: string[] = []
     const unlisten = await db.listen('lingxios_work', payload => { payloads.push(payload) })
     const insert = `INSERT INTO lingxios.agent_work_items(id,tenant_id,agent_id,session_id,kind,lane,trigger_ref)
@@ -36,6 +38,13 @@ it('publishes empty wake hints after commit only, with no idle-claim notificatio
     assert.deepEqual(payloads, ['', ''])
     assert.equal(await store.claim('worker'), null)
     assert.deepEqual(payloads, ['', ''])
+    await db.query("UPDATE lingxios.agent_work_items SET preempt_requested_at=NOW() WHERE id='w'")
+    await db.query("UPDATE lingxios.agent_work_items SET cancel_requested_at=NOW() WHERE id='w'")
+    assert.deepEqual(payloads, ['', '', '', ''])
+    await store.enqueue({ id: 'long', tenantId: 't', agentId: 'a', sessionId: 'long', kind: 'turn', lane: 'interactive', triggerRef: 'm', meta: { executionClass: 'operation' } })
+    await store.enqueue({ id: 'short', tenantId: 't', agentId: 'a', sessionId: 'short', kind: 'turn', lane: 'interactive', triggerRef: 'm', meta: { executionClass: 'conversation' } })
+    assert.equal((await store.claim('worker', 'class-claim', ['turn'], undefined, 'conversation'))?.id, 'short')
+    await assert.rejects(store.claim('worker', 'class-claim', ['turn'], undefined, 'operation'), /changed/)
     await unlisten()
   } finally { await db.close() }
 })

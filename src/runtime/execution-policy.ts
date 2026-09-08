@@ -14,6 +14,7 @@ export function executionMode(work: Pick<WorkItem, 'meta'>): HarnessMode {
 /** Modes only narrow authorization. Internal task inspection remains available to the runtime. */
 export function permitsTool(work: Pick<WorkItem, 'meta'>, tool: ToolDefinition): boolean {
   const mode = executionMode(work)
+  if (work.meta?.['executionClass'] === 'conversation' && tool.execution?.class === 'operation') return false
   return mode === 'execute' || mode === 'read' && tool.effect === 'read'
 }
 
@@ -35,7 +36,7 @@ export function executionSnapshot(context: TurnContext, policy: RuntimePolicy): 
     .map(name => ({ name, methods: tools.filter(tool => tool.action.startsWith(name + '.')).map(tool => tool.action.split('.')[1]!) }))
   const configured = context.work.meta?.['codeExecution']
   const proposedCode = policy.codeExecutionMode?.(context) ?? 'enabled'
-  const codeExecution = mode === 'execute' && (configured === undefined || configured === 'enabled') && proposedCode === 'enabled' ? 'enabled' : 'disabled'
+  const codeExecution = context.work.meta?.['executionClass'] !== 'conversation' && mode === 'execute' && (configured === undefined || configured === 'enabled') && proposedCode === 'enabled' ? 'enabled' : 'disabled'
   const value = { mode, codeExecution, grants, tools } as const
   return { ...value, hash: fingerprint(value) }
 }

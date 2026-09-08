@@ -172,7 +172,7 @@ it('assembles the public app through HTTP model and Python, persisting results a
     await assert.rejects(controlApp.listenControlPlane({ serviceToken: 'test-worker-secret', port: 0 }), /already/)
     const claimUrl = `http://127.0.0.1:${controlPort}/v5/work/claim`
     assert.equal((await fetch(claimUrl, { method: 'POST' })).status, 401)
-    const recoveredClaim = await fetch(claimUrl, { method: 'POST', headers: { authorization: 'Bearer test-worker-secret', 'content-type': 'application/json' }, body: JSON.stringify({ workerId: 'remote-worker', workKinds: ['turn','resume'] }) })
+    const recoveredClaim = await fetch(claimUrl, { method: 'POST', headers: { authorization: 'Bearer test-worker-secret', 'content-type': 'application/json' }, body: JSON.stringify({ protocol: 9, workerId: 'remote-worker', workKinds: ['turn','resume'] }) })
     assert.equal(recoveredClaim.status, 200)
     assert.equal(await recoveredClaim.json(), null)
     assert.equal(requests.length, 2)

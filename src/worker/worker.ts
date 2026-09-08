@@ -4,7 +4,9 @@
  *
  * Separated from `main.ts` so the whole lifecycle is testable in-process.
  */
+import { monitorEventLoopDelay } from 'node:perf_hooks'
 import http from 'node:http'
+import { executionClassOf } from '../protocol/types.js'
 import { setTimeout as delay } from 'node:timers/promises'
 import type { AddressInfo } from 'node:net'
 import { errorMessage } from '../errors.js'
@@ -17,7 +19,7 @@ import { abortable } from '../deadline.js'
 
 export interface AgentWorkerOptions {
   host: Pick<HostPort, 'claimWork' | 'waitForWork'>
-  runtime: Pick<AgentRuntime, 'runWork'>
+  runtime: Pick<AgentRuntime, 'runWork'> & Partial<Pick<AgentRuntime, 'refreshControls' | 'drainBackground'>>
   kernels?: ManagedKernelExecutor
   workerId: string
   maxConcurrentRuns: number
@@ -37,6 +39,7 @@ export class AgentWorker {
   private readonly pollIdleMs: number
   private stopping = false
   private polling: Promise<void> | null = null
+  private controls: Promise<void> | null = null
   private health: http.Server | null = null
   private started = false
   private lastClaimAt = 0
@@ -44,6 +47,8 @@ export class AgentWorker {
   private readonly shutdown = new AbortController()
   private readonly stopPolling = new AbortController()
   private stopResult: Promise<{ timedOut: boolean }> | undefined
+  private loopDelay: ReturnType<typeof monitorEventLoopDelay> | undefined
+  private metricsTimer: NodeJS.Timeout | undefined
 
   constructor(private readonly options: AgentWorkerOptions) {
     const reserved = options.reservedInteractiveRuns ?? 0
@@ -100,6 +105,16 @@ export class AgentWorker {
         })
       })
     }
+    if (this.options.metrics) {
+      const loop = this.loopDelay = monitorEventLoopDelay({ resolution: 20 })
+      loop.enable()
+      this.metricsTimer = setInterval(() => {
+        this.options.metrics!.gauge('agentos_event_loop_delay_p95_seconds', 'Event-loop delay over the last sample interval').set(loop.percentile(95) / 1e9)
+        loop.reset()
+      }, 1000)
+      this.metricsTimer.unref()
+    }
+    this.controls = this.watchControls()
     this.polling = this.poll()
     this.logger.info('worker started', { healthPort, maxConcurrentRuns: this.options.maxConcurrentRuns })
     return { healthPort }
@@ -133,8 +148,8 @@ export class AgentWorker {
           continue
         }
         const backgroundLimit = this.options.maxConcurrentRuns - (this.options.reservedInteractiveRuns ?? 0)
-        const work = await abortable(this.options.host.claimWork(this.stopPolling.signal,
-          this.backgroundRuns >= backgroundLimit ? ['interactive', 'approval'] : undefined),this.stopPolling.signal)
+        const work = await abortable(this.options.host.claimWork(this.stopPolling.signal, undefined,
+          this.backgroundRuns >= backgroundLimit ? 'conversation' : undefined),this.stopPolling.signal)
         this.lastClaimAt = Date.now()
         if (this.stopping) return
         if (!work) {
@@ -144,7 +159,7 @@ export class AgentWorker {
           continue
         }
         if (this.active.has(work.id)) continue
-        const background = !['interactive', 'approval'].includes(work.lane)
+        const background = executionClassOf(work) === 'operation'
         if (background) this.backgroundRuns++
         this.options.metrics?.gauge('agentos_worker_active_runs', 'Runs in flight').set(this.active.size + 1)
         const done = this.options.runtime.runWork(work, this.shutdown.signal)
@@ -161,6 +176,20 @@ export class AgentWorker {
         if (this.stopping) return
         this.logger.error('poll failed', { error: errorMessage(error) })
         await this.sleep(2_000)
+      }
+    }
+  }
+
+  private async watchControls(): Promise<void> {
+    if (!this.options.host.waitForWork || !this.options.runtime.refreshControls) return
+    let cursor: string | undefined
+    while (!this.stopping) {
+      try {
+        const next = await this.options.host.waitForWork(cursor, 25_000, this.stopPolling.signal)
+        if (next !== cursor) await this.options.runtime.refreshControls()
+        cursor = next
+      } catch {
+        if (!this.stopping) await this.sleep(1000)
       }
     }
   }
@@ -183,10 +212,12 @@ export class AgentWorker {
 
   private async drain(): Promise<{ timedOut: boolean }> {
     this.stopping = true
+    clearInterval(this.metricsTimer); this.loopDelay?.disable()
     this.stopPolling.abort()
     let graceTimer: NodeJS.Timeout | undefined
     const timedOut = await Promise.race([
-      Promise.allSettled([this.polling, ...this.active.values()]).then(() => false),
+      Promise.allSettled([this.polling, this.controls, ...this.active.values()])
+        .then(() => this.options.runtime.drainBackground?.()).then(() => false),
       new Promise<true>((resolveTimeout) => {
         graceTimer = setTimeout(() => resolveTimeout(true), this.options.shutdownGraceMs)
         graceTimer.unref?.()

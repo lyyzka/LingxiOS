@@ -1,4 +1,4 @@
-import { workStatusOf, type WorkStatus } from '../protocol/types.js'
+import { executionClassOf, workStatusOf, type WorkStatus } from '../protocol/types.js'
 /**
  * In-memory store implementation. Serves three purposes: local development,
  * the test suite, and the executable specification of the lease state
@@ -93,7 +93,7 @@ export class MemoryWorkStore implements WorkStore {
   private readonly routes = new Map<string, SessionRoute>()
   private readonly sessionLeases = new Map<string, SessionLease>()
   private readonly workerLastSeen = new Map<string, number>()
-  private readonly claims = new Map<string, { workerId: string; work: WorkItem | null; kinds: string[] | null; lanes?: readonly string[] }>()
+  private readonly claims = new Map<string, { workerId: string; work: WorkItem | null; kinds: string[] | null; lanes?: readonly string[]; executionClass?: import('../protocol/types.js').ExecutionClass }>()
   private readonly leaseTtlMs: number
   private readonly workerTimeoutMs: number
 
@@ -155,7 +155,7 @@ export class MemoryWorkStore implements WorkStore {
     return seen !== undefined && now - seen < this.workerTimeoutMs
   }
 
-  async claim(workerId: string, requestId?: string, workKinds?: readonly string[], lanes?: readonly WorkItem['lane'][]): Promise<WorkItem | null> {
+  async claim(workerId: string, requestId?: string, workKinds?: readonly string[], lanes?: readonly WorkItem['lane'][], executionClass?: import('../protocol/types.js').ExecutionClass): Promise<WorkItem | null> {
     const kinds = workKinds ? [...new Set(workKinds)].sort() : null
     lanes = lanes ? [...new Set(lanes)].sort() : undefined
     if (requestId) {
@@ -164,6 +164,7 @@ export class MemoryWorkStore implements WorkStore {
         if (prior.workerId !== workerId) throw new Error('claim request identity reused by another worker')
         if (!isDeepStrictEqual(prior.kinds, kinds)) throw new Error('claim request task types changed')
         if (!isDeepStrictEqual(prior.lanes, lanes)) throw new Error('claim request lanes changed')
+        if (prior.executionClass !== executionClass) throw new Error('claim request execution class changed')
         return structuredClone(prior.work)
       }
       if (this.claims.size >= 10_000) this.claims.delete(this.claims.keys().next().value!)
@@ -177,6 +178,7 @@ export class MemoryWorkStore implements WorkStore {
       .filter((row) => {
         if (kinds && !kinds.includes(row.kind)) return false
         if (lanes && !lanes.includes(row.lane)) return false
+        if (executionClass && executionClassOf(row) !== executionClass) return false
         if (['memory_synthesis','memory_index','memory_evaluation'].includes(row.kind) && row.attempts >= 3) return false
         const claimable = row.status === 'queued'
           || (row.status === 'leased' && (row.leaseExpiresAt ?? 0) <= now)
@@ -199,7 +201,7 @@ export class MemoryWorkStore implements WorkStore {
         || (Date.parse(a.createdAt) - Date.parse(b.createdAt)))
     const row = candidates[0]
     if (!row) {
-      if (requestId) this.claims.set(requestId, { workerId, work: null, kinds, ...(lanes ? { lanes } : {}) })
+      if (requestId) this.claims.set(requestId, { workerId, work: null, kinds, ...(lanes ? { lanes } : {}), ...(executionClass ? { executionClass } : {}) })
       return null
     }
 
@@ -228,7 +230,7 @@ export class MemoryWorkStore implements WorkStore {
     const work = this.toWorkItem(row, token, homeEpoch)
     const { leaseToken: _token, ...issued } = work
     this.attempts.set(JSON.stringify([work.id, work.fence, row.leaseTokenHash]), structuredClone(issued))
-    if (requestId) this.claims.set(requestId, { workerId, work: structuredClone(work), kinds, ...(lanes ? { lanes } : {}) })
+    if (requestId) this.claims.set(requestId, { workerId, work: structuredClone(work), kinds, ...(lanes ? { lanes } : {}), ...(executionClass ? { executionClass } : {}) })
     return work
   }
 

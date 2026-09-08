@@ -76,6 +76,19 @@ it('never invents tool names or call identities', async () => {
   assert.equal(result.finalCandidate, undefined, 'progress accompanying a tool call is not a final candidate')
 })
 
+it('serializes provider tool calls when parallel tools are disabled', async () => {
+  for (const parallelTools of [false, true]) {
+    let payload: Record<string, unknown> | undefined
+    const model = new OpenAIChatDriver('test', { apiKey: 'test', capabilities: { parallelTools }, fetchImpl: async (_url, init) => {
+      payload = JSON.parse(String(init?.body))
+      return new Response('data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-1","function":{"name":"ipython","arguments":"{\\"code\\":\\"1\\"}"}},{"index":1,"id":"call-2","function":{"name":"ipython","arguments":"{\\"code\\":\\"2\\"}"}}]},"finish_reason":"tool_calls"}]}\n\ndata: [DONE]\n\n')
+    } })
+    const result = await model.run({ instructions: '', items: [] })
+    assert.equal(payload?.['parallel_tool_calls'], parallelTools)
+    assert.deepEqual(result.output.filter(item => 'type' in item).map(item => item.callId), parallelTools ? ['call-1', 'call-2'] : ['call-1'])
+  }
+})
+
 it('removes Python from the provider tool surface when code execution is disabled', async () => {
   let payload: Record<string, unknown> | undefined
   const model = new OpenAIChatDriver('test', { apiKey: 'test', fetchImpl: async (_url, init) => {

@@ -7,6 +7,7 @@
  * seq, actions dedupe on idempotency key). Lease-invalid responses (409) are
  * surfaced as {@link LeaseLostError} so the runtime can stop cleanly.
  */
+import { AGENT_OS_PROTOCOL_VERSION } from '../protocol/constants.js'
 import { randomUUID } from 'node:crypto'
 import { abortable } from '../deadline.js'
 import { previewRequestBody } from './preview-stream.js'
@@ -124,10 +125,10 @@ export class HttpHostClient implements HostPort {
     return { fence: work.fence, leaseToken: work.leaseToken }
   }
 
-  async claimWork(signal?: AbortSignal, lanes?: readonly WorkItem['lane'][]): Promise<WorkItem | null> {
+  async claimWork(signal?: AbortSignal, lanes?: readonly WorkItem['lane'][], executionClass?: import('../protocol/types.js').ExecutionClass): Promise<WorkItem | null> {
     return this.request<WorkItem | null>('POST', '/v5/work/claim', {
-      workerId: this.options.workerId, requestId: randomUUID(), workKinds: this.options.workKinds ?? ['turn', 'resume'],
-      ...(lanes ? { lanes } : {}),
+      protocol: AGENT_OS_PROTOCOL_VERSION, workerId: this.options.workerId, requestId: randomUUID(), workKinds: this.options.workKinds ?? ['turn', 'resume'],
+      ...(lanes ? { lanes } : {}), ...(executionClass ? { executionClass } : {}),
     }, signal)
   }
 
@@ -153,6 +154,11 @@ export class HttpHostClient implements HostPort {
     const response = await this.fetchImpl(`${this.options.baseUrl.replace(/\/$/, '')}/v5/work/${encodeURIComponent(work.id)}/preview`, init)
     await response.body?.cancel()
     if (!response.ok) throw new HostRequestError(response.status, 'preview channel unavailable')
+  }
+
+  async recoverWork(work: WorkItem, signal?: AbortSignal): Promise<boolean> {
+    try { return await this.request('POST', `/v5/work/${encodeURIComponent(work.id)}/recover`, this.proof(work), signal) }
+    catch (error) { if (error instanceof HostRequestError && error.status === 404) return false; throw error }
   }
 
   async heartbeat(work: WorkItem, signal?: AbortSignal): Promise<HeartbeatResult> {

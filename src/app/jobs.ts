@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto'
 import type { SqlQueryable } from '../control-plane/pg-store.js'
 import type { RequestSnapshot } from '../context/request.js'
 import type { GoalOutcome } from '../protocol/outcome.js'
-import type { WorkItem, WorkLane, WorkStatus } from '../protocol/types.js'
+import { executionClassOf, type WorkItem, type WorkLane, type WorkStatus } from '../protocol/types.js'
 import type { RequestInput, MessageIdentity } from './index.js'
 import { executionMode } from '../runtime/execution-policy.js'
 import { authorizeConversationWork, digest, participant, requireAudience } from '../collaboration/access.js'
@@ -21,6 +21,8 @@ export interface ChildInput {
   agentId: string
   text: string
   kind?: string
+  /** Trusted host policy: move long work to an isolated child, never promote operations into reserved capacity. */
+  executionClass?: import('../protocol/types.js').ExecutionClass
   sessionId?: string
   threadId?: string
   dependsOn?: string[]
@@ -121,12 +123,17 @@ export async function enqueueChild(database: SqlQueryable, parent: Omit<WorkItem
     || input.dependsOn && (input.dependsOn.length > 64 || input.dependsOn.some(id => !id.trim() || id === input.id))) throw new Error('invalid child request')
   const children = await database.query(`SELECT COUNT(*)::int AS count FROM lingxios.agent_work_items WHERE meta->>'parentWorkId'=$1 AND id<>$2`, [parent.id,input.id])
   if (Number(children.rows[0]?.['count']) >= 64) throw new Error('a parent may create at most 64 child tasks')
-  const { harnessHash: _untrustedHarness, mode: _untrustedMode, obligations: _untrustedObligations, codeExecution: childCode,
+  const executionClass = input.executionClass ?? executionClassOf(parent)
+  if (!['conversation', 'operation'].includes(executionClass)
+    || executionClass === 'conversation' && executionClassOf(parent) !== 'conversation') throw new Error('invalid child execution class')
+  if (executionClass === 'operation' && input.sessionId === parent.sessionId && input.agentId === parent.agentId
+    && (input.threadId ?? parent.threadId) === parent.threadId) throw new Error('long child work requires an isolated session')
+  const { executionClass: _untrustedClass, harnessHash: _untrustedHarness, mode: _untrustedMode, obligations: _untrustedObligations, codeExecution: childCode,
     deliveryMode: _untrustedDeliveryMode, graphId: _untrustedGraph, ...childMeta } = input.meta ?? {}
   const inheritedCode = parent.meta?.['codeExecution']
   const codeExecution = inheritedCode === 'disabled' || childCode === 'disabled' ? 'disabled'
     : inheritedCode === 'enabled' || childCode === 'enabled' ? 'enabled' : undefined
-  const meta = { ...childMeta, ...(parent.meta?.['harnessHash'] ? { harnessHash: parent.meta['harnessHash'] } : {}),
+  const meta = { ...childMeta, executionClass, ...(parent.meta?.['harnessHash'] ? { harnessHash: parent.meta['harnessHash'] } : {}),
     ...(parent.meta?.['mode'] === undefined ? {} : { mode: executionMode(parent) }), ...(codeExecution ? { codeExecution } : {}), text: input.text, authorName: parent.agentId, attachments: request.attachments,
     parentWorkId: parent.id, rootWorkId: parent.meta?.['rootWorkId'] ?? parent.id, parentRequestVersion: version,
     ...(graphId ? { graphId } : {}), dependsOn: input.dependsOn ?? [], delegation: { parentWorkId: parent.id, rootWorkId: parent.meta?.['rootWorkId'] ?? parent.id,

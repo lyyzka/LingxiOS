@@ -80,7 +80,7 @@ export interface WorkStore {
    * session exclusivity and session→worker routing; returns null when
    * nothing is claimable.
    */
-  claim(workerId: string, requestId?: string, workKinds?: readonly string[], lanes?: readonly WorkLane[]): Promise<WorkItem | null>
+  claim(workerId: string, requestId?: string, workKinds?: readonly string[], lanes?: readonly WorkLane[], executionClass?: import('../protocol/types.js').ExecutionClass): Promise<WorkItem | null>
 
   /** Renew the lease; null when the lease is no longer valid. */
   heartbeat(id: string, fence: number, leaseTokenHash: string): Promise<HeartbeatRow | null>
@@ -223,7 +223,7 @@ export interface ActionLedgerStore {
 
 /** Assembles everything but `work` in a TurnContext. */
 export interface ContextProvider {
-  loadContext(work: Omit<WorkItem, 'leaseToken'>): Promise<{
+  loadContext(work: Omit<WorkItem, 'leaseToken'>, signal?: AbortSignal): Promise<{
     /** IM providers must authorize this audience before returning evidence, memory or dynamic resource data. */
     audience?: import('../collaboration/types.js').Audience
     productRules?: string
@@ -281,7 +281,8 @@ export interface DeliveryPort {
 }
 
 export interface ArtifactStager {
-  stage(work: Omit<WorkItem, 'leaseToken'>, artifact: import('../protocol/types.js').KernelArtifact, bytes: Uint8Array): Promise<void>
+  stage(work: Omit<WorkItem, 'leaseToken'>, artifact: import('../protocol/types.js').KernelArtifact, bytes: Uint8Array, signal?: AbortSignal): Promise<void>
+  stream?(work: Omit<WorkItem, 'leaseToken'>, artifact: import('../protocol/types.js').KernelArtifact, bytes: AsyncIterable<Uint8Array>, signal?: AbortSignal): Promise<void>
 }
 
 // ---------------------------------------------------------------------------

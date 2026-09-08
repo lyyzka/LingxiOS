@@ -10,6 +10,7 @@ import { modelPricing } from '../src/model/execution.js'
 import type { ToolDefinition } from '../src/tools/definition.js'
 import { snapshotEvidence } from '../src/context/evidence.js'
 import { readRunReference, countPendingApprovals } from '../src/app/diagnostics.js'
+import { snapshotRequest } from '../src/context/request.js'
 
 it('commits child lineage atomically, resumes a child that finished before parking, propagates revisions and freezes model prices', async () => {
   const db = new PGlite()
@@ -108,5 +109,42 @@ it('commits child lineage atomically, resumes a child that finished before parki
     assert.equal(await control.retryDelivery({ ...identity,threadId: 'another-thread' },'usage'),false)
     assert.equal(await control.retryDelivery(identity,'usage'),true)
     assert.equal(await control.retryDelivery(identity,'usage'),false)
+  } finally { await control.stop(); await db.close() }
+})
+
+it('durable operation handoff releases the original conversation, then resumes without a sweep', async () => {
+  const db = new PGlite()
+  const pool: SqlPool = { query: async (sql, params) => {
+    const result = await db.query<Record<string, unknown>>(sql, params)
+    return { rows: result.rows, rowCount: result.affectedRows ?? result.rows.length }
+  }, connect: async () => ({ query: pool.query, release() {} }) }
+  await db.exec(await readFile(new URL('../../db/schema.sql', import.meta.url), 'utf8'))
+  const tool: ToolDefinition = { name: 'delegate__create', action: 'delegate.create', description: 'Persist a long operation',
+    effect: 'transaction', approval: false, parameters: { type: 'object', properties: {}, additionalProperties: false },
+    parse: () => ({}), authorize: async () => {}, execute: async context => {
+      const child = await context.enqueueChild({ id: 'long', agentId: 'agent', text: 'Long operation', executionClass: 'operation' })
+      return { ok: true, value: child, directive: { type: 'defer', reason: 'child', data: { taskRef: child.id } } }
+    } }
+  const control = await createLingxiOS({ database: pool, tools: [tool], performance: { notifications: false } })
+  const identity = { runId: 'front', tenantId: 'tenant', agentId: 'agent', sessionId: 'room', principalId: 'human' }
+  try {
+    await control.enqueue({ ...identity, id: 'front', text: 'Delegate work', executionClass: 'conversation' })
+    const host = control.connectWorker({ workerId: 'worker', workKinds: ['turn'] })
+    const parent = (await host.claimWork())!, context = await host.loadContext(parent)
+    await host.saveSession(parent, { key: sessionKeyOf(parent), tenantId: parent.tenantId, agentId: parent.agentId,
+      sessionId: parent.sessionId, revision: 0, compactionEpoch: 0, history: [], appliedWorkIds: [parent.id], request: snapshotRequest(context) })
+    const scope = { runId: parent.id, cellId: 'delegate', callIndex: 0 }
+    assert.equal((await host.executeAction(parent, { ...scope, action: tool.action, args: {}, idempotencyKey: actionKeyOf(scope) })).ok, true)
+    await host.waitWork(parent, { status: 'delegated', taskRef: 'long', verification: 'not_run', requestVersion: 1 })
+    const operation = (await host.claimWork(undefined, undefined, 'operation'))!
+    assert.equal(operation.id, 'long'); assert.notEqual(sessionKeyOf(operation), sessionKeyOf(parent))
+    await control.enqueue({ ...identity, id: 'short', text: 'Answer a new question', mode: 'chat' })
+    const conversation = (await host.claimWork(undefined, undefined, 'conversation'))!
+    assert.equal(conversation.id, 'short') // Same original session, while the long child remains leased.
+    await host.completeWork(conversation, { status: 'completed', goalOutcome: { status: 'partial', verification: 'not_run', requestVersion: 1 } })
+    assert.equal((await control.readRun(identity))?.status, 'waiting')
+    await host.completeWork(operation, { status: 'completed', goalOutcome: { status: 'partial', verification: 'not_run', requestVersion: 1 } })
+    assert.equal((await control.readRun(identity))?.status, 'queued') // No resumeDependents call, timer or notification required.
+    assert.equal((await host.claimWork(undefined, undefined, 'conversation'))?.id, parent.id)
   } finally { await control.stop(); await db.close() }
 })

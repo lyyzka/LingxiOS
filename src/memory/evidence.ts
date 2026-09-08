@@ -8,8 +8,8 @@ import { excerpt, memoryDigest, memoryQuery, memorySearchText, pageLimit } from 
 import type { MemoryHistoryHit, MemorySearchResult } from './types.js'
 import { MemoryContentRejected, memoryWriteBody, type MemoryWritePolicy } from './policy.js'
 
-/** Called in the committed-result transaction. Drafts, wait messages and old sources are never learned. */
-export async function captureMemoryEvidence(database: SqlQueryable, work: Omit<WorkItem,'leaseToken'>, message: AssistantMessage, scopes: readonly MemoryScope[], policy?: MemoryWritePolicy) {
+/** Privacy hooks run before acquiring work or memory row locks. Nothing unfiltered is queued. */
+export async function prepareMemoryEvidence(database: SqlQueryable, work: Omit<WorkItem,'leaseToken'>, message: AssistantMessage, scopes: readonly MemoryScope[], policy?: MemoryWritePolicy, signal?: AbortSignal) {
   if (!scopes.length || !work.principalId) return
   if (scopes.length > 12 || scopes.some(scope => scope.tenantId !== work.tenantId)) throw new Error('invalid memory evidence scopes')
   const request = (await database.query(`SELECT request_snapshot FROM lingxios.agent_request_snapshots WHERE session_key=$1 AND work_id=$2`,
@@ -18,27 +18,41 @@ export async function captureMemoryEvidence(database: SqlQueryable, work: Omit<W
     || request.revisions.length+1 !== message.envelope.requestVersion) throw new Error('memory evidence requires the committed request version')
   // Delegated assignments and agent-authored steering are not additional human observations.
   if (request.instructionAuthor || request.parentWorkId) return
-  const epochs = await currentMemoryScopes(database,await lockMemoryScopes(database,scopes),work.id)
-  if (!epochs.length) return
-  const currentScopes = epochs.map(({ tenantId,scopeType,scopeId }) => ({ tenantId,scopeType,scopeId }))
+  const currentScopes = scopes
   const input = JSON.stringify({ originalText: request.originalText,
     revisions: request.revisions.filter(item => !item.author || item.author.kind === 'human').map(item => ({ text: item.text,createdAt: item.createdAt })) })
   let inputText = excerpt(input,16_000), assistantText = excerpt(message.body,16_000)
   try {
     for (const scope of currentScopes) {
       const boundary = { scope,principalId:work.principalId,sourceWorkId:work.id,origin:'synthesized' as const }
-      inputText = await memoryWriteBody({...boundary,kind:'history_user',body:inputText},policy)
-      if (assistantText.trim()) assistantText = await memoryWriteBody({...boundary,kind:'history_assistant',body:assistantText},policy)
+      inputText = await memoryWriteBody({...boundary,kind:'history_user',body:inputText},policy,signal)
+      if (assistantText.trim()) assistantText = await memoryWriteBody({...boundary,kind:'history_assistant',body:assistantText},policy,signal)
     }
   } catch (error) {
     if (error instanceof MemoryContentRejected) return
     throw error
   }
+  return { inputText, assistantText, inputHash: memoryDigest(input), sourceRef: request.sourceRef,
+    inputTruncated: inputText.length < input.length, assistantTruncated: assistantText.length < message.body.length,
+    fingerprint: memoryDigest([request, message.body, message.envelope.requestVersion]) }
+}
+
+/** Install only prefiltered evidence, with the request and forgetting epochs checked under locks. */
+export async function captureMemoryEvidence(database: SqlQueryable, work: Omit<WorkItem,'leaseToken'>, message: AssistantMessage,
+  scopes: readonly MemoryScope[], policy?: MemoryWritePolicy, prepared?: Awaited<ReturnType<typeof prepareMemoryEvidence>>) {
+  const evidence = prepared ?? await prepareMemoryEvidence(database, work, message, scopes, policy)
+  if (!evidence) return
+  const request = (await database.query('SELECT request_snapshot FROM lingxios.agent_request_snapshots WHERE work_id=$1', [work.id])).rows[0]?.['request_snapshot']
+  if (evidence.fingerprint !== memoryDigest([request, message.body, message.envelope.requestVersion])) throw new Error('memory evidence preparation is stale')
+  const epochs = await currentMemoryScopes(database, await lockMemoryScopes(database, scopes), work.id)
+  if (!epochs.length) return
+  const currentScopes = epochs.map(({ tenantId, scopeType, scopeId }) => ({ tenantId, scopeType, scopeId }))
+  const { inputText, assistantText } = evidence
   await database.query(`INSERT INTO lingxios.agent_memory_evidence
     (source_run_id,tenant_id,agent_id,principal_id,session_id,request_version,source_ref,input_sha256,input_text,assistant_text,input_truncated,assistant_truncated,scopes,scope_epochs,search_text)
     VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::jsonb,$14::jsonb,$15) ON CONFLICT(source_run_id) DO NOTHING`,
-    [work.id,work.tenantId,work.agentId,work.principalId,work.sessionId,message.envelope.requestVersion,request.sourceRef,memoryDigest(input),
-      inputText,assistantText,inputText.length<input.length,assistantText.length<message.body.length,JSON.stringify(currentScopes),JSON.stringify(epochs),
+    [work.id,work.tenantId,work.agentId,work.principalId,work.sessionId,message.envelope.requestVersion,evidence.sourceRef,evidence.inputHash,
+      inputText,assistantText,evidence.inputTruncated,evidence.assistantTruncated,JSON.stringify(currentScopes),JSON.stringify(epochs),
       memorySearchText(`${inputText} ${assistantText}`)])
   for (const epoch of epochs) await database.query(`INSERT INTO lingxios.agent_memory_evidence_scopes
     (tenant_id,agent_id,principal_id,scope_type,scope_id,epoch,source_run_id)

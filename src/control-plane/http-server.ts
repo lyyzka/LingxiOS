@@ -3,6 +3,11 @@
  * with a small explicit route table; every route is authenticated with a
  * timing-safe service-token comparison.
  */
+import { AGENT_OS_PROTOCOL_VERSION } from '../protocol/constants.js'
+import { ByteBudget } from '../resource-quota.js'
+const uploadBytes = new ByteBudget()
+const jsonBytes = new ByteBudget(64 * 1024 * 1024, 64 * 1024 * 1024)
+
 import { timingSafeEqual } from 'node:crypto'
 import http from 'node:http'
 import type { AddressInfo } from 'node:net'
@@ -15,7 +20,8 @@ import { readPreviewFrames } from '../host/preview-stream.js'
 
 export interface ControlPlaneServerOptions {
   service: ControlPlaneService
-  claimWork: (workerId: string, requestId?: string, workKinds?: readonly string[], lanes?: readonly import('../protocol/types.js').WorkLane[]) => Promise<import('../protocol/types.js').WorkItem | null>
+  claimWork: (workerId: string, requestId?: string, workKinds?: readonly string[], lanes?: readonly import('../protocol/types.js').WorkLane[], executionClass?: import('../protocol/types.js').ExecutionClass) => Promise<import('../protocol/types.js').WorkItem | null>
+  recoverWork?: (proof: LeaseProof, signal?: AbortSignal) => Promise<boolean>
   waitForWork?: NonNullable<import('../host/port.js').HostPort['waitForWork']>
   streamPreview?: (proof: LeaseProof, frames: AsyncIterable<import('../protocol/preview.js').PreviewFrame>, signal: AbortSignal) => Promise<void>
   serviceToken: string
@@ -25,29 +31,23 @@ export interface ControlPlaneServerOptions {
   ready?: () => Promise<boolean>
 }
 
-function readBody(req: http.IncomingMessage, maxBytes: number): Promise<unknown> {
-  return new Promise((resolveBody, rejectBody) => {
+async function readBody(req: http.IncomingMessage, maxBytes: number, signal: AbortSignal): Promise<unknown> {
+  const release = jsonBytes.acquire('json', maxBytes * 2)
+  const cancel = () => req.destroy(new Error('request body deadline exceeded'))
+  signal.addEventListener('abort', cancel, { once: true })
+  try {
+    signal.throwIfAborted()
     const chunks: Buffer[] = []
     let size = 0
-    req.on('data', (chunk: Buffer) => {
+    for await (const chunk of req) {
       size += chunk.length
-      if (size > maxBytes) {
-        rejectBody(new ControlPlaneError(413, 'request body too large'))
-        req.destroy()
-        return
-      }
+      if (size > maxBytes) throw new ControlPlaneError(413, 'request body too large')
       chunks.push(chunk)
-    })
-    req.on('end', () => {
-      if (chunks.length === 0) { resolveBody({}); return }
-      try {
-        resolveBody(JSON.parse(Buffer.concat(chunks).toString('utf8')))
-      } catch {
-        rejectBody(new ControlPlaneError(400, 'request body must be JSON'))
-      }
-    })
-    req.on('error', rejectBody)
-  })
+    }
+    if (!size) return {}
+    try { return JSON.parse(Buffer.concat(chunks).toString('utf8')) }
+    catch { throw new ControlPlaneError(400, 'request body must be JSON') }
+  } finally { signal.removeEventListener('abort', cancel); release() }
 }
 
 function json(res: http.ServerResponse, status: number, payload: unknown): void {
@@ -150,19 +150,20 @@ export class ControlPlaneServer {
       let artifact: unknown
       try { artifact = JSON.parse(Buffer.from(metadata, 'base64url').toString('utf8')) }
       catch { throw new ControlPlaneError(400, 'invalid artifact metadata') }
-      const chunks: Buffer[] = []
-      let size = 0
-      for await (const chunk of req) {
-        size += chunk.length
-        if (size > 16 * 1024 * 1024) throw new ControlPlaneError(413, 'artifact upload exceeds 16 MiB')
-        chunks.push(Buffer.from(chunk))
-      }
-      await service.stageArtifact(proof, artifact as never, Buffer.concat(chunks))
+      const work = await service.requireLease(proof, { rejectCancelled: true })
+      const size = (artifact as { size?: number })?.size
+      if (!Number.isSafeInteger(size) || size! < 0 || size! > 16 * 1024 * 1024) throw new ControlPlaneError(413, 'invalid artifact size')
+      const release = uploadBytes.acquire(work.tenantId, Math.max(64 * 1024, size!))
+      const signal = AbortSignal.any([disconnected.signal, AbortSignal.timeout(30_000)])
+      const cancel = () => req.destroy(new Error('artifact upload cancelled'))
+      signal.addEventListener('abort', cancel, { once: true })
+      try { await service.stageArtifactStream(proof, artifact as never, req, signal) }
+      finally { signal.removeEventListener('abort', cancel); release() }
       json(res, 200, { ok: true }); return
     }
 
     const maxBody = path.endsWith('/artifacts') ? 24 * 1024 * 1024 : this.options.maxBodyBytes ?? 8 * 1024 * 1024
-    const parsed = method === 'GET' ? {} : await readBody(req, maxBody)
+    const parsed = method === 'GET' ? {} : await readBody(req, maxBody, AbortSignal.any([disconnected.signal, AbortSignal.timeout(30_000)]))
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new ControlPlaneError(400, 'request body must be a JSON object')
     const body = parsed as Record<string, unknown>
 
@@ -181,13 +182,14 @@ export class ControlPlaneServer {
       return
     }
     if (method === 'POST' && path === '/v5/work/claim') {
+      if (body['protocol'] !== AGENT_OS_PROTOCOL_VERSION) throw new ControlPlaneError(409, 'upgrade worker: claims require the per-run recovery protocol', 'protocol_mismatch')
       if (body['requestId'] !== undefined && typeof body['requestId'] !== 'string') {
         throw new ControlPlaneError(400, 'requestId must be a string')
       }
       if (!Array.isArray(body['workKinds']) || body['workKinds'].length < 1 || body['workKinds'].length > 64
         || body['workKinds'].some(kind => typeof kind !== 'string' || !/^[a-z][a-z0-9_]{0,63}$/.test(kind))) throw new ControlPlaneError(400, 'workKinds are required')
       json(res, 200, await this.options.claimWork(stringField(body, 'workerId'),
-        typeof body['requestId'] === 'string' ? body['requestId'] : undefined, body['workKinds'], body['lanes'] as never))
+        typeof body['requestId'] === 'string' ? body['requestId'] : undefined, body['workKinds'], body['lanes'] as never, body['executionClass'] as never))
       return
     }
 
@@ -201,12 +203,14 @@ export class ControlPlaneServer {
           fence: Number(url.searchParams.get('fence')),
           leaseToken: url.searchParams.get('leaseToken') ?? '',
         }
-        json(res, 200, await service.loadContext(proof, url.searchParams.get('includeSession') === 'true'))
+        json(res, 200, await service.loadContext(proof, url.searchParams.get('includeSession') === 'true', disconnected.signal))
         return
       }
       if (method === 'POST') {
         const proof = leaseProofOf(id, body)
         switch (operation) {
+          case 'recover':
+            json(res, 200, await this.options.recoverWork?.(proof, disconnected.signal) ?? false); return
           case 'heartbeat':
             json(res, 200, await service.heartbeat(proof)); return
           case 'model-budget':
@@ -221,11 +225,11 @@ export class ControlPlaneServer {
           case 'actions':
             json(res, 200, await service.executeAction(proof, body['action'] as never, disconnected.signal)); return
           case 'reconcile':
-            json(res, 200, await service.recoverCell(proof, stringField(body, 'cellId'))); return
+            json(res, 200, await service.recoverCell(proof, stringField(body, 'cellId'), disconnected.signal)); return
           case 'step':
             json(res, 200, await service.recoverStep(proof, stringField(body, 'cellId'))); return
           case 'verify':
-            json(res, 200, await service.verifyCandidate(proof, body['candidate'] as never)); return
+            json(res, 200, await service.verifyCandidate(proof, body['candidate'] as never, disconnected.signal)); return
           case 'memory-review':
             json(res,200,await service.prepareMemoryReview(proof,body['action'] as never)); return
           case 'memory-review-result':
@@ -234,7 +238,7 @@ export class ControlPlaneServer {
           case 'checkpoint':
             await service.saveStep(proof, body['step'] as never); json(res, 200, { ok: true }); return
           case 'artifacts':
-            await service.stageArtifact(proof, body['artifact'] as never, stringField(body, 'contentBase64'))
+            await service.stageArtifact(proof, body['artifact'] as never, stringField(body, 'contentBase64'), disconnected.signal)
             json(res, 200, { ok: true }); return
           case 'events':
             await service.recordEvent(proof, body['event'] as RunEvent); json(res, 200, { ok: true }); return

@@ -57,7 +57,7 @@ it('asks through real Python, exposes the question and continues after a human r
     // Simulate process loss after the ask receipt, before session/output and wait completion.
     await db.exec(`UPDATE lingxios.agent_work_items SET status='queued',goal_outcome=NULL,finished_at=NULL;
       UPDATE lingxios.agent_os_sessions SET history=history- (jsonb_array_length(history)-1)`)
-    assert.equal(await worker.runNext(), false)
+    assert.equal(await worker.runNext(), true) // A leased recovery is now a registered run, even when it parks without model work.
     assert.equal(requests, 1)
     assert.deepEqual(await app.readOutcome(identity), { status: 'awaiting_input', verification: 'not_run', requestVersion: 1, question: 'Which city?' })
     const recovered = (await db.query<{ history: Array<{ output?: string }> }>('SELECT history FROM lingxios.agent_os_sessions')).rows[0]!.history.at(-1)!
@@ -67,12 +67,12 @@ it('asks through real Python, exposes the question and continues after a human r
       UPDATE lingxios.agent_os_sessions SET history=history-(jsonb_array_length(history)-1);
       INSERT INTO lingxios.agent_action_intents(idempotency_key,fingerprint,intent)
         SELECT 'lost-after-ask','lost',jsonb_set(intent,'{action,callIndex}','1'::jsonb) FROM lingxios.agent_action_intents LIMIT 1`)
-    assert.equal(await worker.runNext(), false)
+    assert.equal(await worker.runNext(), true)
     assert.equal(requests, 1)
     assert.equal((await app.readOutcome(identity))?.status, 'blocked')
     await db.exec(`DELETE FROM lingxios.agent_action_intents WHERE idempotency_key='lost-after-ask';
       UPDATE lingxios.agent_work_items SET status='queued',goal_outcome=NULL,finished_at=NULL`)
-    assert.equal(await worker.runNext(), false)
+    assert.equal(await worker.runNext(), true)
     assert.equal((await app.readOutcome(identity))?.status, 'awaiting_input')
     const replyAttachment = { id: 'schedule', sourceVersion: 'v1', name: 'schedule.txt', mimeType: 'text/plain', size: 14, text: 'Avoid Mondays.' }
     const reply = { ...identity, principalId: 'u', inputId: 'reply', requestVersion: 1, text: 'Shanghai', attachments: [replyAttachment] }

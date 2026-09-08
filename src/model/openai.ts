@@ -328,7 +328,7 @@ export class OpenAIChatDriver implements ModelDriver {
     const response = await this.request({
       model: this.modelId,
       messages: toWireMessages(request.instructions, request.items),
-      ...(tools.length ? { tools, tool_choice: 'auto', ...(this.profile.parallelTools ? { parallel_tool_calls: true } : {}) } : {}),
+      ...(tools.length ? { tools, tool_choice: 'auto', parallel_tool_calls: this.profile.parallelTools } : {}),
       stream: true,
       stream_options: { include_usage: true },
     }, request.signal)
@@ -337,10 +337,10 @@ export class OpenAIChatDriver implements ModelDriver {
       throw new ModelDriverError('model stream did not finish normally', { kind: 'provider', finishReasons: accumulator.finishReasons })
     }
     const output: ModelItem[] = []
-    if (!this.profile.parallelTools && accumulator.toolCalls.size > 1) throw new ModelDriverError('selected model returned unsupported parallel tools', { kind: 'protocol', finishReasons: accumulator.finishReasons })
     const text = accumulator.text
     if (text.trim()) output.push({ role: 'assistant', content: text })
-    for (const [, call] of [...accumulator.toolCalls.entries()].sort(([a], [b]) => a - b)) {
+    const toolCalls = [...accumulator.toolCalls.entries()].sort(([a], [b]) => a - b)
+    for (const [, call] of this.profile.parallelTools ? toolCalls : toolCalls.slice(0, 1)) {
       if (!call.id.trim()
         || call.name === IPYTHON_TOOL_NAME && !allowPython
         || call.name !== IPYTHON_TOOL_NAME && !request.tools?.some(tool => tool.name === call.name)) {

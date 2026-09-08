@@ -8,6 +8,7 @@
  */
 import { createHash, randomBytes, randomUUID } from 'node:crypto'
 import { isDeepStrictEqual } from 'node:util'
+import { resumeDependents } from './dependencies.js'
 import { fromRow as stepFromRow, type ExecutionStep } from './steps.js'
 import { sessionKeyOf, workStatusOf } from '../protocol/types.js'
 import { cancelDescendants, cancelRun, enqueueWork } from '../app/jobs.js'
@@ -129,9 +130,9 @@ export class PgWorkStore implements WorkStore {
 
   async enqueue(input: EnqueueWorkInput): Promise<EnqueueResult> { return enqueueWork(this.pool, input) }
 
-  async claim(workerId: string, requestId?: string, workKinds?: readonly string[], lanes?: readonly WorkItem['lane'][]): Promise<WorkItem | null> {
+  async claim(workerId: string, requestId?: string, workKinds?: readonly string[], lanes?: readonly WorkItem['lane'][], executionClass?: import('../protocol/types.js').ExecutionClass): Promise<WorkItem | null> {
     const kinds = workKinds ? [...new Set(workKinds)].sort() : null
-    const filter = lanes ? { kinds, lanes: [...new Set(lanes)].sort() } : kinds
+    const filter = lanes || executionClass ? { kinds, ...(lanes ? { lanes: [...new Set(lanes)].sort() } : {}), ...(executionClass ? { executionClass } : {}) } : kinds
     return withTransaction(this.pool, async (client) => {
       if (requestId) {
         // ponytail: seven-day dedupe window bounds storage; use partitioned retention if claim volume demands it.
@@ -169,6 +170,8 @@ export class PgWorkStore implements WorkStore {
           WHERE (work.status = 'queued' OR (work.status = 'leased' AND work.lease_expires_at <= NOW()))
             AND ($2::text[] IS NULL OR work.kind=ANY($2::text[]))
             AND ($3::text[] IS NULL OR work.lane=ANY($3::text[]))
+            AND ($4::text IS NULL OR COALESCE(work.meta->>'executionClass',
+              CASE WHEN work.lane IN ('interactive','approval') THEN 'conversation' ELSE 'operation' END)=$4)
             AND (work.kind NOT IN ('memory_synthesis','memory_index','memory_evaluation') OR work.attempts < 3)
             AND work.cancel_requested_at IS NULL
             AND work.available_at <= NOW()
@@ -193,7 +196,7 @@ export class PgWorkStore implements WorkStore {
                    work.priority DESC, (route.worker_id=$1) DESC NULLS LAST, work.created_at ASC
           FOR UPDATE OF work SKIP LOCKED
           LIMIT 1`,
-        [workerId, kinds, lanes ?? null],
+        [workerId, kinds, lanes ?? null, executionClass ?? null],
       )
       const row = rows[0]
       if (!row) return finish(null)
@@ -308,7 +311,7 @@ export class PgWorkStore implements WorkStore {
   }
 
   private async settle(id: string, fence: number, leaseTokenHash: string, status: string, completion: Omit<WorkCompletion, 'status'>): Promise<boolean> {
-    return withTransaction(this.pool, async (client) => {
+    const settled = await withTransaction(this.pool, async (client) => {
       const { rows } = await client.query(
         `UPDATE lingxios.agent_work_items
             SET status = $4, error = $5, goal_outcome = $6::jsonb, lease_token_hash = NULL,
@@ -327,6 +330,9 @@ export class PgWorkStore implements WorkStore {
       if (status !== 'waiting') await cancelDescendants(client, id)
       return true
     })
+    // Post-commit check also closes the child-finished-before-parent-parked race.
+    if (settled) await resumeDependents(this.pool, id)
+    return settled
   }
 
   async requestCancel(id: string): Promise<boolean> {

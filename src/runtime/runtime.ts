@@ -108,6 +108,7 @@ interface AttemptSignals {
   refresh: () => Promise<void>
   hasSteer: () => boolean
   drainSteer: () => SteerInput[]
+  generationSignal: () => AbortSignal
   stop: () => void
 }
 
@@ -129,6 +130,18 @@ export class AgentRuntime {
   private readonly eventSeqByRun = new Map<string, number>()
   private readonly eventTails = new Map<string, Promise<void>>()
   private readonly hostsByRun = new Map<string, HostPort>()
+  private readonly controls = new Map<string, AttemptSignals>()
+  private readonly auxiliary = new Set<Promise<void>>()
+
+  async refreshControls(): Promise<void> { await Promise.all([...this.controls.values()].map(signals => signals.refresh())) }
+  async drainBackground(): Promise<void> { await Promise.allSettled(this.auxiliary) }
+
+  private trackCompaction(candidate: ReturnType<typeof prepareCompaction>) {
+    this.auxiliary.add(candidate.settled)
+    void candidate.settled.finally(() => this.auxiliary.delete(candidate.settled))
+    return candidate
+  }
+
   private readonly previews = new Map<string, { buffer: PreviewBuffer; stop: AbortController; task: Promise<void> }>()
 
   private hostFor(work: WorkItem): HostPort { return this.hostsByRun.get(work.id) ?? this.host }
@@ -204,6 +217,7 @@ export class AgentRuntime {
     let leaseLost: Error | null = null
     let preemptRequested = false
     const steerQueue: SteerInput[] = []
+    let generation = new AbortController()
     const seenSteer = new Set<string>()
     let heartbeatInFlight: Promise<void> | undefined
 
@@ -227,6 +241,8 @@ export class AgentRuntime {
           if (!seenSteer.has(steer.id)) {
             seenSteer.add(steer.id)
             steerQueue.push(steer)
+            generation.abort(new Error('request revised'))
+            this.previews.get(work.id)?.buffer.discard()
           }
         }
       }).catch((error: unknown) => {
@@ -244,7 +260,8 @@ export class AgentRuntime {
       preemptRequested: () => preemptRequested,
       refresh,
       hasSteer: () => steerQueue.length > 0,
-      drainSteer: () => steerQueue.splice(0),
+      generationSignal: () => AbortSignal.any([lifecycle.signal, generation.signal]),
+      drainSteer: () => { const values = steerQueue.splice(0); if (values.length) generation = new AbortController(); return values },
       stop: () => {
         clearInterval(heartbeat)
         external?.removeEventListener('abort', abortFromCaller)
@@ -257,6 +274,7 @@ export class AgentRuntime {
     const runId = work.id
     this.eventSeqByRun.set(runId, Math.max(0, work.fence - 1) * RUN_SEQUENCE_SPAN)
     const signals = this.startSignals(work, signal)
+    this.controls.set(runId, signals)
     this.hostsByRun.set(runId,deadlineHost(this.checkpointDedup ? checkpointHost(this.host, this.metrics) : this.host,
       signals.lifecycle.signal,30_000,this.metrics))
     let activeSession: SessionRecord | null = null
@@ -264,6 +282,10 @@ export class AgentRuntime {
     const model = executionModel(this.hostFor(work), this.model, work, this.rootModelBudget, event => this.event(work, runId, event))
 
     try {
+      const recoveryStarted = performance.now()
+      if (await this.hostFor(work).recoverWork?.(work)) return
+      this.metrics?.histogram('agentos_claim_recovery_seconds', 'Per-run recovery after heartbeat registration', LATENCY_BUCKETS)
+        .observe((performance.now() - recoveryStarted) / 1000)
       await this.event(work, runId, {
         kind: 'run.started', stage: 'started', visibility: 'user',
         data: {
@@ -291,7 +313,6 @@ export class AgentRuntime {
         await this.runTurn(work, runId, signals, log, sessionRef, model)
       } finally {
         sessionRef.compaction?.cancel()
-        await sessionRef.compaction?.settled
         activeSession = sessionRef.session
       }
     } catch (error) {
@@ -315,6 +336,7 @@ export class AgentRuntime {
       this.metrics?.histogram('agentos_run_seconds', 'Execution attempt duration excluding parked waits', LATENCY_BUCKETS)
         .observe((performance.now() - began) / 1000, { lane: work.lane })
       signals.stop()
+      this.controls.delete(runId)
       this.eventSeqByRun.delete(runId)
       this.eventTails.delete(runId)
       this.hostsByRun.delete(runId)
@@ -368,7 +390,6 @@ export class AgentRuntime {
       const steers = signals.drainSteer()
       if (steers.length > 0) {
         pendingCompaction?.cancel()
-        await pendingCompaction?.settled
         pendingCompaction = undefined
         this.previews.get(runId)?.buffer.discard()
         budget.observe({ revisions: steers })
@@ -414,7 +435,7 @@ export class AgentRuntime {
       const preferenceItems = (session.promptContext.blocks ?? []).filter(block => block.trust !== 'platform' && block.trust !== 'product').map(contextItem)
       const dynamicItems = [...preferenceItems, ...this.policy.dynamicContextItems(liveContext)]
       const instructions = session.promptContext.systemInstructions
-      if (budget.rediagnose && protocolCorrection && 'role' in protocolCorrection) protocolCorrection = { ...protocolCorrection, content: 'Repeated failure without new observations: diagnose the cause and change the approach before another attempt. ' + protocolCorrection.content }
+      if (budget.rediagnose && protocolCorrection && 'role' in protocolCorrection) protocolCorrection = { role: 'user', content: 'Repeated failure without new observations: diagnose the cause and change the approach before another attempt. ' + protocolCorrection.content }
       const supplementalItems = [...dynamicItems, ...evidenceItems(evidence()), ...(session.request ? requestItems(session.request,
         this.onDemandAttachments && modelTools.some(tool => tool.action === 'task.read_attachment')) : []), ...(protocolCorrection ? [protocolCorrection] : [])]
       if (liveContext.priorArtifacts?.length) supplementalItems.push({ role: 'user', content:
@@ -432,14 +453,26 @@ export class AgentRuntime {
         supplementalItems.splice(0,dynamicCount,...items); dynamicCount=items.length
         memoryForModel=snapshot; overheadTokens=estimateOverhead()
       }
-      // Compact narration before sacrificing core memory. A failed compaction may still fit after optional context is removed.
-      if (pendingCompaction && estimateTokens(session.history) + overheadTokens >= this.compaction.contextWindowTokens * this.compaction.softRatio) {
+      // A soft threshold schedules work, not a foreground wait. Hard-budget compaction is mandatory.
+      const hardLimit = this.compaction.contextWindowTokens * this.compaction.hardRatio
+      if (pendingCompaction && estimateTokens(session.history) + overheadTokens >= hardLimit) {
+        pendingCompaction.cancel()
         await pendingCompaction.settled
       }
       const prepared = pendingCompaction?.ready ? pendingCompaction.install(session) : { compacted: false }
       if (pendingCompaction?.ready) pendingCompaction = undefined
-      const compacted = prepared.compacted ? prepared : await compactIfNeeded(session, instructions, model, this.compaction, signals.lifecycle.signal, overheadTokens)
-        .catch((error):CompactionOutcome => { if (!memoryForModel || !(error instanceof HardLimitExceededError)) throw error; return {compacted:false} })
+      const compacted = prepared.compacted ? prepared : this.asyncCompaction && estimateTokens(session.history) + overheadTokens < hardLimit
+        ? { compacted: false } : await compactIfNeeded(session, instructions, model, this.compaction, signals.generationSignal(), overheadTokens)
+          .catch((error): CompactionOutcome => {
+            if (!signals.hasSteer() && (!memoryForModel || !(error instanceof HardLimitExceededError))) throw error
+            return { compacted: false }
+          })
+      if (signals.hasSteer()) continue
+      if (this.asyncCompaction && !pendingCompaction && session.history.length > this.compaction.keepTailItems
+        && estimateTokens(session.history) + overheadTokens >= this.compaction.contextWindowTokens * this.compaction.softRatio * 0.8) {
+        sessionRef.compaction = pendingCompaction = this.trackCompaction(prepareCompaction(session, model,
+          { ...this.compaction, softRatio: this.compaction.softRatio * 0.8 }, signals.generationSignal(), overheadTokens))
+      }
       if (compacted.compacted) {
         session.promptContext.epoch = session.compactionEpoch
         await this.hostFor(work).saveSession(work, session)
@@ -489,7 +522,7 @@ export class AgentRuntime {
           items: modelItems,
           tools: modelTools,
           codeExecution,
-          signal: signals.lifecycle.signal,
+          signal: signals.generationSignal(),
           onAttempt: callId => {
             providerBegan = performance.now()
             parser = new CandidateBodyParser()
@@ -511,6 +544,7 @@ export class AgentRuntime {
         })
       } catch (error) {
         preview?.discard()
+        if (signals.hasSteer() && !signals.lifecycle.signal.aborted) continue
         await this.event(work, runId, {
           kind: 'model.failed', stage: 'failed', visibility: 'internal',
           data: { hop: hop + 1, model: model.modelId ?? 'unknown', error: errorMessage(error) },
@@ -675,7 +709,7 @@ export class AgentRuntime {
         }
         if (!violation && needsContentCheck && session.request) {
           const check = await checkCandidateContent(model, session.request, turn.text.trim(), artifacts,
-            this.compaction.contextWindowTokens, signals.lifecycle.signal, resourceGaps, fileObservations,
+            this.compaction.contextWindowTokens, signals.generationSignal(), resourceGaps, fileObservations,
             { steps: (liveContext.executionSteps ?? []).filter(step => !step.kind.startsWith('runtime.')).map(step => ({ id: step.id, requestVersion: step.requestVersion, kind: step.kind, output: step.output })),
               dependencies: liveContext.dependencies ?? [] })
           await signals.refresh()
@@ -745,8 +779,8 @@ export class AgentRuntime {
       await this.hostFor(work).saveSession(work, session)
       if (this.asyncCompaction && !pendingCompaction && session.history.length > this.compaction.keepTailItems
         && estimateTokens(session.history) + overheadTokens >= this.compaction.contextWindowTokens * this.compaction.softRatio * 0.8) {
-        sessionRef.compaction = pendingCompaction = prepareCompaction(session, model, { ...this.compaction, softRatio: this.compaction.softRatio * 0.8 },
-          signals.lifecycle.signal, overheadTokens)
+        sessionRef.compaction = pendingCompaction = this.trackCompaction(prepareCompaction(session, model, { ...this.compaction, softRatio: this.compaction.softRatio * 0.8 },
+          signals.generationSignal(), overheadTokens))
       }
       const onlyReads = calls.every(call => liveContext.tools?.some(tool => tool.name === call.name && tool.effect === 'read'))
       let terminal = false
@@ -829,7 +863,6 @@ export class AgentRuntime {
     }
     this.previews.get(runId)?.buffer.close()
     pendingCompaction?.cancel()
-    await pendingCompaction?.settled
     pendingCompaction = undefined
     await this.hostFor(work).saveSession(work, session)
     await this.hostFor(work).commitResult(work, message)
@@ -962,7 +995,7 @@ export class AgentRuntime {
       if (execution.artifacts.length && artifactHost.stageArtifact) {
         if (!this.kernels.readArtifact) throw new Error('remote artifact transfer is unavailable for this kernel backend')
         for (const artifact of execution.artifacts) {
-          await artifactHost.stageArtifact(work, artifact, await this.kernels.readArtifact(work, artifact))
+          await artifactHost.stageArtifact(work, artifact, await this.kernels.readArtifact(work, artifact, signals.lifecycle.signal))
         }
       }
       execution.artifacts.push(...receipts.flatMap(receipt => receipt.result.ok ? receipt.result.artifacts ?? [] : []))

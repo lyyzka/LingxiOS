@@ -19,7 +19,7 @@ const model = createServer(async (req, res) => {
   res.on('close', () => { active-- })
   while (hold && !res.destroyed) await delay(20)
   await delay(80)
-  const content = JSON.stringify({ body: '4', status: 'satisfied', gaps: [], checks: [{ requirement: 'Return 4.', status: 'met', basis: 'The answer is 4.' }] })
+  const content = '4'
   if (!res.destroyed) res.writeHead(200, { 'content-type': 'text/event-stream' }).end(`data: ${JSON.stringify({ model: 'fixture', choices: [{ index: 0, delta: { content }, finish_reason: 'stop' }] })}\n\ndata: [DONE]\n\n`)
 })
 async function until(check) {
@@ -43,7 +43,7 @@ try {
   app = await createLingxiOS({ database: pool, homesRoot: join(directory, 'control') })
   const port = await app.listenControlPlane({ serviceToken: 'capacity', port: 0 })
   model.listen(0, '127.0.0.1'); await once(model, 'listening')
-  for (let i = 0; i < 100; i++) await app.enqueue({ id: `capacity-${i}`, tenantId: 't', agentId: 'a', sessionId: `s-${i}`, principalId: 'p', text: 'Return 4.' })
+  for (let i = 0; i < 100; i++) await app.enqueue({ id: `capacity-${i}`, tenantId: 't', agentId: 'a', sessionId: `s-${i}`, principalId: 'p', text: 'Return 4.', mode: 'chat', executionClass: i % 2 ? 'conversation' : 'operation' })
   assert.equal((await pool.query("SELECT count(*)::int AS n FROM lingxios.agent_work_items WHERE status='queued'")).rows[0].n, 100)
   const first = worker('capacity-a', port); worker('capacity-b', port)
   await until(() => active === 4)
@@ -54,10 +54,11 @@ try {
   await pool.query("UPDATE lingxios.agent_os_workers SET last_seen_at=NOW()-INTERVAL '1 day' WHERE worker_id='capacity-a'")
   hold = false; worker('capacity-replacement', port)
   await until(async () => (await pool.query("SELECT count(*)::int AS n FROM lingxios.agent_work_items WHERE status IN ('succeeded','partial','blocked','failed','cancelled')")).rows[0].n === 100)
-  assert.deepEqual((await pool.query('SELECT status,count(*)::int AS n FROM lingxios.agent_work_items GROUP BY status')).rows, [{ status: 'succeeded', n: 100 }])
+  assert.deepEqual((await pool.query('SELECT status,count(*)::int AS n FROM lingxios.agent_work_items GROUP BY status')).rows, [{ status: 'succeeded', n: 100 }],
+    JSON.stringify((await pool.query("SELECT id,meta->>'mode' AS mode,goal_outcome,error FROM lingxios.agent_work_items WHERE status<>'succeeded' LIMIT 3")).rows))
   assert.equal((await pool.query('SELECT count(*)::int AS n FROM lingxios.agent_results')).rows[0].n, 100)
   assert.ok(peak <= 4, `observed ${peak} concurrent model calls`)
-  console.log('Capacity passed: 100 queued tasks, two Workers x two slots, SIGKILL takeover, 100 unique committed messages.')
+  console.log('Capacity passed: 100 mixed conversation/operation tasks, two Workers x two slots, SIGKILL takeover, 100 unique committed messages.')
 } finally {
   hold = false
   for (const item of children) { if (item.child.exitCode === null && item.child.signalCode === null) item.child.kill('SIGKILL'); await item.exited }
