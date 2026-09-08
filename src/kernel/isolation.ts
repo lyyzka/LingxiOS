@@ -32,7 +32,8 @@ export function sandboxCommand(home: string, runner: string, python: string, lim
     ...['/lib', '/lib64'].filter(existsSync).flatMap(path => ['--ro-bind', path, path]),
     ...(existsSync('/etc/ld.so.cache') ? ['--ro-bind', '/etc/ld.so.cache', '/etc/ld.so.cache'] : []),
     '--ro-bind', runner, '/runner.py',
-    '--proc', '/proc', '--dev', '/dev', '--size', String(limits.tmpBytes), '--tmpfs', '/tmp', '--bind', home, home,
+    // The runner uses stdio; omitting procfs preserves Docker's masked paths during nested isolation.
+    '--dev', '/dev', '--size', String(limits.tmpBytes), '--tmpfs', '/tmp', '--bind', home, home,
     '--chdir', home, '--', python, ...args,
   ] }
 }
@@ -41,7 +42,7 @@ export async function checkKernelIsolation(runner: string, python: string, limit
   const directory = await mkdtemp(join(tmpdir(), 'lingxios-isolation-'))
   try {
     const launch = sandboxCommand(directory, runner, python, limits, false, ['-I', '-c',
-      'import os,socket; assert not os.path.exists("/app"); assert os.path.isfile("/runner.py"); print("isolated")'])
+      'import os; assert not os.path.exists("/app"); assert not os.path.exists("/proc"); assert os.path.isfile("/runner.py"); print("isolated")'])
     const { stdout } = await promisify(execFile)(launch.command, launch.args, { timeout: 10_000, env: { PATH: '/usr/bin:/bin' }, windowsHide: true })
     if (stdout.trim() !== 'isolated') throw new Error('unexpected isolation probe output')
   } catch (cause) { throw new ConfigError(`kernel isolation self-check failed: ${cause instanceof Error ? cause.message : String(cause)}`) }

@@ -4,6 +4,8 @@ Run one control-plane process with PostgreSQL and its persistent artifact direct
 
 Workers require Linux Bubblewrap isolation. Use the supplied `worker-seccomp.json`, a read-only root filesystem, `--cap-drop ALL`, `no-new-privileges`, `/tmp` as a bounded no-exec tmpfs, and an isolated writable `/data/homes`. Do not run privileged or unconfined workers.
 
+The Python runner communicates over inherited stdio and has no `/proc` filesystem. Code requiring procfs (including `/dev/stdin` aliases through `/proc/self/fd`) is outside the isolated Kernel contract. Docker's masked system paths remain enabled; the sandbox never binds the Worker's process tree into Python.
+
 On hosts where `docker info` lists AppArmor, load the dedicated profile below and pass `--security-opt apparmor=lingxios-worker`. Docker's default profile denies the mounts needed to construct the sandbox. This profile permits Bubblewrap's temporary root setup while keeping mount targets restricted and `/proc` and `/sys` protected. Hosts without AppArmor omit only that AppArmor option; all other sandbox restrictions and readiness checks remain required. See [Docker's AppArmor instructions](https://docs.docker.com/engine/security/apparmor/).
 
 ```sh
