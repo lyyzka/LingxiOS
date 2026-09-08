@@ -7,7 +7,7 @@ import { dirname, join, resolve } from 'node:path'
 import { createServer } from 'node:http'
 import { setTimeout as delay } from 'node:timers/promises'
 import { Pool } from 'pg'
-import { createLingxiOS, packageResources } from 'lingxios'
+import { createLingxiOS, packageResources } from '@lyyzka/lingxios'
 
 assert.ok(process.env.LINGXIOS_CAPACITY_TEST_DATABASE_URL, 'a fresh capacity PostgreSQL database is required')
 const pool = new Pool({ connectionString: process.env.LINGXIOS_CAPACITY_TEST_DATABASE_URL, max: 8 })

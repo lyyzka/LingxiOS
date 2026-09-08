@@ -55,7 +55,7 @@ for (const [code, expected] of [
   assert.equal(exhausted.error, undefined, 'kernel must terminate within its own CPU limit')
   if (expected) assert.match(exhausted.stderr, expected)
 }
-for (const name of ['lingxios', 'lingxios/worker', 'lingxios/eval', 'lingxios/ui']) await import(name)
+for (const name of ['@lyyzka/lingxios', '@lyyzka/lingxios/worker', '@lyyzka/lingxios/eval', '@lyyzka/lingxios/ui']) await import(name)
 const invalid = spawnSync(process.execPath, ['dist/src/worker/main.js'], { encoding: 'utf8', timeout: 5000 })
 assert.equal(invalid.status, 1)
 assert.match(invalid.stderr, /missing required environment variable: AGENT_OS_CONTROL_PLANE_URL/)

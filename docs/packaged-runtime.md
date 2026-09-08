@@ -4,7 +4,7 @@
 
 `createLingxiOS()` owns the control plane: durable ingress, reads, cancellation, revisions, input continuation, approvals, reconciliation, diagnostics, delivery retries, memory administration, and Worker connections. It requires a PostgreSQL-compatible pool and does not claim work.
 
-`createWorker()` from `lingxios/worker` owns execution. It receives a local or HTTP control-plane connection, a model driver or provider configuration, Kernel configuration, runtime policy, product processors, and an optional evolution evaluator. Multiple Workers coordinate through leases and fencing.
+`createWorker()` from `@lyyzka/lingxios/worker` owns execution. It receives a local or HTTP control-plane connection, a model driver or provider configuration, Kernel configuration, runtime policy, product processors, and an optional evolution evaluator. Multiple Workers coordinate through leases and fencing.
 
 The consuming product owns authentication, authorization policy, native services, its business schema, transactions, delivery transport, and model-cost ledger. It registers tools through public contracts; LingxiOS has no product-specific export or table access.
 
@@ -18,10 +18,10 @@ Before upgrading, stop ingress and workers, drain running tasks and explicitly r
 
 The package exports only:
 
-- `lingxios`: control plane, schema resources, tools, state, diagnostics, memory and evolution contracts
-- `lingxios/worker`: Worker factory, model and Kernel ports, product processor contracts
-- `lingxios/ui`: browser-safe committed-message and replay reducers
-- `lingxios/eval`: verification and evaluation helpers
+- `@lyyzka/lingxios`: control plane, schema resources, tools, state, diagnostics, memory and evolution contracts
+- `@lyyzka/lingxios/worker`: Worker factory, model and Kernel ports, product processor contracts
+- `@lyyzka/lingxios/ui`: browser-safe committed-message and replay reducers
+- `@lyyzka/lingxios/eval`: verification and evaluation helpers
 
 ## Execution contract
 
@@ -45,7 +45,7 @@ Result, event, and model-ledger outboxes use expiring claims, bounded retries, e
 
 Artifacts are limited to 16 MiB. The control plane snapshots them by content hash before committing the message. `readArtifact()` checks the authenticated run identity, manifest entry, path containment, size, and SHA-256 digest before returning bytes.
 
-The browser consumes committed messages and ordered events through `lingxios/ui`. Reconnects page through `readEvents()` and then apply `readRunState()`; reducers reject stale fences and request versions. Waiting, partial completion, verification gaps, delivery failure, citations, and artifact provenance stay explicit.
+The browser consumes committed messages and ordered events through `@lyyzka/lingxios/ui`. Reconnects page through `readEvents()` and then apply `readRunState()`; reducers reject stale fences and request versions. Waiting, partial completion, verification gaps, delivery failure, citations, and artifact provenance stay explicit.
 
 ## Memory evolution
 

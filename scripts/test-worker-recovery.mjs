@@ -9,7 +9,7 @@ import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 import { fileURLToPath } from 'node:url'
-import { createLingxiOS, packageResources } from 'lingxios'
+import { createLingxiOS, packageResources } from '@lyyzka/lingxios'
 
 const connectionString = process.env.LINGXIOS_WORKER_TEST_DATABASE_URL
 assert.ok(connectionString, 'configure a fresh disposable PostgreSQL database for worker recovery')

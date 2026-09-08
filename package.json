@@ -1,5 +1,5 @@
 {
-  "name": "lingxios",
+  "name": "@lyyzka/lingxios",
   "version": "3.0.0",
   "description": "Durable agent execution for PostgreSQL with fenced workers, native tools, verified outcomes, and sandboxed Python.",
   "type": "module",
@@ -7,6 +7,9 @@
   "repository": {
     "type": "git",
     "url": "git+https://github.com/lyyzka/LingxiOS.git"
+  },
+  "publishConfig": {
+    "registry": "https://npm.pkg.github.com"
   },
   "files": [
     "dist/src",

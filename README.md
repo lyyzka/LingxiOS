@@ -2,12 +2,18 @@
 
 LingxiOS is a product-neutral agent execution runtime for Node.js and PostgreSQL. It provides durable requests, fenced workers, native tool transactions, recovery, approval and input waits, model budgets, verified outcomes, committed artifacts, delivery outboxes, and versioned memory.
 
-The package has four public entries: `lingxios`, `lingxios/worker`, `lingxios/ui`, and `lingxios/eval`. Product rules and services stay in the consuming application.
+The package has four public entries: `@lyyzka/lingxios`, `@lyyzka/lingxios/worker`, `@lyyzka/lingxios/ui`, and `@lyyzka/lingxios/eval`. Product rules and services stay in the consuming application.
 
 ## Install
 
 ```sh
-npm install lingxios@3.0.0
+npm install @lyyzka/lingxios@3.0.0
+```
+
+Configure the GitHub Packages registry for the `@lyyzka` scope before installing:
+
+```ini
+@lyyzka:registry=https://npm.pkg.github.com
 ```
 
 Requires Node.js 22.13+, PostgreSQL, and Python 3. Install `packageResources().schema` through the product's explicit migration process before an application starts. LingxiOS performs read-only schema checks at startup and never applies DDL itself.
@@ -15,8 +21,8 @@ Requires Node.js 22.13+, PostgreSQL, and Python 3. Install `packageResources().s
 ## Control plane and Worker
 
 ```ts
-import { createLingxiOS } from 'lingxios'
-import { createWorker } from 'lingxios/worker'
+import { createLingxiOS } from '@lyyzka/lingxios'
+import { createWorker } from '@lyyzka/lingxios/worker'
 import { pool } from './database.js'
 import { context, delivery, tools } from './native-agent-bindings.js'
 

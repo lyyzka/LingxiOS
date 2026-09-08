@@ -5,9 +5,9 @@ import { createHash, randomUUID } from 'node:crypto'
 import { isDeepStrictEqual } from 'node:util'
 import { Pool } from 'pg'
 import { PGlite } from '@electric-sql/pglite'
-import { createLingxiOS, packageResources, releaseVersions, DEFAULT_MODEL } from 'lingxios'
-import { createWorker } from 'lingxios/worker'
-import { executeRequest, reviewAnswer } from 'lingxios/eval'
+import { createLingxiOS, packageResources, releaseVersions, DEFAULT_MODEL } from '@lyyzka/lingxios'
+import { createWorker } from '@lyyzka/lingxios/worker'
+import { executeRequest, reviewAnswer } from '@lyyzka/lingxios/eval'
 import { intEnv } from '../dist/src/config.js'
 
 const args = process.argv.slice(2)
