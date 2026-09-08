@@ -48,7 +48,7 @@ it('continues beyond twelve steps, bounds concurrent reads, and stops an unstart
   const tools: ToolDefinition[] = ['read','write'].map(method => ({ name: `data__${method}`, action: `data.${method}`,
     description: method, parameters: { type: 'object', properties: { [method === 'read' ? 'query' : 'body']: { type: 'string' } }, additionalProperties: false },
     effect: method === 'read' ? 'read' : 'uncertain', approval: method === 'write' }))
-  let calls = 0, active = 0, peak = 0, reads = 0, writes = 0, message: AssistantMessage | undefined
+  let calls = 0, active = 0, peak = 0, reads = 0, writes = 0, serial = false, message: AssistantMessage | undefined
   const deliveredEvents: number[] = []
   const readWaiters: Array<() => void> = []
   let emitting = 0
@@ -68,16 +68,19 @@ it('continues beyond twelve steps, bounds concurrent reads, and stops an unstart
       assert.notEqual(action.cellId, 'provider-call')
       if (action.action === 'data.write') { writes++; return { ok: false, approval: { id: 'approval', status: 'PENDING' } } }
       active++; peak = Math.max(peak, active)
-      // Each seven-call turn has batches of four and three. Hold peers until the batch is admitted.
-      await new Promise<void>(resolve => {
-        readWaiters.push(resolve)
-        const batchSize = Number(String(action.args['query']).split(':')[1]) < 4 ? 4 : 3
-        if (readWaiters.length === batchSize) readWaiters.splice(0).forEach(release => release())
-      })
+      if (serial) await delay(1)
+      else {
+        // Each seven-call turn has batches of four and three. Hold peers until the batch is admitted.
+        await new Promise<void>(resolve => {
+          readWaiters.push(resolve)
+          const batchSize = Number(String(action.args['query']).split(':')[1]) < 4 ? 4 : 3
+          if (readWaiters.length === batchSize) readWaiters.splice(0).forEach(release => release())
+        })
+      }
       active--; reads++
       return { ok: true, value: { query: action.args['query'] } }
     }, commitResult: async (_work, value) => { message = value }, completeWork: async (_work, value) => {
-      assert.equal(value.goalOutcome?.status, 'awaiting_approval')
+      assert.equal(value.goalOutcome?.status, serial ? 'satisfied' : 'awaiting_approval')
     } }
   const unexpected = async (): Promise<never> => { throw new Error('unexpected auxiliary call') }
   await new AgentRuntime(host, { structured: unexpected, compact: unexpected, run: async () => {
@@ -92,6 +95,14 @@ it('continues beyond twelve steps, bounds concurrent reads, and stops an unstart
     output: [0, 1].map(i => ({ type: 'function_call' as const, callId: `write-${i}`, name: 'data__write', arguments: '{"body":"save"}' })),
     usage: { available: true, inputTokens: 1, outputTokens: 1 } }) }, { execute: unexpected }).runWork(work)
   assert.equal(writes, 1)
+  serial = true; calls = active = peak = reads = 0; message = undefined
+  await new AgentRuntime(host, { profile: { id: 'test', contextWindowTokens: 128_000, maxOutputTokens: 8192,
+    maxThinkingTokens: 0, toolCalls: true, jsonObject: true, parallelTools: false }, structured: unexpected, compact: unexpected,
+  run: async () => ++calls === 1 ? { text: '', output: [0, 1].map(i => ({ type: 'function_call' as const,
+    callId: `serial-${i}`, name: 'data__read', arguments: JSON.stringify({ query: `serial:${i}` }) })), usage: { available: true, inputTokens: 1, outputTokens: 1 } }
+    : { text: 'Done.', output: [], usage: { available: true, inputTokens: 1, outputTokens: 1 } } }, { execute: unexpected }).runWork(work)
+  assert.deepEqual({ calls, reads, peak, body: (message as AssistantMessage | undefined)?.body },
+    { calls: 2, reads: 2, peak: 1, body: 'Done.' })
 })
 
 it('reserves each provider attempt and settles an issued call after cancellation', async () => {

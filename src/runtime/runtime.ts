@@ -782,7 +782,8 @@ export class AgentRuntime {
         sessionRef.compaction = pendingCompaction = this.trackCompaction(prepareCompaction(session, model, { ...this.compaction, softRatio: this.compaction.softRatio * 0.8 },
           signals.generationSignal(), overheadTokens))
       }
-      const onlyReads = calls.every(call => liveContext.tools?.some(tool => tool.name === call.name && tool.effect === 'read'))
+      const onlyReads = model.profile?.parallelTools !== false
+        && calls.every(call => liveContext.tools?.some(tool => tool.name === call.name && tool.effect === 'read'))
       let terminal = false
       for (let index = 0; index < calls.length; index += onlyReads ? 4 : 1) {
         await signals.refresh()
