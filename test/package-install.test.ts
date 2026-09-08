@@ -15,16 +15,24 @@ it('installs a standalone tarball and executes packaged Python and document pars
   const npm = process.env['npm_execpath'] ?? join(dirname(process.execPath), 'node_modules/npm/bin/npm-cli.js')
   try {
     const packed = await run(process.execPath, [npm, 'pack', '--json', '--ignore-scripts', '--pack-destination', directory], { cwd: root })
-    const [tarball] = JSON.parse(packed.stdout) as Array<{ filename: string; files: Array<{ path: string }> }>
+    const [tarball] = JSON.parse(packed.stdout) as Array<{ filename: string; integrity: string; files: Array<{ path: string }> }>
     assert.ok(tarball)
     assert.ok(tarball.files.some((file) => file.path === 'kernel/runner.py'))
     assert.ok(tarball.files.some((file) => file.path === 'dist/src/context/document-worker.js'))
     assert.ok(tarball.files.some((file) => file.path === 'db/schema.sql'))
     assert.ok(tarball.files.some((file) => file.path === 'dist/src/cli/eval.js'))
     assert.ok(!tarball.files.some((file) => file.path.startsWith('test/') || file.path.includes('pglite')))
-    await writeFile(join(directory, 'package.json'), '{"private":true,"type":"module"}')
-    await run(process.execPath, [npm, 'install', '--ignore-scripts', '--omit=dev', '--offline', '--no-audit', '--no-fund', join(directory, tarball.filename)], { cwd: directory })
     const pkg = JSON.parse(await readFile(join(root, 'package.json'), 'utf8')) as { name: string; version: string }
+    // npm ci caches locked tarballs, not registry metadata. Reuse that graph so a clean CI cache also installs offline.
+    const locked = JSON.parse(await readFile(join(root, 'package-lock.json'), 'utf8')) as { packages: Record<string, Record<string, unknown>> }
+    const { devDependencies: _devDependencies, ...packageEntry } = locked.packages['']!
+    const dependencies = { [pkg.name]: `file:${tarball.filename}` }
+    const consumer = { name: 'lingxios-package-consumer', private: true, type: 'module', dependencies }
+    const packages = { ...locked.packages, '': consumer,
+      [`node_modules/${pkg.name}`]: { ...packageEntry, resolved: `file:${tarball.filename}`, integrity: tarball.integrity } }
+    await writeFile(join(directory, 'package.json'), JSON.stringify(consumer))
+    await writeFile(join(directory, 'package-lock.json'), JSON.stringify({ name: consumer.name, lockfileVersion: 3, requires: true, packages }))
+    await run(process.execPath, [npm, 'ci', '--ignore-scripts', '--omit=dev', '--offline', '--no-audit', '--no-fund'], { cwd: directory })
     await writeFile(join(directory, 'consumer.mjs'), `
 import assert from 'node:assert/strict'
 import { access, mkdir, symlink, writeFile } from 'node:fs/promises'
