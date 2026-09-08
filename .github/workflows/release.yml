@@ -14,7 +14,12 @@ jobs:
       - uses: actions/setup-node@v4
         with: { node-version: 22.13.1, cache: npm }
       - run: npm ci --ignore-scripts
+      - name: Load confined Worker AppArmor policy
+        run: sudo apparmor_parser --replace --skip-cache deploy/worker-apparmor
       - run: npm run check:release
+      - name: Report sandbox denials
+        if: failure()
+        run: sudo journalctl --dmesg --no-pager --grep='apparmor="DENIED"' --lines=30
 
   windows-package:
     runs-on: windows-2025

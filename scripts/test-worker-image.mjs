@@ -6,8 +6,12 @@ import { fileURLToPath } from 'node:url'
 // Run against an already-built image; no host mounts or published ports.
 const image = process.argv[2]
 assert.ok(image && !image.startsWith('-'), 'usage: node scripts/test-worker-image.mjs IMAGE')
+const security = spawnSync('docker', ['info', '--format', '{{json .SecurityOptions}}'], { encoding: 'utf8', timeout: 10_000 })
+assert.ifError(security.error)
+assert.equal(security.status, 0, security.stderr)
+const apparmor = JSON.parse(security.stdout).some(option => option.split(',').includes('name=apparmor'))
 const container = `lingxios-image-test-${randomUUID()}`
-const result = spawnSync('docker', ['run', '--rm', '--name', container, '--network=none', '--read-only', '--tmpfs', '/tmp:rw,noexec,nosuid,size=128m', '--tmpfs', '/data/homes:rw,nosuid,size=256m,uid=1000,gid=1000', '--cpus', '2', '--memory', '2g', '--pids-limit', '128', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--security-opt', `seccomp=${fileURLToPath(new URL('../deploy/worker-seccomp.json', import.meta.url))}`, '-i', image, 'node', '--input-type=module'], {
+const result = spawnSync('docker', ['run', '--rm', '--name', container, '--network=none', '--read-only', '--tmpfs', '/tmp:rw,noexec,nosuid,size=128m', '--tmpfs', '/data/homes:rw,nosuid,size=256m,uid=1000,gid=1000', '--cpus', '2', '--memory', '2g', '--pids-limit', '128', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--security-opt', `seccomp=${fileURLToPath(new URL('../deploy/worker-seccomp.json', import.meta.url))}`, ...(apparmor ? ['--security-opt', 'apparmor=lingxios-worker'] : []), '-i', image, 'node', '--input-type=module'], {
   encoding: 'utf8', timeout: 45_000,
   input: `
 import assert from 'node:assert/strict'
@@ -16,7 +20,7 @@ import { once } from 'node:events'
 import { createServer } from 'node:http'
 import { setTimeout as delay } from 'node:timers/promises'
 import { KernelManager } from './dist/src/kernel/manager.js'
-import { access, mkdir, writeFile } from 'node:fs/promises'
+import { access, mkdir, readFile, writeFile } from 'node:fs/promises'
 import { packageResources } from './dist/src/app/resources.js'
 import { sandboxCommand } from './dist/src/kernel/isolation.js'
 
@@ -26,6 +30,13 @@ await mkdir('/data/homes/own', { recursive: true })
 await mkdir('/data/homes/sibling', { recursive: true })
 await writeFile('/data/homes/sibling/secret', 'private')
 await writeFile('/tmp/host-secret', 'private')
+if (${apparmor}) {
+  assert.equal((await readFile('/proc/self/attr/current', 'utf8')).trim(), 'lingxios-worker (enforce)')
+  const forbidden = spawnSync('unshare', ['--user', '--map-root-user', '--mount', '--', 'mount', '-t', 'tmpfs', 'tmpfs', '/data/homes/own'], { encoding: 'utf8', timeout: 5000 })
+  assert.ifError(forbidden.error)
+  assert.notEqual(forbidden.status, 0, 'AppArmor must deny mounts outside Bubblewrap setup paths')
+  assert.match(forbidden.stderr, /^mount:.*(?:permission denied|operation not permitted)/im, 'namespace setup must succeed before the mount is rejected')
+}
 const sandbox = sandboxCommand('/data/homes/own', '/app/kernel/runner.py', 'python3',
   { memoryBytes: 512*1024*1024, cpuSeconds: 30, maxProcesses: 512, tmpBytes: 1024*1024 }, false, ['-I', '-c',
   'import os,socket,resource; assert not os.path.exists("/data/homes/sibling"); assert not os.path.exists("/tmp/host-secret"); assert not os.path.exists("/app"); assert resource.getrlimit(resource.RLIMIT_AS)[1]==512*1024*1024; s=socket.socket(); s.settimeout(1); assert s.connect_ex(("192.0.2.1",80))!=0; print("isolated")'])

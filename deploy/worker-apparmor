@@ -1,0 +1,39 @@
+abi <abi/3.0>,
+#include <tunables/global>
+
+profile lingxios-worker flags=(attach_disconnected,mediate_deleted) {
+  #include <abstractions/base>
+  network,
+  deny network alg,
+  deny network vsock,
+  capability,
+  file,
+
+  signal (receive) peer=unconfined,
+  signal (receive) peer=runc,
+  signal (receive) peer=crun,
+  signal (receive) peer=/usr/bin/dockerd,
+  signal (send,receive) peer=lingxios-worker,
+  ptrace (trace,tracedby,read,readby) peer=lingxios-worker,
+
+  # Bubblewrap 0.8 constructs its root under /tmp, then pivots twice.
+  # The container still has no capabilities in the parent user namespace.
+  mount options=(rw,rslave) -> /,
+  mount fstype=tmpfs -> /tmp/,
+  mount options=(rw,rbind) /tmp/newroot/ -> /tmp/newroot/,
+  pivot_root oldroot=/tmp/oldroot/ /tmp/,
+  mount fstype=(tmpfs,proc,devpts) -> /newroot/**,
+  mount options=(rw,rbind) -> /newroot/**,
+  mount options=(rw,bind) -> /newroot/**,
+  remount options=(bind,nosuid) options in (ro,nodev,noexec,relatime,noatime,nodiratime,strictatime) /newroot/**,
+  mount options=(rw,rprivate) -> /oldroot/,
+  umount /oldroot/,
+  pivot_root oldroot=/newroot/ /newroot/,
+  umount /,
+
+  deny /proc/* w,
+  deny /proc/{acpi,asound,bus,driver,fs,irq,scsi,sys,tty}/** wklx,
+  deny /proc/{mem,kmem,kcore,sysrq-trigger} rwklx,
+  deny /sys/** wklx,
+  deny /sys/{firmware,kernel/security,devices/virtual/powercap}/** r,
+}
