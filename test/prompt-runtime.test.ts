@@ -48,6 +48,10 @@ it('keeps dynamic grants and preferences outside the stable prefix and invalidat
   assert.match(revoked.systemInstructions, /"grants":\[\]/)
   assert.doesNotMatch(revoked.systemInstructions, /PRIVATE_PREFERENCE|CHANGED/)
   assert.equal(revoked.epoch, 1)
+  assert.match(first.systemInstructions, /"codeExecution":"enabled"/)
+  const disabled = buildPromptContext({ ...context, work: { ...context.work, meta: { codeExecution: 'disabled' } } }, policy, 0, 'v1')
+  assert.match(disabled.systemInstructions, /"codeExecution":"disabled"/)
+  assert.notEqual(first.fingerprint, disabled.fingerprint)
   const changed = buildPromptContext({ ...context, productRules: 'Changed trusted rules.' }, policy, 0, 'v1')
   assert.notEqual(first.manifest!.prefix.sha256, changed.manifest!.prefix.sha256)
   assert.notEqual(first.fingerprint, changed.fingerprint)
@@ -78,7 +82,7 @@ it('binds prompt identity to tool definitions and source versions without contam
   ]
   for (const variant of variants) {
     const compiled = buildPromptContext(variant, policy, 0)
-    assert.equal(compiled.systemInstructions, base.systemInstructions)
+    assert.deepEqual(compiled.manifest!.prefix, base.manifest!.prefix)
     assert.notEqual(compiled.fingerprint, base.fingerprint)
   }
   const a = buildPromptContext({ ...context, tools: [tool] }, policy, 0)

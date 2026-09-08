@@ -171,6 +171,7 @@ export interface EventStore {
 // ---------------------------------------------------------------------------
 
 export interface ActionIntent {
+  toolContractHash?: string
   workId: string
   tenantId: string
   principalId: string | null
@@ -192,6 +193,8 @@ export interface ActionResolution {
 export interface ActionLedgerStore {
   artifacts(workId: string): Promise<import('../protocol/types.js').KernelArtifact[]>
   hasWait(workId: string, requestVersion: number, wait: { approvalId: string } | { question: string }): Promise<boolean>
+  /** Authoritative successful receipt existence for a trusted set of side-effect action names. */
+  hasSuccessfulAction(workId: string, requestVersion: number, actions: readonly string[]): Promise<boolean>
   /** At most 65 unresolved business actions; callers report truncation above 64. */
   unsettled(workId: string): Promise<Array<{ actionKey: string; action: string; state: 'unknown' | 'awaiting_approval' }>>
   /** Persist intent before execution; mismatched reuse must throw. */

@@ -34,7 +34,7 @@ export const memorySynthesisProcessor: WorkProcessor = {
       signal.throwIfAborted()
       const started = Date.now()
       await context.emit({ kind: 'model.started', stage: 'started', visibility: 'internal', data: { purpose } })
-      const result = await context.model.structured({ instructions, prompt: prompt.manifest, input, signal })
+      const result = await context.model.structured({ purpose: 'memory-synthesis', instructions, prompt: prompt.manifest, input, signal })
       signal.throwIfAborted()
       await context.emit({ kind: 'model.completed', stage: 'completed', visibility: 'internal',
         data: { purpose, model: result.model, usage: result.usage, latencyMs: Date.now() - started } })

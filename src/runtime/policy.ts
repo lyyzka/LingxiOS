@@ -8,7 +8,7 @@
  * into the loop; the split is the central lesson of that codebase.
  */
 import type {
-  CapabilityGrant, ModelItem, PromptContext, TurnContext,
+  CapabilityGrant, CodeExecutionMode, ModelItem, PromptContext, TurnContext,
 } from '../protocol/types.js'
 import type { GoalAssessment } from '../outcome/assessment.js'
 
@@ -19,6 +19,9 @@ export interface RuntimePolicy {
    * grant is advisory, the control-plane check is authoritative.
    */
   kernelCapabilities(context: TurnContext): CapabilityGrant[]
+
+  /** Trusted switch for the built-in Python execution surface. */
+  codeExecutionMode?(context: TurnContext): CodeExecutionMode
 
   /**
    * Contribute trusted product and execution-role rules. Core rules are compiled separately.
@@ -57,6 +60,12 @@ export interface RuntimePolicy {
 export class DefaultRuntimePolicy implements RuntimePolicy {
   kernelCapabilities(context: TurnContext): CapabilityGrant[] {
     return context.grants ?? context.capabilities.map((name) => ({ name }))
+  }
+
+  codeExecutionMode(context: TurnContext): CodeExecutionMode {
+    const configured = context.work.meta?.['codeExecution']
+    // Unknown persisted policy values fail closed instead of silently enabling code.
+    return configured === undefined || configured === 'enabled' ? 'enabled' : 'disabled'
   }
 
   productRules(_candidate: PromptContext, context?: TurnContext): string {

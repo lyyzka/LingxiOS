@@ -1,5 +1,7 @@
 import type { SqlQueryable } from '../control-plane/pg-store.js'
 import { createHash } from 'node:crypto'
+import { memoryWriteBody, type MemoryWritePolicy } from './policy.js'
+import { currentMemoryScopes, forgetMemoryScope, lockMemoryScopes } from './forget.js'
 
 export type MemoryScopeType = string
 export interface MemoryScope { tenantId: string; scopeType: MemoryScopeType; scopeId: string }
@@ -42,7 +44,7 @@ export async function recallMemories(database: SqlQueryable, scope: MemoryScope,
   return rows
 }
 
-function validateScope(scope: MemoryScope) {
+export function validateScope(scope: MemoryScope) {
   if (![scope.tenantId,scope.scopeType,scope.scopeId].every(value => typeof value === 'string' && value.trim() && value.length <= 1000)) throw new Error('invalid memory scope')
 }
 
@@ -60,11 +62,13 @@ export type MemoryMutation = { method: 'note'; body: string; kind?: string; vali
 
 /** Use the action's database transaction so its receipt and this mutation commit together. */
 export async function writeMemory(database: SqlQueryable, scope: MemoryScope, mutation: MemoryMutation,
-  provenance: { actionId: string; workId: string; request: import('../context/request.js').RequestSnapshot }) {
+  provenance: { actionId: string; workId: string; request: import('../context/request.js').RequestSnapshot }, policy?: MemoryWritePolicy) {
   validateScope(scope)
   const { request } = provenance
   if (request.workId !== provenance.workId || request.tenantId !== scope.tenantId || !provenance.actionId || !request.authorId) throw new Error('memory write requires request provenance')
   if (!['note','verify','pin','delete'].includes(mutation.method)) throw new Error('invalid memory mutation')
+  const epochs = await lockMemoryScopes(database, [scope])
+  if (mutation.method !== 'delete' && !(await currentMemoryScopes(database, epochs, provenance.workId)).length) throw new Error('memory source predates forgetting')
   const validUntil = 'validUntil' in mutation ? mutation.validUntil : undefined
   if (validUntil !== undefined && (!/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d{1,3})?(?:Z|[+-]\d\d:\d\d)$/.test(validUntil)
     || !Number.isFinite(Date.parse(validUntil)) || Date.parse(validUntil) <= Date.now())) throw new Error('memory expiry must be a future ISO timestamp')
@@ -74,11 +78,13 @@ export async function writeMemory(database: SqlQueryable, scope: MemoryScope, mu
       inheritedRevisions: request.inheritedRevisions, revisions: request.revisions, attachments: request.attachments })).digest('hex') }])
   if (mutation.method === 'note') {
     if (!mutation.body.trim() || mutation.body.length > 2000 || !/^[a-z_]{1,32}$/.test(mutation.kind ?? 'observation')) throw new Error('invalid memory body or kind')
+    const body = await memoryWriteBody({ scope, principalId: request.authorId, sourceWorkId: provenance.workId,
+      origin: 'explicit', kind: mutation.kind ?? 'observation', body: mutation.body }, policy)
     const id = `mem-${createHash('sha256').update(provenance.actionId).digest('hex')}`
     const saved = await database.query(`INSERT INTO lingxios.agent_memories
       (tenant_id,id,scope_type,scope_id,body,kind,origin,source_refs,valid_until)
       VALUES($1,$2,$3,$4,$5,$6,'explicit',$7::jsonb,$8::timestamptz) RETURNING id,body,kind,origin,pinned,version,source_refs,valid_until,status`,
-    [scope.tenantId,id,scope.scopeType,scope.scopeId,mutation.body.trim(),mutation.kind ?? 'observation',source,validUntil ?? null])
+    [scope.tenantId,id,scope.scopeType,scope.scopeId,body,mutation.kind ?? 'observation',source,validUntil ?? null])
     return saved.rows[0]!
   }
   if (!mutation.id || !Number.isSafeInteger(mutation.expectedVersion) || mutation.expectedVersion < 1) throw new Error('memory changes require an identity and version')
@@ -87,6 +93,7 @@ export async function writeMemory(database: SqlQueryable, scope: MemoryScope, mu
     const deleted = await database.query(`DELETE FROM lingxios.agent_memories
       WHERE tenant_id=$1 AND id=$2 AND scope_type=$3 AND scope_id=$4 AND version=$5 AND origin<>'evolved' RETURNING id`, identity)
     if (!deleted.rows.length) throw new Error('memory is unavailable or stale')
+    await forgetMemoryScope(database, scope, false)
     return { id: mutation.id, deleted: true }
   }
   if (mutation.method === 'pin' && typeof mutation.pinned !== 'boolean') throw new Error('invalid memory pin')

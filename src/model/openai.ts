@@ -15,6 +15,8 @@ import { createHash } from 'node:crypto'
 import { COMPACTION_INSTRUCTIONS, observationItems } from '../context/compiler.js'
 import type { ModelItem } from '../protocol/types.js'
 import { ModelDriverError } from '../errors.js'
+import type { ModelProfile } from './profile.js'
+import { describeTool } from '../tools/catalog.js'
 import type {
   CompactionRequest, CompactionResult,
   ModelDriver, ModelTurnRequest, ModelTurnResult, ModelUsage,
@@ -22,9 +24,11 @@ import type {
 } from './driver.js'
 
 export const DEFAULT_MODEL = { id: 'deepseek-ai/DeepSeek-V4-Flash', baseUrl: 'https://api.siliconflow.cn/v1', reasoningEffort: 'high' } as const
-export const DEFAULT_SMALL_MODEL = { id: 'Qwen/Qwen3.5-4B', maxOutputTokens: 2048, maxThinkingTokens: 0 } as const
 
 export interface OpenAIDriverOptions {
+  capabilities?: Partial<Pick<ModelProfile, 'toolCalls' | 'jsonObject' | 'parallelTools'>>
+  /** Calibrated tokenizer for this exact model configuration. */
+  countTokens?: (text: string) => number
   maxThinkingTokens?: number
   apiKey: string
   baseUrl?: string
@@ -85,12 +89,19 @@ function toWireMessages(instructions: string, items: readonly ModelItem[]): Wire
   return messages
 }
 
+interface ProviderUsage {
+  prompt_tokens?: number
+  completion_tokens?: number
+  prompt_tokens_details?: { cached_tokens?: number }
+  completion_tokens_details?: { reasoning_tokens?: number }
+}
+
 interface StreamAccumulator {
   text: string
   toolCalls: Map<number, { id: string; name: string; arguments: string }>
   finishReasons: string[]
   model?: string
-  usage?: { prompt_tokens?: number; completion_tokens?: number }
+  usage?: ProviderUsage
 }
 
 function defaultSleep(ms: number, signal?: AbortSignal): Promise<void> {
@@ -151,6 +162,8 @@ export async function* sseDataEvents(body: ReadableStream<Uint8Array>): AsyncGen
 }
 
 export class OpenAIChatDriver implements ModelDriver {
+  readonly profile: ModelProfile
+  countTokens(text: string): number { return this.options.countTokens?.(text) ?? Buffer.byteLength(text) }
   readonly maxThinkingTokens: number
   singleAttempt(): ModelDriver { return new OpenAIChatDriver(this.modelId, { ...this.options, maxAttempts: 1 }) }
   readonly configurationFingerprint: string
@@ -178,10 +191,16 @@ export class OpenAIChatDriver implements ModelDriver {
     if (this.maxThinkingTokens !== 0 && (!Number.isSafeInteger(this.maxThinkingTokens) || this.maxThinkingTokens < 128 || this.maxThinkingTokens > 32768)) throw new Error('maxThinkingTokens must be 0 or 128..32768')
     if (!Number.isSafeInteger(this.maxOutputTokens) || this.maxOutputTokens < 1) throw new Error('maxOutputTokens must be a positive integer')
     if (!Number.isSafeInteger(this.contextWindowTokens) || this.contextWindowTokens <= this.maxOutputTokens) throw new Error('contextWindowTokens must be an integer greater than maxOutputTokens')
+    this.profile = Object.freeze({ id: modelId, contextWindowTokens: this.contextWindowTokens, maxOutputTokens: this.maxOutputTokens,
+      maxThinkingTokens: this.maxThinkingTokens, toolCalls: true, jsonObject: true, parallelTools: true, ...options.capabilities })
+    for (const key of ['toolCalls', 'jsonObject', 'parallelTools'] as const) {
+      if (typeof this.profile[key] !== 'boolean') throw new Error(`invalid model capability ${key}`)
+    }
     this.configurationFingerprint = createHash('sha256').update(JSON.stringify({
       wire: 'openai-chat-completions-v1', model: modelId, baseUrl: this.baseUrl,
       reasoningEffort: options.reasoningEffort ?? null, maxOutputTokens: this.maxOutputTokens,
       contextWindowTokens: this.contextWindowTokens, maxThinkingTokens: this.maxThinkingTokens, tool: 'ipython-v1',
+      capabilities: this.profile,
     })).digest('hex')
   }
 
@@ -245,7 +264,7 @@ export class OpenAIChatDriver implements ModelDriver {
       if (data === '[DONE]') break
       let chunk: {
         model?: string
-        usage?: { prompt_tokens?: number; completion_tokens?: number } | null
+        usage?: ProviderUsage | null
         choices?: Array<{
           finish_reason?: string | null
           delta?: {
@@ -289,16 +308,25 @@ export class OpenAIChatDriver implements ModelDriver {
     if (!usage || (usage.prompt_tokens === undefined && usage.completion_tokens === undefined)) {
       return { available: false, inputTokens: 0, outputTokens: 0 }
     }
-    return { available: true, inputTokens: usage.prompt_tokens ?? 0, outputTokens: usage.completion_tokens ?? 0 }
+    const input = usage.prompt_tokens, output = usage.completion_tokens
+    if (![input, output].every(value => Number.isSafeInteger(value) && value! >= 0)) return { available: false, inputTokens: 0, outputTokens: 0 }
+    const cached = usage.prompt_tokens_details?.cached_tokens, reasoning = usage.completion_tokens_details?.reasoning_tokens
+    return { available: true, inputTokens: input!, outputTokens: output!,
+      ...(Number.isSafeInteger(cached) && cached! >= 0 && cached! <= input! ? { cachedInputTokens: cached! } : {}),
+      ...(Number.isSafeInteger(reasoning) && reasoning! >= 0 && reasoning! <= output! ? { reasoningTokens: reasoning! } : {}) }
   }
 
   async run(request: ModelTurnRequest): Promise<ModelTurnResult> {
+    const allowPython = request.codeExecution === 'enabled' || request.codeExecution === undefined && request.tools === undefined
+    const tools = [
+      ...(allowPython ? [IPYTHON_TOOL] : []),
+      ...(request.tools ?? []).map(tool => ({ type: 'function' as const, function: { name: tool.name, description: describeTool(tool), parameters: tool.parameters } })),
+    ]
+    if (tools.length && !this.profile.toolCalls) throw new Error('selected model does not support tool calls')
     const response = await this.request({
       model: this.modelId,
       messages: toWireMessages(request.instructions, request.items),
-      tools: [IPYTHON_TOOL, ...(request.tools ?? []).map(tool => ({ type: 'function', function: { name: tool.name, description: tool.description, parameters: tool.parameters } }))],
-      tool_choice: 'auto',
-      parallel_tool_calls: true,
+      ...(tools.length ? { tools, tool_choice: 'auto', ...(this.profile.parallelTools ? { parallel_tool_calls: true } : {}) } : {}),
       stream: true,
       stream_options: { include_usage: true },
     }, request.signal)
@@ -307,10 +335,15 @@ export class OpenAIChatDriver implements ModelDriver {
       throw new ModelDriverError('model stream did not finish normally', { kind: 'provider', finishReasons: accumulator.finishReasons })
     }
     const output: ModelItem[] = []
+    if (!this.profile.parallelTools && accumulator.toolCalls.size > 1) throw new ModelDriverError('selected model returned unsupported parallel tools', { kind: 'protocol', finishReasons: accumulator.finishReasons })
     const text = accumulator.text
     if (text.trim()) output.push({ role: 'assistant', content: text })
     for (const [, call] of [...accumulator.toolCalls.entries()].sort(([a], [b]) => a - b)) {
-      if (!call.id.trim() || call.name !== IPYTHON_TOOL_NAME && !request.tools?.some(tool => tool.name === call.name)) throw new ModelDriverError('model returned an invalid tool identity', { kind: 'protocol', finishReasons: accumulator.finishReasons })
+      if (!call.id.trim()
+        || call.name === IPYTHON_TOOL_NAME && !allowPython
+        || call.name !== IPYTHON_TOOL_NAME && !request.tools?.some(tool => tool.name === call.name)) {
+        throw new ModelDriverError('model returned an invalid tool identity', { kind: 'protocol', finishReasons: accumulator.finishReasons })
+      }
       output.push({
         type: 'function_call',
         callId: call.id,
@@ -330,6 +363,7 @@ export class OpenAIChatDriver implements ModelDriver {
   }
 
   async structured(request: StructuredCallRequest): Promise<StructuredCallResult> {
+    if (!this.profile.jsonObject) throw new Error('selected model does not support JSON object output')
     const response = await this.request({
       model: this.modelId,
       messages: [
@@ -341,7 +375,7 @@ export class OpenAIChatDriver implements ModelDriver {
     }, request.signal)
     const payload = await responseJson(response) as {
       model?: string
-      usage?: { prompt_tokens?: number; completion_tokens?: number }
+      usage?: ProviderUsage
       choices?: Array<{ finish_reason?: string | null; message?: { content?: string | null } }>
     }
     if (payload.choices?.[0]?.finish_reason !== 'stop') throw new ModelDriverError('model response did not finish normally', { finishReasons: [payload.choices?.[0]?.finish_reason ?? 'missing'] })
@@ -359,6 +393,7 @@ export class OpenAIChatDriver implements ModelDriver {
   }
 
   async compact(request: CompactionRequest): Promise<CompactionResult> {
+    if (!this.profile.jsonObject) throw new Error('selected model does not support JSON object output')
     const response = await this.request({
       model: this.modelId,
       messages: [
@@ -373,7 +408,7 @@ export class OpenAIChatDriver implements ModelDriver {
     }, request.signal)
     const payload = await responseJson(response) as {
       model?: string
-      usage?: { prompt_tokens?: number; completion_tokens?: number }
+      usage?: ProviderUsage
       choices?: Array<{ finish_reason?: string | null; message?: { content?: string | null } }>
     }
     if (payload.choices?.[0]?.finish_reason !== 'stop') throw new ModelDriverError('model response did not finish normally', { finishReasons: [payload.choices?.[0]?.finish_reason ?? 'missing'] })

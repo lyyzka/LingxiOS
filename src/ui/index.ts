@@ -7,6 +7,7 @@ import type { RunState, DeliveryState } from '../app/jobs.js'
 export type { RunState, RunSnapshot, DeliveryState } from '../app/jobs.js'
 export type { AssistantMessage, RunEvent } from '../protocol/types.js'
 export type { ResponseEnvelope } from '../outcome/envelope.js'
+export type { TrustedPresentation } from '../presentation/definition.js'
 
 export interface RunView {
   runId: string
@@ -89,6 +90,7 @@ export function consumeRunState(view: RunView, state: RunState): RunView {
 export type { GoalOutcome } from '../protocol/outcome.js'
 
 export type ResponseSegment = { type: 'text'; text: string } | { type: 'citation'; text: string; annotation: CitationAnnotation }
+  | { type: 'presentation'; component: import('../presentation/definition.js').TrustedPresentation }
 
 /** Text values are display data; callers must not insert them as raw HTML. */
 export function responseSegments(envelope: ResponseEnvelope): ResponseSegment[] {
@@ -104,5 +106,6 @@ export function responseSegments(envelope: ResponseEnvelope): ResponseSegment[] 
     offset = annotation.end
   }
   if (offset < envelope.body.length) segments.push({ type: 'text', text: envelope.body.slice(offset) })
+  for (const component of envelope.presentations ?? []) segments.push({ type: 'presentation', component: structuredClone(component) })
   return segments
 }

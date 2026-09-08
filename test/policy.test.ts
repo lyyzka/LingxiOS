@@ -40,6 +40,15 @@ describe('DefaultRuntimePolicy.kernelCapabilities', () => {
   })
 })
 
+describe('DefaultRuntimePolicy.codeExecutionMode', () => {
+  it('defaults to enabled but fails closed on disabled or malformed trusted metadata', () => {
+    const policy = new DefaultRuntimePolicy()
+    assert.equal(policy.codeExecutionMode(context()), 'enabled')
+    assert.equal(policy.codeExecutionMode(context({ work: work({ meta: { codeExecution: 'disabled' } }) })), 'disabled')
+    assert.equal(policy.codeExecutionMode(context({ work: work({ meta: { codeExecution: 'unexpected' } }) })), 'disabled')
+  })
+})
+
 describe('DefaultRuntimePolicy.productRules', () => {
   it('contributes only trusted product configuration', () => {
     const policy = new DefaultRuntimePolicy()

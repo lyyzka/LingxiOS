@@ -2,12 +2,15 @@
  * Model driver port. The runtime speaks only this interface; concrete
  * providers (OpenAI-compatible, Anthropic, test fakes) live behind it.
  */
-import type { ModelItem } from '../protocol/types.js'
+import type { CodeExecutionMode, ModelItem } from '../protocol/types.js'
+import type { ModelProfile, ModelPurpose } from './profile.js'
 
 export interface ModelUsage {
   available: boolean
   inputTokens: number
   outputTokens: number
+  cachedInputTokens?: number
+  reasoningTokens?: number
 }
 
 export interface ModelTurnResult {
@@ -24,7 +27,10 @@ export interface ModelTurnResult {
 }
 
 export interface ModelTurnRequest {
+  purpose?: Extract<ModelPurpose, 'execute' | 'approval-explanation'>
   tools?: readonly import('../tools/catalog.js').ToolDefinition[]
+  /** Whether the built-in Python tool is structurally available for this turn. */
+  codeExecution?: CodeExecutionMode
   instructions: string
   /** Local diagnostics, never sent as provider request fields. */
   prompt?: import('../context/compiler.js').PromptManifest
@@ -35,6 +41,7 @@ export interface ModelTurnRequest {
 }
 
 export interface StructuredCallRequest {
+  purpose?: Extract<ModelPurpose, 'content-review' | 'memory-synthesis' | 'approval-explanation'>
   instructions: string
   /** Local diagnostics, never sent as provider request fields. */
   prompt?: import('../context/compiler.js').PromptManifest
@@ -63,6 +70,9 @@ export interface CompactionResult {
 }
 
 export interface ModelDriver {
+  readonly profile?: ModelProfile
+  /** A provider tokenizer or calibrated upper bound; never a fixed bytes/constant guess. */
+  countTokens?(text: string): number
   readonly maxThinkingTokens?: number
   /** Runtime owns retries so each outbound request reserves and settles its own budget. */
   singleAttempt?(): ModelDriver

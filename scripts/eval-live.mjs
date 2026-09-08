@@ -78,7 +78,7 @@ for (let repeat = 1; repeat <= Number(args[3]); repeat++) {
       if (!pool || !databaseInitialized) await db.exec(await readFile(packageResources().schema, 'utf8'))
       databaseInitialized = true
       app = await createLingxiOS({ database, homesRoot: join(directory, 'homes') })
-      worker = createWorker({ controlPlane: app, model, smallModel: model, kernel: { homesRoot: join(directory, 'homes'), allowNetwork: false } })
+      worker = createWorker({ controlPlane: app, model, kernel: { homesRoot: join(directory, 'homes'), allowNetwork: false } })
       timeout = setTimeout(() => {
         timedOut = true
         cancellation = app.cancel(identity).catch(() => { report.failures.push('Timeout cancellation failed') })

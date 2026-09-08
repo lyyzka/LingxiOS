@@ -6,6 +6,7 @@ import type { HostPort } from '../host/port.js'
 import type { RunEvent, WorkItem } from '../protocol/types.js'
 import type { ModelDriver, ModelUsage } from './driver.js'
 import { abortable } from '../deadline.js'
+import { fitsModel, inputTokens, modelProfile } from './profile.js'
 
 export interface ModelPricing {
   version: string
@@ -54,7 +55,7 @@ export const DEFAULT_MODEL_BUDGET: Required<RootModelBudgetOptions> = {
 
 /** One provider attempt boundary shared by generation, reviews, compaction and embeddings. */
 export function modelExecution(host: Pick<HostPort, 'reserveModelCall' | 'recordModelUsage'>,
-  model: Pick<ModelDriver, 'modelId' | 'maxOutputTokens' | 'maxThinkingTokens' | 'toolDefinitionTokens'>, work: WorkItem,
+  model: Pick<ModelDriver, 'modelId' | 'maxOutputTokens' | 'maxThinkingTokens' | 'toolDefinitionTokens' | 'countTokens'>, work: WorkItem,
   limits: Required<RootModelBudgetOptions>,
   emit?: (event: Omit<RunEvent, 'runId' | 'seq'>) => Promise<unknown>, namespace = 'model') {
   let sequence = 0, calls = 0, tokens = 0, cost = 0
@@ -65,7 +66,7 @@ export function modelExecution(host: Pick<HostPort, 'reserveModelCall' | 'record
     if (request.prompt && request.prompt.instructionsSha256 !== instructionsSha256) throw new Error('prompt manifest does not match model instructions')
     const logicalCallId = `${work.id}:${work.fence}:${namespace}:${++sequence}`
     const { prompt: _prompt, ...providerRequest } = request
-    const input = Buffer.byteLength(JSON.stringify(providerRequest)) + (callModel.toolDefinitionTokens ?? 0)
+    const input = inputTokens(callModel, providerRequest) + (callModel.toolDefinitionTokens ?? 0)
     const output = (callModel.maxOutputTokens ?? 8192) + (callModel.maxThinkingTokens ?? 0)
     const reservedCost = Math.ceil((input * limits.inputCostMicrosPerMillion + output * limits.outputCostMicrosPerMillion) / 1_000_000)
     for (let attempt = 1; ; attempt++) {
@@ -124,27 +125,37 @@ export function modelExecution(host: Pick<HostPort, 'reserveModelCall' | 'record
 
 export function executionModel(host: Pick<HostPort, 'reserveModelCall' | 'recordModelUsage'>, source: ModelDriver, work: WorkItem,
   limits: Required<RootModelBudgetOptions>,
-  emit?: (event: Omit<RunEvent, 'runId' | 'seq'>) => Promise<unknown>, smallSource: ModelDriver = source): ModelDriver {
-  const primary = source.singleAttempt?.() ?? source
-  const small = smallSource === source ? primary : smallSource.singleAttempt?.() ?? smallSource
-  const model = work.kind === 'memory_synthesis' || work.lane === 'approval' ? small : primary
-  const reviewer = work.kind === 'memory_synthesis' ? small : primary
+  emit?: (event: Omit<RunEvent, 'runId' | 'seq'>) => Promise<unknown>): ModelDriver {
+  const model = source.singleAttempt?.() ?? source
   const { invoke, nextCallId } = modelExecution(host, model, work, limits, emit)
-  const drivers = [model, reviewer, small]
+  const check = (request: unknown) => {
+    if (!fitsModel(model, request)) throw new Error('model call exceeds its context budget; original input was not truncated')
+  }
   return {
     nextCallId,
     ...(model.modelId === undefined ? {} : { modelId: model.modelId }),
-    ...(model.configurationFingerprint === undefined ? {} : { configurationFingerprint: small === primary ? model.configurationFingerprint
-      : createHash('sha256').update(JSON.stringify(drivers.map(driver => [driver.modelId, driver.configurationFingerprint]))).digest('hex') }),
-    ...(drivers.every(driver => driver.contextWindowTokens === undefined) ? {} : { contextWindowTokens: Math.min(...drivers.map(driver => driver.contextWindowTokens ?? 128_000)) }),
-    ...(drivers.every(driver => driver.maxOutputTokens === undefined) ? {} : { maxOutputTokens: Math.max(...drivers.map(driver => driver.maxOutputTokens ?? 8192)) }),
-    ...(drivers.every(driver => driver.maxThinkingTokens === undefined) ? {} : { maxThinkingTokens: Math.max(...drivers.map(driver => driver.maxThinkingTokens ?? 0)) }),
+    ...(model.configurationFingerprint === undefined ? {} : { configurationFingerprint: model.configurationFingerprint }),
+    profile: modelProfile(model),
+    ...(model.countTokens ? { countTokens: model.countTokens.bind(model) } : {}),
+    ...(model.contextWindowTokens === undefined ? {} : { contextWindowTokens: model.contextWindowTokens }),
+    ...(model.maxOutputTokens === undefined ? {} : { maxOutputTokens: model.maxOutputTokens }),
+    ...(model.maxThinkingTokens === undefined ? {} : { maxThinkingTokens: model.maxThinkingTokens }),
     ...(model.toolDefinitionTokens === undefined ? {} : { toolDefinitionTokens: model.toolDefinitionTokens }),
-    run: request => invoke('agent-turn', request, signal => model.run({ ...request, signal })),
-    structured: request => invoke('structured', request, signal => reviewer.structured({ ...request, signal }), reviewer),
+    run: request => {
+      if (request.purpose === 'approval-explanation' && (request.tools?.length || request.codeExecution !== 'disabled')) {
+        throw new Error('approval explanations cannot execute tools')
+      }
+      check(request)
+      return invoke('agent-turn', request, signal => model.run({ ...request, signal }))
+    },
+    structured: request => {
+      check(request)
+      return invoke('structured', request, signal => model.structured({ ...request, signal }))
+    },
     compact: request => {
       const compiled = { ...request, instructions: COMPACTION_PROMPT.instructions, prompt: COMPACTION_PROMPT.manifest }
-      return invoke('compaction', compiled, signal => small.compact({ ...compiled, signal }), small)
+      check(compiled)
+      return invoke('compaction', compiled, signal => model.compact({ ...compiled, signal }))
     },
   }
 }

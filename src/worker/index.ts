@@ -17,7 +17,7 @@ export async function startWorker(env: NodeJS.ProcessEnv = process.env,
   const config = loadWorkerConfig(env)
   const worker = createWorker({ ...options,
     controlPlane: { url: config.controlPlaneUrl, serviceToken: config.serviceToken },
-    model: config.model, smallModel: config.smallModel, modelBudget: loadModelBudget(env),
+    model: config.model, modelBudget: loadModelBudget(env),
     recordModelPayloads: boolEnv('AGENT_OS_RECORD_MODEL_PAYLOADS', false, env),
     kernelFactory: options.kernelFactory ?? (bridge => new KernelManager(bridge, {
       maxKernels: config.maxConcurrentRuns,

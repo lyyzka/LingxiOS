@@ -1,4 +1,4 @@
--- LingxiOS Agent OS — control-plane schema (protocol v5)
+-- LingxiOS Agent OS — control-plane schema (protocol v6)
 --
 -- Apply with: psql -f db/schema.sql
 -- All tables are owned by the control plane; workers never touch the database.
@@ -244,6 +244,7 @@ CREATE TABLE lingxios.agent_action_ledger (
 );
 
 CREATE TABLE lingxios.agent_approvals (
+  tool_contract_hash TEXT CHECK (tool_contract_hash ~ '^[a-f0-9]{64}$'),
   id TEXT PRIMARY KEY,
   action_key TEXT NOT NULL UNIQUE REFERENCES lingxios.agent_action_intents(idempotency_key),
   preview JSONB NOT NULL,
@@ -329,6 +330,15 @@ CREATE UNIQUE INDEX agent_action_resolutions_seq_idx
 CREATE INDEX agent_action_resolutions_action_idx
   ON lingxios.agent_action_resolutions(idempotency_key, resolution_seq DESC);
 
+CREATE TABLE lingxios.agent_memory_scopes (
+  tenant_id TEXT NOT NULL,
+  scope_type TEXT NOT NULL,
+  scope_id TEXT NOT NULL,
+  epoch BIGINT NOT NULL DEFAULT 0 CHECK (epoch >= 0),
+  forgotten_at TIMESTAMPTZ,
+  PRIMARY KEY (tenant_id,scope_type,scope_id)
+);
+
 CREATE TABLE lingxios.agent_memories (
   tenant_id TEXT NOT NULL,
   id TEXT NOT NULL,
@@ -413,6 +423,7 @@ CREATE TRIGGER agent_memory_version_history
   EXECUTE FUNCTION lingxios.archive_memory_version();
 
 CREATE TABLE lingxios.agent_memory_evidence (
+  scope_epochs JSONB NOT NULL DEFAULT '[]' CHECK (jsonb_typeof(scope_epochs)='array'),
   scopes JSONB NOT NULL CHECK (jsonb_typeof(scopes)='array' AND jsonb_array_length(scopes) BETWEEN 1 AND 12),
   source_run_id TEXT PRIMARY KEY REFERENCES lingxios.agent_work_items(id),
   tenant_id TEXT NOT NULL,
@@ -456,5 +467,5 @@ CREATE TRIGGER agent_work_memory_evidence
     OR OLD.status IS DISTINCT FROM NEW.status OR OLD.steer_inputs IS DISTINCT FROM NEW.steer_inputs)
   EXECUTE FUNCTION lingxios.supersede_memory_evidence();
 
-INSERT INTO lingxios.schema_version(singleton, version) VALUES(TRUE, 7);
+INSERT INTO lingxios.schema_version(singleton, version) VALUES(TRUE, 8);
 COMMIT;

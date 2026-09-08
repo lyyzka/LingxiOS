@@ -16,10 +16,12 @@ import { once } from 'node:events'
 import { createServer } from 'node:http'
 import { setTimeout as delay } from 'node:timers/promises'
 import { KernelManager } from './dist/src/kernel/manager.js'
-import { mkdir, writeFile } from 'node:fs/promises'
+import { access, mkdir, writeFile } from 'node:fs/promises'
+import { packageResources } from './dist/src/app/resources.js'
 import { sandboxCommand } from './dist/src/kernel/isolation.js'
 
 assert.notEqual(process.getuid(), 0)
+for (const path of Object.values(packageResources())) await access(path)
 await mkdir('/data/homes/own', { recursive: true })
 await mkdir('/data/homes/sibling', { recursive: true })
 await writeFile('/data/homes/sibling/secret', 'private')

@@ -2,6 +2,7 @@
  * Parsing and bounding of the single `ipython` tool call.
  */
 import { MAX_TOOL_OUTPUT_CHARS } from '../protocol/constants.js'
+import type { ObservationRef } from '../context/observations.js'
 
 /**
  * Parse the model-emitted tool arguments strictly: a JSON object with exactly
@@ -34,8 +35,18 @@ export function parseIPythonArguments(raw: string): { code: string } {
  * Serialize a tool output for the model, truncating oversized payloads into
  * an explicit `{truncated, preview}` shape rather than corrupting JSON.
  */
-export function boundedToolOutput(value: unknown, maxChars: number = MAX_TOOL_OUTPUT_CHARS): string {
+export function boundedToolOutput(value: unknown, maxChars: number = MAX_TOOL_OUTPUT_CHARS, observations: ObservationRef[] = []): string {
+  if (!Number.isSafeInteger(maxChars) || maxChars < 128) throw new Error('tool output budget must be at least 128 characters')
   const serialized = JSON.stringify(value) ?? 'null'
   if (serialized.length <= maxChars) return serialized
-  return JSON.stringify({ truncated: true, preview: serialized.slice(0, maxChars - 80) })
+  const references: ObservationRef[] = []
+  for (const ref of observations) {
+    if (JSON.stringify([...references, ref]).length > maxChars - 384) break
+    references.push(ref)
+  }
+  const metadata = { truncated: true, originalCharacters: serialized.length,
+    ...(references.length ? { observations: references, read: 'observations.read' } : {}),
+    ...(observations.length > references.length ? { omittedReferences: observations.length - references.length } : {}) }
+  // JSON escapes the preview again. Reserve its worst-case expansion and a possible split surrogate.
+  return JSON.stringify({ ...metadata, preview: serialized.slice(0, Math.max(0, Math.floor((maxChars - JSON.stringify(metadata).length - 80) / 2))) })
 }

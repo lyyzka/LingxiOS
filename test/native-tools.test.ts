@@ -5,6 +5,7 @@ import { readFile } from 'node:fs/promises'
 import { it } from 'node:test'
 import { PGlite } from '@electric-sql/pglite'
 import { snapshotEvidence } from '../src/context/evidence.js'
+import { toolContractHash } from '../src/tools/contracts.js'
 import { PgActionLedger, PgEventStore, PgSessionStore, PgWorkStore, type SqlPool } from '../src/control-plane/pg-store.js'
 import { ControlPlaneService, actionFingerprint } from '../src/control-plane/service.js'
 import { actionKeyOf, sessionKeyOf, type HostAction } from '../src/protocol/types.js'
@@ -80,7 +81,7 @@ it('validates before intent, rolls back effects with receipts, and recovers a lo
     assert.equal(executions, 2)
     const interrupted = action('intent-only', { title: 'Recovered' })
     await actions.reserve(interrupted.idempotencyKey, actionFingerprint(work, interrupted), {
-      workId: 'w', tenantId: 't', agentId: 'a', sessionId: 's', principalId: 'u', threadId: null, requestVersion: 1, action: interrupted,
+      workId: 'w', tenantId: 't', agentId: 'a', sessionId: 's', principalId: 'u', threadId: null, requestVersion: 1, action: interrupted, toolContractHash: toolContractHash(tool),
     })
     assert.equal((await service.executeAction(work, interrupted)).ok, true)
     assert.deepEqual((await db.query('SELECT title FROM native_documents ORDER BY title')).rows, [{ title: 'Corrected' }, { title: 'Recovered' }])
@@ -122,6 +123,13 @@ it('validates before intent, rolls back effects with receipts, and recovers a lo
     assert.deepEqual(await actions.unsettled('w'), [])
     assert.equal(executions, 4)
     denied = false
+    const changedAction = action('changed-contract', { title: 'Old semantics' })
+    const changed = await service.executeAction(resumed, changedAction)
+    await decideApproval(pool, { ...decision, approvalId: changed.approval!.id })
+    tool.semanticVersion = '2'
+    assert.equal((await service.executeAction(resumed, changedAction)).code, 'tool_contract_changed')
+    assert.equal((await actions.find(changedAction.idempotencyKey))?.executionState, 'no_effect')
+    assert.equal(executions, 4)
     tool.approval = false
     tool.effect = 'uncertain'
     failAfterWrite = true
@@ -132,6 +140,10 @@ it('validates before intent, rolls back effects with receipts, and recovers a lo
     const external = action('external-ack-lost', { title: 'External effect' })
     assert.equal((await service.executeAction(resumed, external)).executionState, 'unknown')
     assert.equal(executions, 5)
+    tool.semanticVersion = '3'
+    assert.equal((await service.executeAction(resumed, external)).executionState, 'unknown')
+    assert.equal(executions, 5)
+    tool.semanticVersion = '2'
     assert.deepEqual(await service.executeAction(resumed, external), { ok: true, executionState: 'succeeded', value: { title: 'External effect' } })
     assert.equal(executions, 5, 'reconciliation reads the effect without repeating the external call')
     assert.deepEqual(await actions.unsettled('w'), [])

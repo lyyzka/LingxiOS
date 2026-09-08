@@ -100,6 +100,9 @@ export interface CapabilityGrant {
   methods?: readonly string[]
 }
 
+/** Trusted runtime policy for the built-in Python execution surface. */
+export type CodeExecutionMode = 'enabled' | 'disabled'
+
 // ---------------------------------------------------------------------------
 // Host actions (the typed effect bridge)
 // ---------------------------------------------------------------------------
@@ -127,6 +130,7 @@ export function actionKeyOf(action: Pick<HostAction, 'runId' | 'cellId' | 'callI
 }
 
 export interface HostActionResult {
+  observations?: Array<{ resourceType: string; resourceId: string; version: string; completeness: 'full' | 'summary' }>
   ok: boolean
   executionState?: 'rejected' | 'no_effect' | 'succeeded' | 'awaiting_approval' | 'unknown'
   code?: string
@@ -275,6 +279,8 @@ export interface ContextMessage {
  * into the session.
  */
 export interface TurnContext {
+  discoveredTools?: string[]
+  harness?: import('../harness/profile.js').HarnessContext
   executionSteps?: import('../control-plane/steps.js').ExecutionStep[]
   productRules?: string
   executionCheckpoint?: import('../runtime/corrections.js').ProgressCheckpoint

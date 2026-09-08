@@ -19,7 +19,9 @@ import { ConfigError } from '../errors.js'
 import { ControlPlaneService } from '../control-plane/service.js'
 import { withTransaction, workItemFromRow, PgWorkStore, PgSessionStore, PgEventStore, PgActionLedger, PgModelBudgetStore, type SqlPool, type SqlQueryable } from '../control-plane/pg-store.js'
 import type { HostPort } from '../host/port.js'
-import type { AssistantMessage, PromptContext, WorkItem, RunEvent } from '../protocol/types.js'
+import type { AssistantMessage, CodeExecutionMode, PromptContext, WorkItem, RunEvent } from '../protocol/types.js'
+import type { DeliveryMode } from '../context/request.js'
+import { executionMode, type HarnessMode } from '../runtime/execution-policy.js'
 import { sessionKeyOf } from '../protocol/types.js'
 import { RUN_SEQUENCE_SPAN } from '../protocol/constants.js'
 import type { GoalOutcome } from '../protocol/outcome.js'
@@ -38,12 +40,26 @@ import { readApproval, decideApproval, resumeDecidedApprovals, executeDecidedApp
 import { readRun, readRunState, reviseRun, cancelRun, cancelDescendants, enqueueWork, type RunIdentity, type JobInput } from './jobs.js'
 import { createMemoryRuntime, type MemoryOptions } from '../memory/runtime.js'
 import type { MemoryScope } from '../memory/store.js'
+import { forgetMemoryScope } from '../memory/forget.js'
+import { inspectObligations, snapshotObligations, type DeliveryObligation } from '../outcome/obligations.js'
 import { sweepQueuedWork } from '../control-plane/scheduler.js'
 import { readDiagnostics, refreshMetrics, listRuns, readOperations, retryDelivery, type RunListQuery } from './diagnostics.js'
 import { freezeEvolutionBenchmark, rollbackEvolution, type EvolutionBenchmark } from '../memory/evolution.js'
 import { deadlinePool } from '../control-plane/deadline-pool.js'
+import { assembleHarness, type HarnessProfile } from '../harness/profile.js'
+import { skillIndex, skillTool, type SkillDefinition } from '../skills/definition.js'
+import { presentationTool, type PresentationDefinition, type TrustedPresentation } from '../presentation/definition.js'
+import { observationTool } from '../context/observations.js'
+import { discoveryTool, toolSpecification } from '../tools/discovery.js'
+import { grantedTools } from '../tools/catalog.js'
+import { permitsTool } from '../runtime/execution-policy.js'
+import { canonicalJson, textSha256 } from '../context/compiler.js'
+import { toolContractHash } from '../tools/contracts.js'
 
 export interface LingxiOSOptions {
+  harness?: HarnessProfile
+  skills?: readonly SkillDefinition[]
+  presentations?: readonly PresentationDefinition[]
   memory?: MemoryOptions
   tools?: readonly ToolDefinition[]
   delivery?: import('../control-plane/stores.js').DeliveryPort
@@ -76,6 +92,13 @@ export interface RequestInput {
   authorName?: string
   threadId?: string
   attachments?: RequestAttachment[]
+  /** Trusted product classification; disabled removes the Python execution surface end to end. */
+  codeExecution?: CodeExecutionMode
+  /** Modes narrow current grants; chat has no tools and read allows only native reads. */
+  mode?: HarnessMode
+  obligations?: DeliveryObligation[]
+  /** Trusted completion obligation; action requires durable successful business-action evidence. */
+  deliveryMode?: DeliveryMode
 }
 
 export interface DelegatedRequestInput extends RequestInput {
@@ -96,11 +119,26 @@ export type ActionResolutionInput = ActionResolution & Pick<RequestInput,
   'tenantId' | 'agentId' | 'sessionId' | 'principalId' | 'threadId'>
 
 export interface RunVerificationContext {
+  candidate: import('../outcome/verification.js').Candidate
   work: Omit<WorkItem, 'leaseToken'>
   requestVersion: number
   database: SqlQueryable
   signal: AbortSignal
   deadlineAt: string
+}
+
+function requestPolicyMeta(input: Pick<RequestInput, 'codeExecution' | 'deliveryMode' | 'mode' | 'obligations'>): {
+  codeExecution?: CodeExecutionMode; deliveryMode?: DeliveryMode; mode?: HarnessMode; obligations?: DeliveryObligation[]
+} {
+  if (input.mode !== undefined) executionMode({ meta: { mode: input.mode } })
+  if (input.codeExecution !== undefined && !['enabled','disabled'].includes(input.codeExecution)) throw new Error('invalid codeExecution policy')
+  if (input.deliveryMode !== undefined && !['auto','text','action'].includes(input.deliveryMode)) throw new Error('invalid deliveryMode policy')
+  return {
+    ...(input.mode ? { mode: input.mode } : {}),
+    ...(input.obligations ? { obligations: snapshotObligations(input.obligations) } : {}),
+    ...(input.codeExecution ? { codeExecution: input.codeExecution } : {}),
+    ...(input.deliveryMode ? { deliveryMode: input.deliveryMode } : {}),
+  }
 }
 
 /** Trusted server entry point. Product ingress authenticates the principal; workers execute separately. */
@@ -113,8 +151,9 @@ export async function createLingxiOS(options: LingxiOSOptions) {
   const metrics = options.metrics ?? new MetricsRegistry()
   const homesRoot = resolve(options.homesRoot ?? process.env['AGENT_OS_HOMES_ROOT'] ?? '.agent-os/homes')
   const modelBudget = { ...DEFAULT_MODEL_BUDGET, ...loadModelBudget(), ...options.modelBudget }
-  if (process.env['NODE_ENV'] === 'production' && !(modelBudget.inputCostMicrosPerMillion > 0 || modelBudget.outputCostMicrosPerMillion > 0)) {
-    throw new ConfigError('production requires configured model token prices')
+  if ((process.env['NODE_ENV'] === 'production' || options.modelBudget?.maxCostMicros !== undefined || process.env['AGENT_OS_MAX_COST_MICROS'] !== undefined)
+    && !(modelBudget.inputCostMicrosPerMillion > 0 || modelBudget.outputCostMicrosPerMillion > 0)) {
+    throw new ConfigError('production or an explicit monetary budget requires configured model token prices')
   }
   metrics.gauge('agentos_cost_budget_enabled', 'Configured prices make the cost budget effective').set(
     modelBudget.inputCostMicrosPerMillion! > 0 || modelBudget.outputCostMicrosPerMillion! > 0 ? 1 : 0)
@@ -129,22 +168,57 @@ export async function createLingxiOS(options: LingxiOSOptions) {
       }
     } }
   const memory = options.memory ? createMemoryRuntime(options.database, options.memory, options.modelBudget) : undefined
-  const definitions = [...options.tools ?? [], ...memory?.tools ?? []]
-  const capabilities = options.capabilityResolver ?? { resolve: async () => [...new Set((options.tools ?? []).map(tool => tool.action.split('.')[0]!))]
-    .map(name => ({ name, methods: (options.tools ?? []).filter(tool => tool.action.startsWith(name + '.')).map(tool => tool.action.split('.')[1]!) })) }
+  const harness = options.harness ? assembleHarness(options.harness) : undefined
+  const businessTools = [...options.tools ?? [], ...harness?.tools ?? []]
+  const skills = [...options.skills ?? [], ...harness?.skills ?? []], presentations = [...options.presentations ?? [], ...harness?.presentations ?? []]
+  const capabilities = options.capabilityResolver ?? { resolve: async () => [...new Set(businessTools.map(tool => tool.action.split('.')[0]!))]
+    .map(name => ({ name, methods: businessTools.filter(tool => tool.action.startsWith(name + '.')).map(tool => tool.action.split('.')[1]!) })) }
+  const allowed = async (context: import('../tools/definition.js').ActionContext, actions: string[]) => {
+    const tools = grantedTools(businessTools, await capabilities.resolve(context.work)).filter(tool => permitsTool(context.work, tool))
+    if (actions.some(action => !tools.some(tool => tool.action === action))) throw new Error('required capability was revoked or is unavailable in this mode')
+  }
+  const extensionTools = [...(skills.length ? [skillTool(skills, allowed)] : []), ...(presentations.length ? [presentationTool(presentations, allowed)] : [])]
+  const readableTools = [...businessTools, ...extensionTools]
+  const helperTools = [...extensionTools, ...(readableTools.length ? [observationTool(readableTools, async (context, actions) => {
+    if (actions.every(action => businessTools.some(tool => tool.action === action))) await allowed(context, actions)
+  })] : []), ...(businessTools.some(tool => tool.deferred) ? [discoveryTool(businessTools, context => capabilities.resolve(context.work))] : [])]
+  const definitions = [...businessTools, ...helperTools, ...memory?.tools ?? []]
+  const behavior = harness?.context ?? (skills.length || presentations.length ? { id: 'authored', version: '1', hash: '', rules: [], skills: [], presentations: [] } : undefined)
+  if (behavior) {
+    behavior.skills = skills.map(skillIndex)
+    behavior.presentations = presentations.map(({ type, version, description, actions }) => ({ type, version, description, actions }))
+    behavior.hash = textSha256(canonicalJson({ ...behavior, tools: definitions.map(toolContractHash) }))
+  }
+  const policyMeta = (input: Pick<RequestInput, 'mode' | 'codeExecution' | 'deliveryMode' | 'obligations'>) => {
+    const mode = input.mode ?? options.harness?.mode
+    if (options.harness && ['chat','read','execute'].indexOf(mode!) > ['chat','read','execute'].indexOf(options.harness.mode)) throw new Error('request cannot widen its harness mode')
+    return { ...requestPolicyMeta({ ...input, ...(mode ? { mode } : {}) }), ...(behavior ? { harnessHash: behavior.hash } : {}) }
+  }
   const integration = {
-    tools: [...TASK_TOOLS, ...definitions.map(({ name, action, description, parameters, effect, approval, readback }) =>
-      ({ name, action, description, parameters, effect, approval, ...(readback ? { readback } : {}) }))],
+    tools: [...TASK_TOOLS, ...definitions.map(toolSpecification)],
     actionExecutor: toolExecutor(options.database, definitions, (work, input) => createNativeArtifact(
-      resolve(options.homesRoot ?? process.env['AGENT_OS_HOMES_ROOT'] ?? '.agent-os/homes'), work, input)),
+      resolve(options.homesRoot ?? process.env['AGENT_OS_HOMES_ROOT'] ?? '.agent-os/homes'), work, input), options.memory),
     capabilityResolver: { async resolve(work: Omit<WorkItem, 'leaseToken'>) {
       if (memory && ['memory_synthesis','memory_index','memory_evaluation'].includes(work.kind)) return [{ name: work.kind,
         methods: memory.tools.filter(tool => tool.action.startsWith(work.kind + '.')).map(tool => tool.action.split('.')[1]!) }]
-      return capabilities.resolve(work)
+      return [...await capabilities.resolve(work), ...helperTools.map(tool => ({ name: tool.action.split('.')[0]!, methods: [tool.action.split('.')[1]!] }))]
     } },
     contextProvider: { async loadContext(work: Omit<WorkItem, 'leaseToken'>) {
-      const context = await contextProvider.loadContext(work)
-      return memory && !['memory_synthesis','memory_index','memory_evaluation'].includes(work.kind) ? { ...context, memory: await memory.context(work) } : context
+      if (behavior && !['memory_synthesis','memory_index','memory_evaluation'].includes(work.kind) && work.meta?.['harnessHash'] !== behavior.hash) throw new Error('harness version mismatch; resume with the pinned deployment or drain the old run')
+      const context = { ...await contextProvider.loadContext(work), ...(behavior ? { harness: structuredClone(behavior) } : {}) }
+      let discoveredTools: string[] | undefined
+      if (businessTools.some(tool => tool.deferred)) {
+        const discovered = await options.database.query(`SELECT DISTINCT tool->>'name' AS name FROM lingxios.agent_action_intents i
+          JOIN lingxios.agent_action_ledger r USING(idempotency_key)
+          JOIN lingxios.agent_work_items w ON w.id=i.intent->>'workId'
+          CROSS JOIN LATERAL jsonb_array_elements(CASE WHEN jsonb_typeof(r.result->'value'->'tools')='array' THEN r.result->'value'->'tools' ELSE '[]'::jsonb END) tool
+          WHERE w.id=$1 AND i.intent->'action'->>'action'='catalog.discover' AND r.result->>'ok'='true'
+            AND (i.intent->>'requestVersion')::integer=jsonb_array_length(w.steer_inputs)+1 LIMIT 1025`, [work.id])
+        if (discovered.rows.length > 1024) throw new Error('too many materialized tool schemas')
+        discoveredTools = discovered.rows.map(row => String(row['name']))
+      }
+      return { ...context, ...(discoveredTools ? { discoveredTools } : {}),
+        ...(memory && !['memory_synthesis','memory_index','memory_evaluation'].includes(work.kind) ? { memory: await memory.context(work) } : {}) }
     } },
     ...(options.delivery ? { delivery: options.delivery } : {}),
   }
@@ -170,12 +244,12 @@ export async function createLingxiOS(options: LingxiOSOptions) {
       row['observation'] as import('../model/execution.js').ModelCallObservation, context), { signal: shutdown.signal })
   }
 
-  async function verifyNative(work: Omit<WorkItem, 'leaseToken'>, requestVersion: number, database: SqlQueryable) {
+  async function verifyNative(work: Omit<WorkItem, 'leaseToken'>, candidate: import('../outcome/verification.js').Candidate, database: SqlQueryable) {
     if (!options.verifyRun) return []
     const deadlineAt = new Date(Date.now() + 10_000).toISOString(), signal = AbortSignal.any([shutdown.signal,AbortSignal.timeout(10_000)])
     let active = true
     try {
-      const records = await abortable(options.verifyRun({ work, requestVersion, signal, deadlineAt, database: {
+      const records = await abortable(options.verifyRun({ work, candidate: structuredClone(candidate), requestVersion: candidate.requestVersion, signal, deadlineAt, database: {
         query: (sql, params) => { signal.throwIfAborted(); if (!active) throw new Error('verification ended'); return database.query(sql, params) },
       } }), signal)
       if (records.length > 64 || records.some(record => !record.checker.startsWith('product:')
@@ -198,7 +272,8 @@ export async function createLingxiOS(options: LingxiOSOptions) {
           AND status='leased' AND lease_expires_at>NOW() AND cancel_requested_at IS NULL
           AND jsonb_array_length(steer_inputs)+1=$3 FOR UPDATE`, [work.id,work.fence,candidate.requestVersion])
         if (!current.rows.length) throw new Error('candidate request changed while checking files')
-        records.push(...await verifyNative(work, candidate.requestVersion, client))
+        records.push(...await verifyNative(work, candidate, client))
+        records.push(...await inspectObligations(client, work, candidate, integration.tools, records))
         for (const record of records) await client.query(`INSERT INTO lingxios.agent_verifications
           (work_id,request_version,candidate_hash,checker,status,evidence) VALUES($1,$2,$3,$4,$5,$6::jsonb)
           ON CONFLICT(work_id,request_version,candidate_hash,checker) DO UPDATE SET
@@ -235,6 +310,21 @@ export async function createLingxiOS(options: LingxiOSOptions) {
                 AND ($3::integer IS NULL OR jsonb_array_length(steer_inputs)+1=$3)
               FOR UPDATE`, [work.id, work.fence, message.envelope.requestVersion])
           if (!current.rows.length) throw new Error('request changed or lease expired before message persistence')
+          if (presentations.length) {
+            const rendered = await client.query(`SELECT i.intent,r.result FROM lingxios.agent_action_intents i JOIN lingxios.agent_action_ledger r USING(idempotency_key)
+              WHERE i.intent->>'workId'=$1 AND (i.intent->>'requestVersion')::integer=$2 AND i.intent->'action'->>'action'='presentation.render'
+                AND r.result->>'ok'='true' ORDER BY i.recorded_at,i.idempotency_key LIMIT 17`, [work.id, message.envelope.requestVersion])
+            if (rendered.rows.length > 16) throw new Error('at most 16 presentation components may be committed')
+            const components: TrustedPresentation[] = []
+            for (const row of rendered.rows) {
+              const intent = row['intent'] as import('../control-plane/stores.js').ActionIntent
+              if (intent.toolContractHash !== toolContractHash(helperTools.find(tool => tool.action === 'presentation.render')!)) throw new Error('presentation contract changed before commit')
+              await integration.actionExecutor.prepare(work, intent.action, { requestVersion: message.envelope.requestVersion,
+                signal: AbortSignal.any([shutdown.signal, AbortSignal.timeout(10_000)]), deadlineAt: new Date(Date.now() + 10_000).toISOString() })
+              components.push(structuredClone((row['result'] as { value: { presentation: TrustedPresentation } }).value.presentation))
+            }
+            if (components.length) message = { ...message, envelope: { ...message.envelope, presentations: components } }
+          }
           const resultId = 'result:' + createHash('sha256').update(JSON.stringify([work.id, message])).digest('hex')
           const previous = await client.query(`SELECT result.id,result.message FROM lingxios.agent_work_items work
             JOIN lingxios.agent_results result ON result.id=work.result_id WHERE work.id=$1`, [work.id])
@@ -245,12 +335,17 @@ export async function createLingxiOS(options: LingxiOSOptions) {
             VALUES($1,$2,$3,$4,$5,$6::jsonb) ON CONFLICT(id) DO NOTHING`,
           [resultId,work.id,message.envelope.requestVersion,work.fence,work.homeEpoch,JSON.stringify(message)])
           if (message.envelope.goalOutcome.status === 'satisfied') {
-            if ((await verifyNative(work, message.envelope.requestVersion, client)).some(record => record.status !== 'passed')) {
+            const nativeChecks = await verifyNative(work, { body: message.body, requestVersion: message.envelope.requestVersion, artifacts: message.envelope.artifacts }, client)
+            if (nativeChecks.some(record => record.status !== 'passed')) {
               throw new Error('native acceptance changed before successful completion')
             }
             const hash = candidateHash({ body: message.body, requestVersion: message.envelope.requestVersion, artifacts: message.envelope.artifacts })
             const checks = await client.query(`SELECT checker,status FROM lingxios.agent_verifications
               WHERE work_id=$1 AND request_version=$2 AND candidate_hash=$3`, [work.id,message.envelope.requestVersion,hash])
+            const obligations = await inspectObligations(client, work, { body: message.body, requestVersion: message.envelope.requestVersion,
+              artifacts: message.envelope.artifacts }, integration.tools, [
+              ...checks.rows.filter(row => !String(row['checker']).startsWith('product:')).map(row => ({ checker: String(row['checker']), status: row['status'] as VerificationRecord['status'], evidence: {} })), ...nativeChecks])
+            if (obligations.some(record => record.status !== 'passed')) throw new Error('delivery obligations are unfulfilled or no longer current')
             if (message.envelope.artifacts.some(artifact => !checks.rows.some(check => check['checker'] === `artifact:${artifact.path}` && check['status'] === 'passed'))) throw new Error('candidate files require current authoritative checks')
             const actions = await candidateActions(client, work.id, message.envelope.requestVersion, integration?.tools ?? [])
             if (actions.length > 1024 || actions.some(action => !checks.rows.some(check => check['checker'] === `action:${action.key}` && check['status'] === 'passed'))) throw new Error('candidate writes require current authoritative checks')
@@ -349,6 +444,15 @@ export async function createLingxiOS(options: LingxiOSOptions) {
       signal?.throwIfAborted()
       return memory ? memory.recall(work, scope, query, limit, signal) : []
     },
+    /** Trusted product ingress supplies the authenticated identity used by resolveScopes. */
+    async forgetMemory(work: Omit<WorkItem, 'leaseToken'>, scope: MemoryScope) {
+      if (!options.memory || work.tenantId !== scope.tenantId || !work.principalId) throw new Error('memory scope is unavailable')
+      return withTransaction(options.database, async db => {
+        const scopes = await options.memory!.resolveScopes(work, db)
+        if (!scopes.some(item => item.tenantId === scope.tenantId && item.scopeType === scope.scopeType && item.scopeId === scope.scopeId)) throw new Error('memory scope was revoked')
+        return forgetMemoryScope(db, scope)
+      })
+    },
     metrics: () => metrics.expose(),
     listRuns: (query?: RunListQuery) => listRuns(options.database,query),
     readOperations: () => readOperations(options.database),
@@ -371,8 +475,9 @@ export async function createLingxiOS(options: LingxiOSOptions) {
       ? reviseRun(transaction, identity, text, author) : withTransaction(options.database, db => reviseRun(db, identity, text, author)),
     async enqueueJob(input: JobInput, transaction?: SqlQueryable) {
       if (!input.principalId?.trim() || !input.text?.trim() || input.text.length > 100_000) throw new Error('job requires its authenticated principal and original request text')
+      const { mode: _reservedMode, obligations: _reservedObligations, codeExecution: _reservedCodeExecution, deliveryMode: _reservedDeliveryMode, ...jobMeta } = input.meta ?? {}
       const work = { ...input, triggerRef: input.sourceRef ?? input.id ?? randomUUID(),
-        meta: { ...input.meta, text: input.text, authorName: input.authorName ?? 'User', attachments: snapshotAttachments(input.attachments ?? []) } }
+        meta: { ...jobMeta, ...policyMeta(input), text: input.text, authorName: input.authorName ?? 'User', attachments: snapshotAttachments(input.attachments ?? []) } }
       return transaction ? enqueueWork(transaction, work) : service.enqueue(work)
     },
     readApproval: (identity: ApprovalLookup) => readApproval(options.database, identity),
@@ -445,15 +550,19 @@ export async function createLingxiOS(options: LingxiOSOptions) {
         throw new Error('non-empty request text and authenticated principalId are required')
       }
       return service.enqueue({ ...input, kind: 'turn', lane: 'interactive', triggerRef: input.sourceRef ?? input.id ?? randomUUID(),
-        meta: { text: input.text, authorName: input.authorName ?? 'User', attachments: snapshotAttachments(input.attachments ?? []) },
+        meta: { ...policyMeta(input), text: input.text, authorName: input.authorName ?? 'User', attachments: snapshotAttachments(input.attachments ?? []) },
       })
     },
     async enqueueDelegated(input: DelegatedRequestInput) {
       const { delegation, ...request } = input
       if (!delegation || delegation.parentRequest.workId !== delegation.parentWorkId
         || delegation.parentRequest.revisions.length + 1 !== delegation.parentRequestVersion) throw new Error('invalid delegated request')
+      const requestPolicy = policyMeta(request)
+      if (delegation.parentRequest.codeExecution === 'disabled') requestPolicy.codeExecution = 'disabled'
+      const parentMode = delegation.parentRequest.mode
+      if (parentMode === 'chat' || parentMode === 'read' && requestPolicy.mode !== 'chat') requestPolicy.mode = parentMode
       return service.enqueue({ ...request, kind: 'turn', lane: 'collaboration', triggerRef: request.sourceRef ?? request.id ?? randomUUID(),
-        meta: { text: request.text, authorName: request.authorName ?? 'Agent', attachments: snapshotAttachments(request.attachments ?? []),
+        meta: { ...requestPolicy, text: request.text, authorName: request.authorName ?? 'Agent', attachments: snapshotAttachments(request.attachments ?? []),
           parentWorkId: delegation.parentWorkId, rootWorkId: delegation.rootWorkId,
           parentRequestVersion: delegation.parentRequestVersion, delegation: { ...delegation, assignment: request.text } },
       })

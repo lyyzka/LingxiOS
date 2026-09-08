@@ -11,5 +11,7 @@
 !test/**
 !db/
 !db/schema.sql
+!db/migrations/
+!db/migrations/**
 !kernel/
 !kernel/runner.py

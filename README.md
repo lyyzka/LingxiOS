@@ -7,7 +7,7 @@ The package has four public entries: `lingxios`, `lingxios/worker`, `lingxios/ui
 ## Install
 
 ```sh
-npm install lingxios@2.1.0
+npm install lingxios@3.0.0
 ```
 
 Requires Node.js 22.13+, PostgreSQL, and Python 3. Install `packageResources().schema` through the product's explicit migration process before an application starts. LingxiOS performs read-only schema checks at startup and never applies DDL itself.

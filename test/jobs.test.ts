@@ -29,12 +29,13 @@ it('commits child lineage atomically, resumes a child that finished before parki
   const control = await createLingxiOS({ database: pool, tools: [tool] })
   try {
     const identity = { runId: 'parent', tenantId: 'tenant', agentId: 'agent', sessionId: 'room', principalId: 'human' }
-    await control.enqueue({ ...identity, id: 'parent', text: 'Original request' })
+    await control.enqueue({ ...identity, id: 'parent', text: 'Original request', codeExecution: 'disabled', deliveryMode: 'action' })
     const host = control.connectWorker({ workerId: 'worker', workKinds: ['turn'] })
     let parent = (await host.claimWork())!
     await host.saveSession(parent, { key: sessionKeyOf(parent), tenantId: parent.tenantId, agentId: parent.agentId, sessionId: parent.sessionId,
       revision: 0, compactionEpoch: 0, history: [], appliedWorkIds: ['parent'], request: { version: 1, workId: 'parent', tenantId: 'tenant', sessionId: 'room',
-        authorId: 'human', sourceRef: 'parent', originalText: 'Original request', revisions: [], attachments: [], evidence: snapshotEvidence('parent:evidence:1', []) } })
+        authorId: 'human', sourceRef: 'parent', originalText: 'Original request', revisions: [], codeExecution: 'disabled', deliveryMode: 'action',
+        attachments: [], evidence: snapshotEvidence('parent:evidence:1', []) } })
     const saveProgress = (id: string, version: number, observedAt: string) => host.saveStep(parent,{ id, requestVersion: 1, kind: 'tool', input: { id }, artifacts: [],
       output: JSON.stringify({ receipts: [{ result: { ok: true, value: { version, observedAt } } }] }) })
     await saveProgress('first-progress',1,'2026-01-01')
@@ -56,6 +57,8 @@ it('commits child lineage atomically, resumes a child that finished before parki
     assert.equal(child.principalId, 'human')
     assert.equal(child.meta?.['rootWorkId'], 'parent')
     assert.equal(child.meta?.['parentRequestVersion'], 1)
+    assert.equal(child.meta?.['codeExecution'], 'disabled')
+    assert.equal(child.meta?.['deliveryMode'], undefined)
     await host.completeWork(child, { status: 'completed', goalOutcome: { status: 'partial', verification: 'not_run', requestVersion: 1 } })
     const wait = { status: 'delegated' as const, taskRef: child.id, verification: 'not_run' as const, requestVersion: 1 }
     await assert.rejects(host.completeWork(parent, { status: 'completed', goalOutcome: wait }), /waitWork/)

@@ -192,7 +192,7 @@ it('preserves goal outcomes and enforces session leases over real HTTP', async (
     assert.equal(draftReceipt.ok, true)
     assert.deepEqual(draftReceipt.directive, { type: 'task_contract', data: contract })
     assert.deepEqual(await client.executeAction(work, draftAction), draftReceipt)
-    await assert.rejects(client.executeAction(work, { ...draftAction, args: { ...draftAction.args, actions: ['Different'] } }), /internal error/)
+    await assert.rejects(client.executeAction(work, { ...draftAction, args: { ...draftAction.args, actions: ['Different'] } }), /action identity mismatch/)
     const invalidDraft = await client.executeAction(work, { ...draftAction, cellId: 'invalid', idempotencyKey: JSON.stringify([work.id, 'invalid', 0]), args: { ...draftAction.args, requestVersion: 99 } })
     assert.equal(invalidDraft.ok, false)
     assert.equal(invalidDraft.executionState, 'rejected')

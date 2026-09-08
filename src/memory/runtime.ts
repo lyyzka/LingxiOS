@@ -8,8 +8,10 @@ import { createSemanticMemory } from './semantic.js'
 import { executeMemorySynthesis, parseMemoryChanges } from './synthesis.js'
 import { executeEvolution, parseEvolutionCandidates, pinnedEvolution, proposeEvolution } from './evolution.js'
 import { withTransaction } from '../control-plane/pg-store.js'
+import type { MemoryWritePolicy } from './policy.js'
 
 export interface MemoryOptions {
+  writePolicy?: MemoryWritePolicy
   /** Resolve opaque scopes from the original human's current product permissions. */
   resolveScopes(work: Omit<WorkItem, 'leaseToken'>, database: SqlQueryable): Promise<MemoryScope[]>
   embeddings?: EmbeddingOptions
@@ -53,9 +55,9 @@ export function createMemoryRuntime(database: SqlPool, options: MemoryOptions, b
     async execute(context, input) {
       const scopes = await options.resolveScopes(context.work,context.database)
       const { candidates, ...memoryInput } = input
-      const value = await executeMemorySynthesis(context.database,context.work,method,memoryInput,scopes)
+      const value = await executeMemorySynthesis(context.database,context.work,method,memoryInput,scopes,options.writePolicy)
       if (method === 'apply' && value && 'outcome' in value && value.outcome === 'committed' && options.evolution) {
-        await proposeEvolution(context.database,context.work,scopes,options.evolution.benchmarkId,parseEvolutionCandidates(candidates ?? []))
+        await proposeEvolution(context.database,context.work,scopes,options.evolution.benchmarkId,parseEvolutionCandidates(candidates ?? []),options.writePolicy)
       }
       return { ok: true, executionState: 'succeeded', value: method === 'load' && value ? { ...value, evolutionEnabled: !!options.evolution } : value }
     },

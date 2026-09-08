@@ -3,6 +3,8 @@ import { isDeepStrictEqual } from 'node:util'
 import type { SqlQueryable } from '../control-plane/pg-store.js'
 import type { WorkItem } from '../protocol/types.js'
 import type { MemoryScope } from './store.js'
+import { memoryWriteBody, type MemoryWritePolicy } from './policy.js'
+import { lockMemoryScopes, sameMemoryEpochs, type MemoryEpoch } from './forget.js'
 
 export interface EvolutionCandidate { kind: 'experience' | 'skill' | 'strategy'; scopeType: string; body: string }
 export interface EvolutionCase { id: string; split: 'target' | 'holdout'; input: unknown }
@@ -59,9 +61,10 @@ export function parseEvolutionCandidates(value: unknown): EvolutionCandidate[] {
 
 /** Called in the synthesis action transaction, after its source and scopes have been authorized. */
 export async function proposeEvolution(database: SqlQueryable, work: Omit<WorkItem, 'leaseToken'>, scopes: MemoryScope[],
-  benchmarkId: string, candidates: EvolutionCandidate[]) {
+  benchmarkId: string, candidates: EvolutionCandidate[], policy?: MemoryWritePolicy) {
   parseEvolutionCandidates(candidates)
   if (!candidates.length) return []
+  const epochs = await lockMemoryScopes(database, scopes)
   const { rows } = await database.query(`SELECT e.*,source.result_id FROM lingxios.agent_memory_evidence e
     JOIN lingxios.agent_work_items source ON source.id=e.source_run_id
     JOIN lingxios.agent_work_items job ON job.meta->>'sourceRunId'=source.id
@@ -77,17 +80,21 @@ export async function proposeEvolution(database: SqlQueryable, work: Omit<WorkIt
   const source = rows[0]
   if (!source) throw new Error('evolution requires current committed evidence and a frozen benchmark')
   const recorded = source['scopes'] as MemoryScope[]
+  if (!sameMemoryEpochs(epochs.filter(scope => recorded.some(item => item.scopeType === scope.scopeType && item.scopeId === scope.scopeId)),
+    source['scope_epochs'] as MemoryEpoch[] ?? [])) throw new Error('evolution source was forgotten')
   const ids: string[] = []
   for (const candidate of candidates) {
     const scope = scopes.find(item => item.tenantId === work.tenantId && item.scopeType === candidate.scopeType
       && recorded.some(saved => isDeepStrictEqual(saved,item)))
     if (!scope) throw new Error('candidate scope is unavailable')
+    const body = await memoryWriteBody({ scope, principalId: work.principalId!, sourceWorkId: String(source['source_run_id']),
+      origin: 'evolved', kind: candidate.kind, body: candidate.body }, policy)
     const id = `evolution:${digest([work.id,candidate])}`
     const baseline = (await database.query(`SELECT * FROM lingxios.agent_memories WHERE tenant_id=$1 AND scope_type=$2
       AND scope_id=$3 AND kind=$4 AND origin='evolved' AND status='active'`, [scope.tenantId,scope.scopeType,scope.scopeId,candidate.kind])).rows[0]
     await database.query(`INSERT INTO lingxios.agent_memories(tenant_id,id,scope_type,scope_id,kind,body,origin,status,source_refs)
       VALUES($1,$2,$3,$4,$5,$6,'evolved','candidate',$7::jsonb) ON CONFLICT(tenant_id,id) DO NOTHING`,
-    [scope.tenantId,id,scope.scopeType,scope.scopeId,candidate.kind,candidate.body.trim(),JSON.stringify([{ workId: source['source_run_id'],
+    [scope.tenantId,id,scope.scopeType,scope.scopeId,candidate.kind,body,JSON.stringify([{ workId: source['source_run_id'],
       resultId: source['result_id'], requestVersion: source['request_version'], inputSha256: source['input_sha256'] }])])
     await database.query(`INSERT INTO lingxios.agent_evolution_evaluations(tenant_id,memory_id,candidate_version,benchmark_id,baseline)
       VALUES($1,$2,1,$3,$4::jsonb) ON CONFLICT(tenant_id,memory_id) DO NOTHING`,

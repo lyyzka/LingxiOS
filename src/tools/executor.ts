@@ -10,14 +10,24 @@ import { approvalGate } from '../control-plane/approvals.js'
 import { withTransaction } from '../control-plane/pg-store.js'
 import { requestSnapshot, enqueueChild, childIdentity, readRun, cancelRun, reviseRun } from '../app/jobs.js'
 import { deadlinePool } from '../control-plane/deadline-pool.js'
+import { writeMemory, type MemoryScope } from '../memory/store.js'
+import { forgetMemoryScope } from '../memory/forget.js'
+import type { MemoryOptions } from '../memory/runtime.js'
+import { assertObservation, assertToolContract, observeResult } from './contracts.js'
 
 export function toolExecutor(database: SqlPool, definitions: readonly ToolDefinition[],
-  createArtifact?: (work: Omit<WorkItem, 'leaseToken'>, input: ArtifactInput) => Promise<KernelArtifact>): ActionExecutor {
+  createArtifact?: (work: Omit<WorkItem, 'leaseToken'>, input: ArtifactInput) => Promise<KernelArtifact>, memory?: MemoryOptions): ActionExecutor {
   const tools = new Map(definitions.map(tool => [tool.action, tool]))
   if (tools.size !== definitions.length || new Set(definitions.map(tool => tool.name)).size !== definitions.length) throw new Error('duplicate tool definition')
   for (const tool of definitions) {
     if (!/^[a-z][a-z0-9_]*\.[a-z][a-z0-9_]*$/.test(tool.action) || tool.name !== tool.action.replace('.', '__')) throw new Error('invalid tool identity')
     if (tool.approval && !tool.preview) throw new Error(`${tool.action} requires an approval preview`)
+    if (tool.semanticVersion !== undefined && (typeof tool.semanticVersion !== 'string' || !tool.semanticVersion.trim() || tool.semanticVersion.length > 128)) throw new Error('invalid tool semantic version')
+    if (tool.observation && (tool.effect !== 'read' || !tool.observe || !tool.observation.resourceType || !['full', 'summary'].includes(tool.observation.completeness))) throw new Error('invalid tool observation contract')
+    if (tool.preconditions) {
+      const source = tools.get(tool.preconditions.readAction)
+      if (!tool.observationRequirement || !source?.observation || source.effect !== 'read' || source.observation.resourceType !== tool.preconditions.resourceType) throw new Error('invalid tool observation precondition')
+    }
   }
   function definition(action: HostAction) {
     const tool = tools.get(action.action)
@@ -27,7 +37,18 @@ export function toolExecutor(database: SqlPool, definitions: readonly ToolDefini
   function context(work: Omit<WorkItem, 'leaseToken'>, action: HostAction, options: ActionExecutionOptions, db: SqlQueryable = database): ActionContext {
     const write = () => { options.signal.throwIfAborted(); if (db === database) throw new NoEffectError('child mutations require an action transaction') }
     const queryable = db === database ? deadlinePool(database,options.signal) : db
+    const authorizeMemory = async (scope: MemoryScope) => {
+      write()
+      if (!memory || scope.tenantId !== work.tenantId || !(await memory.resolveScopes(work, db)).some(item =>
+        item.tenantId === scope.tenantId && item.scopeType === scope.scopeType && item.scopeId === scope.scopeId)) throw new NoEffectError('memory scope is unavailable')
+    }
     return { work, action, database: queryable, ...options,
+      writeMemory: async (scope, mutation) => {
+        await authorizeMemory(scope)
+        return writeMemory(db, scope, mutation, { actionId: action.idempotencyKey, workId: work.id,
+          request: await requestSnapshot(db, work.id, options.requestVersion) }, memory!.writePolicy)
+      },
+      forgetMemory: async scope => { await authorizeMemory(scope); return forgetMemoryScope(db, scope) },
       requestSnapshot: () => requestSnapshot(queryable, work.id, options.requestVersion),
       enqueueChild: input => { write(); return enqueueChild(db, work, options.requestVersion, input) },
       readChild: async id => readRun(queryable, await childIdentity(queryable, work, id)),
@@ -44,6 +65,7 @@ export function toolExecutor(database: SqlPool, definitions: readonly ToolDefini
       const tool = definition(action)
       if (!tool.reconcile) return null
       const input = tool.parse(action.args), ctx = context(work, action, options)
+      await assertToolContract(tool, ctx)
       await abortable(tool.authorize(ctx, input), options.signal)
       return abortable(tool.reconcile(ctx, input), options.signal)
     },
@@ -60,14 +82,18 @@ export function toolExecutor(database: SqlPool, definitions: readonly ToolDefini
       const input = tool.parse(action.args)
       const run = async (db: SqlQueryable) => {
         const ctx = context(work, action, options, db)
+        await assertToolContract(tool, ctx)
         await tool.authorize(ctx, input)
+        await assertObservation(tool, ctx, input, tools)
         options.signal.throwIfAborted()
         const pending = await approvalGate(tool, ctx, input)
         return pending ?? tool.execute(ctx, input)
       }
       if (tool.effect !== 'transaction') {
         const ctx = context(work, action, options)
+        await assertToolContract(tool, ctx)
         await abortable(tool.authorize(ctx, input), options.signal)
+        await abortable(assertObservation(tool, ctx, input, tools), options.signal)
         if (tool.approval) {
           const pending = await withTransaction(deadlinePool(database,options.signal), async db => {
             await lockAction(db, work, action)
@@ -84,7 +110,7 @@ export function toolExecutor(database: SqlPool, definitions: readonly ToolDefini
           if (pending) return pending
         }
         let result: HostActionResult
-        try { result = await abortable(tool.execute(ctx, input), options.signal) }
+        try { result = await abortable(tool.execute(ctx, input).then(result => observeResult(tool, ctx, input, result)), options.signal) }
         catch (error) {
           if (!(error instanceof NoEffectError)) throw error
           result = { ok: false, executionState: 'no_effect', code: error.code, error: error.message }
@@ -149,6 +175,7 @@ export function toolExecutor(database: SqlPool, definitions: readonly ToolDefini
       const input = tool.parse(action.args)
       const ctx = context(work, action, options)
       // The independent verifier authorizes its own read scope, including deleted resources.
+      await assertToolContract(tool, ctx)
       return abortable(tool.verify(ctx, input, value), options.signal)
     },
   }

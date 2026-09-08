@@ -9,21 +9,36 @@ import type { GoalAssessment } from '../src/outcome/assessment.js'
 import type { AssistantMessage, SessionRecord } from '../src/protocol/types.js'
 import { MemoryStepStore } from '../src/control-plane/steps.js'
 import { candidateHash } from '../src/outcome/verification.js'
+import { businessActionDeliveryGap, requiresReview } from '../src/outcome/completion.js'
+
+it('uses explicit action delivery as a hard receipt obligation and only uses wording as a conservative review trigger', () => {
+  const request = { version: 1 as const, workId: 'w', tenantId: 't', sessionId: 's', authorId: 'u', sourceRef: 'm',
+    originalText: 'Notify the teacher.', revisions: [], attachments: [], evidence: snapshotEvidence('w:evidence:1', []), deliveryMode: 'action' as const }
+  assert.equal(requiresReview(request, [], []), true)
+  assert.match(businessActionDeliveryGap(request, false)!, /no durable successful receipt/)
+  assert.equal(businessActionDeliveryGap(request, true), null)
+  const { deliveryMode: _mode, ...automatic } = request
+  assert.equal(requiresReview({ ...automatic, originalText: '请发送邮件通知老师。' }, [], []), true)
+  assert.equal(requiresReview({ ...request, deliveryMode: 'text', originalText: '请解释如何发送邮件。' }, [], []), false)
+})
 
 it('requires settled actions and a reviewed committed response, and binds delegation to real scoped child work', async () => {
   for (const delegated of [false, true]) {
     const workStore = new MemoryWorkStore(), actions = new MemoryActionLedger()
     let committed: AssistantMessage | null = null
+    const fileTool = { name: 'files__save', action: 'files.save', description: 'Save a file.',
+      parameters: { type: 'object' as const, properties: {}, additionalProperties: false as const }, effect: 'transaction' as const, approval: false }
     const service = new ControlPlaneService({ modelBudgets: new MemoryModelBudgetStore(), steps: new MemoryStepStore(), work: workStore, actions, sessions: new MemorySessionStore(), events: new MemoryEventStore(),
+      tools: [fileTool],
       contextProvider: { loadContext: async () => { throw new Error('unexpected') } },
       capabilityResolver: { resolve: async () => [] }, actionExecutor: { prepare: async () => {}, execute: async () => { throw new Error('unexpected') } },
       delivery: { onEvent: async () => {}, getMessage: async () => committed,
         deliverMessage: async (_work, message) => { committed = structuredClone(message) } } })
-    await service.enqueue({ id: 'w', tenantId: 't', principalId: 'u', agentId: 'a', sessionId: 's', triggerRef: 'm', kind: 'turn', lane: 'interactive', meta: { text: 'Create a file.' } })
+    await service.enqueue({ id: 'w', tenantId: 't', principalId: 'u', agentId: 'a', sessionId: 's', triggerRef: 'm', kind: 'turn', lane: 'interactive', meta: { text: 'Create a file.', deliveryMode: 'action' } })
     const work = (await service.claim('worker'))!
     const evidence = snapshotEvidence('w:evidence:1', [])
     const session: SessionRecord = { key: '["t","a","s",null]', tenantId: 't', agentId: 'a', sessionId: 's', history: [], appliedWorkIds: ['w'], revision: 0, compactionEpoch: 0,
-      request: { version: 1, workId: 'w', tenantId: 't', sessionId: 's', authorId: 'u', sourceRef: 'm', originalText: 'Create a file.', revisions: [], attachments: [], evidence } }
+      request: { version: 1, workId: 'w', tenantId: 't', sessionId: 's', authorId: 'u', sourceRef: 'm', originalText: 'Create a file.', revisions: [], deliveryMode: 'action', attachments: [], evidence } }
     await service.saveSession(work, session)
     await assert.rejects(service.waitWork(work, {
       status: 'awaiting_approval', approvalId: 'invented', requestVersion: 1, verification: 'not_run',

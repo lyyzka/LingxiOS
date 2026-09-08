@@ -2,6 +2,12 @@ import { createTaskContract } from '../context/task-contract.js'
 import type { CapabilityGrant } from '../protocol/types.js'
 
 export interface ToolDefinition {
+  /** Expose this schema after authorized catalog discovery. Execution permissions are unchanged. */
+  deferred?: boolean
+  /** Increment for any implementation or authorization semantics change, including preview/verification. */
+  semanticVersion?: string
+  observation?: { resourceType: string; completeness: 'full' | 'summary' }
+  preconditions?: { readAction: string; resourceType: string }
   name: string
   action: string
   description: string
@@ -11,6 +17,10 @@ export interface ToolDefinition {
   readback?: string
 }
 const text = { type: 'string', minLength: 1, maxLength: 4000 }
+export function describeTool(tool: ToolDefinition): string {
+  return tool.description + (tool.preconditions ? ` Requires a full ${tool.preconditions.resourceType} observation from ${tool.preconditions.readAction} in this request; refresh stale versions before modifying.` : '')
+    + (tool.observation ? ` Returns ${tool.observation.completeness} ${tool.observation.resourceType} observations with resource versions.` : '')
+}
 const fields = { type: 'array', maxItems: 64, items: { type: 'string', minLength: 1, maxLength: 2000 } }
 const taskDefinitions: Array<ToolDefinition & { parse(args: Record<string, unknown>): void }> = [
   { name: 'task__contract', action: 'task.contract', description: 'Record a derived task checklist. The original request remains authoritative.',
@@ -39,7 +49,7 @@ const taskDefinitions: Array<ToolDefinition & { parse(args: Record<string, unkno
       if (!entries.length || entries.length > 16 || JSON.stringify(expected).length > 16384
         || entries.some(([key]) => !key || key.length > 256 || ['__proto__','prototype','constructor'].includes(key))) throw new Error('expected must contain 1-16 resource fields within 16384 characters')
     } },
-  { name: 'task__inspect', action: 'task.inspect', description: 'Inspect pending approvals and unknown effects, using available authorized reconciliation reads.',
+  { name: 'task__inspect', action: 'task.inspect', description: 'Inspect pending approvals and unknown effects, reconcile authorized unknown actions when possible, and report whether this request version has a durable successful business-action receipt.',
     parameters: { type: 'object', properties: {}, additionalProperties: false }, effect: 'read', approval: false, parse() {} },
 ]
 export const TASK_TOOLS: ToolDefinition[] = taskDefinitions.map(({ parse: _parse, ...definition }) => definition)

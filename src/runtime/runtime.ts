@@ -1,7 +1,8 @@
 import { appendResearchEvidence } from '../context/research-evidence.js'
 import { contextItem, observationItems } from '../context/compiler.js'
 import { buildPromptContext, PROMPT_CONTRACT_VERSION } from '../prompts/provider.js'
-import { requiresReview } from '../outcome/completion.js'
+import { executionSnapshot, type ExecutionSnapshot } from './execution-policy.js'
+import { businessActionDeliveryGap, requiresReview } from '../outcome/completion.js'
 import { appendResourceCheck } from '../context/resource-checks.js'
 import { createTaskContract } from '../context/task-contract.js'
 import { abortable } from '../deadline.js'
@@ -51,6 +52,11 @@ import { DefaultRuntimePolicy, type RuntimePolicy } from './policy.js'
 import { createHash, randomUUID } from 'node:crypto'
 import { ModelBudgetExceededError } from '../errors.js'
 import { boundedToolOutput, parseIPythonArguments } from './tool.js'
+import { receiptReferences } from '../context/observations.js'
+import { exposedTools } from '../tools/discovery.js'
+import { promptProgram } from '../prompts/program.js'
+import { canonicalJson } from '../context/compiler.js'
+import { releaseVersions } from '../versions.js'
 
 export interface WorkProcessorContext {
   host: HostPort
@@ -65,8 +71,6 @@ export interface WorkProcessor {
 }
 
 export interface AgentRuntimeOptions {
-  /** Compact history, synthesize memory and describe resolved approvals with a smaller model. */
-  smallModel?: ModelDriver
   policy?: RuntimePolicy
   heartbeatMs?: number
   compaction?: Partial<CompactionOptions>
@@ -108,7 +112,6 @@ export class AgentRuntime {
   private readonly recordModelPayloads: boolean
   private readonly modelTrace: Required<Pick<ModelTracePolicy, 'sampleRate' | 'retentionDays'>> & Pick<ModelTracePolicy, 'redact'>
   private readonly rootModelBudget: Required<RootModelBudgetOptions>
-  private readonly smallModel: ModelDriver
   private readonly processors = new Map<string, WorkProcessor | 'conversation'>()
   private readonly eventSeqByRun = new Map<string, number>()
   private readonly hostsByRun = new Map<string, HostPort>()
@@ -123,8 +126,7 @@ export class AgentRuntime {
   ) {
     this.policy = options.policy ?? new DefaultRuntimePolicy()
     this.heartbeatMs = options.heartbeatMs ?? 5_000
-    const contextWindowTokens = Math.min(model.contextWindowTokens ?? DEFAULT_COMPACTION.contextWindowTokens,
-      options.smallModel?.contextWindowTokens ?? model.contextWindowTokens ?? DEFAULT_COMPACTION.contextWindowTokens)
+    const contextWindowTokens = model.contextWindowTokens ?? DEFAULT_COMPACTION.contextWindowTokens
     this.compaction = { ...DEFAULT_COMPACTION, contextWindowTokens, ...options.compaction }
     this.logger = options.logger ?? nullLogger
     this.promptContractVersion = options.promptContractVersion ?? PROMPT_CONTRACT_VERSION
@@ -136,7 +138,6 @@ export class AgentRuntime {
     if (!Number.isSafeInteger(this.modelTrace.retentionDays) || this.modelTrace.retentionDays < 1) throw new Error('model trace retentionDays must be a positive integer')
     if (options.modelTrace?.recordPayloads === true) this.recordModelPayloads = true
     this.rootModelBudget = { ...DEFAULT_MODEL_BUDGET, ...options.rootModelBudget }
-    this.smallModel = options.smallModel ?? model
     for (const [name, value] of Object.entries(this.rootModelBudget)) {
       if (!Number.isSafeInteger(value) || value < (name.includes('CostMicrosPerMillion') ? 0 : 1)) throw new Error(`${name} must be a positive safe integer`)
     }
@@ -216,7 +217,7 @@ export class AgentRuntime {
     this.hostsByRun.set(runId,deadlineHost(this.host,signals.lifecycle.signal))
     let activeSession: SessionRecord | null = null
     const log = this.logger.child({ runId, workId: work.id, agentId: work.agentId, fence: work.fence })
-    const model = executionModel(this.hostFor(work), this.model, work, this.rootModelBudget, event => this.event(work, runId, event), this.smallModel)
+    const model = executionModel(this.hostFor(work), this.model, work, this.rootModelBudget, event => this.event(work, runId, event))
 
     try {
       await this.event(work, runId, {
@@ -278,10 +279,18 @@ export class AgentRuntime {
       data: { triggerRef: work.triggerRef },
     })
 
-    const session = await this.restoreSession(work, context)
+    const initialExecution = executionSnapshot(context, this.policy)
+    const session = await this.restoreSession(work, { ...context, tools: initialExecution.tools }, initialExecution)
+    if (context.harness) {
+      const binding = { runtime: releaseVersions.runtime, harness: context.harness.hash, prompt: this.promptContractVersion,
+        model: model.modelId ?? null, provider: model.configurationFingerprint ?? null }
+      const prior = context.executionSteps?.find(step => step.kind === 'runtime.binding')
+      if (prior && canonicalJson(prior.input) !== canonicalJson(binding)) throw new Error('run behavior version changed; restore the pinned worker configuration')
+      if (!prior) await this.hostFor(work).saveStep(work, { id: 'runtime:binding', kind: 'runtime.binding',
+        requestVersion: (session.request?.revisions.length ?? 0) + 1, input: binding, output: '{}', artifacts: [] })
+    }
     sessionRef.session = session
     await this.hostFor(work).saveSession(work, session)
-    const capabilities = this.policy.kernelCapabilities(context)
     const budget = new CorrectionBudget(context.executionCheckpoint)
     let nextStreamPartIndex = 0
     let streamedText = ''
@@ -333,7 +342,11 @@ export class AgentRuntime {
       // Dynamic context stays outside conversational history; memory snapshots
       // are recorded separately with the model call for traceability.
       const liveContext = hop === 0 ? context : await this.hostFor(work).loadContext(work)
-      session.promptContext = buildPromptContext(liveContext, this.policy, session.compactionEpoch, this.promptContractVersion)
+      const execution = hop === 0 ? initialExecution : executionSnapshot(liveContext, this.policy)
+      const { codeExecution } = execution
+      liveContext.tools = execution.tools
+      const modelTools = exposedTools(execution.tools, liveContext.executionSteps ?? [], liveContext.discoveredTools)
+      session.promptContext = buildPromptContext(liveContext, this.policy, session.compactionEpoch, this.promptContractVersion, undefined, execution)
       const preferenceItems = (session.promptContext.blocks ?? []).filter(block => block.trust !== 'platform' && block.trust !== 'product').map(contextItem)
       const dynamicItems = [...preferenceItems, ...this.policy.dynamicContextItems(liveContext)]
       const instructions = session.promptContext.systemInstructions
@@ -343,7 +356,7 @@ export class AgentRuntime {
         `Prior attempt artifact records (untrusted file metadata, not current delivery or proof of file availability). Check the files and call attach_file for any still required deliverables:\n${JSON.stringify(liveContext.priorArtifacts)}` })
       const estimateOverhead = () => estimateTokens([{ role: 'system', content: instructions }, ...supplementalItems])
         + (model.maxOutputTokens ?? 8_192) + (model.maxThinkingTokens ?? 0) + (model.toolDefinitionTokens ?? 1_024)
-        + Buffer.byteLength(JSON.stringify((liveContext.tools ?? []).map(tool => ({ type: 'function', function: { name: tool.name, description: tool.description, parameters: tool.parameters } }))))
+        + Buffer.byteLength(JSON.stringify(modelTools.map(tool => ({ type: 'function', function: { name: tool.name, description: tool.description, parameters: tool.parameters } }))))
       let overheadTokens = estimateOverhead()
       let memoryForModel = liveContext.memory
       if (memoryForModel && estimateTokens(session.history) + overheadTokens > this.compaction.contextWindowTokens * this.compaction.hardRatio) {
@@ -366,7 +379,7 @@ export class AgentRuntime {
       }
 
       const modelItems = observationItems([...session.history, ...supplementalItems], 'turn-context')
-      const modelInput = { instructions, items: modelItems, tools: liveContext.tools ?? [] }
+      const modelInput = { instructions, items: modelItems, tools: modelTools, codeExecution }
       const inputSha256 = createHash('sha256').update(JSON.stringify(modelInput)).digest('hex')
       const modelCallId = model.nextCallId?.() ?? `${work.id}:${work.fence}:model:${hop + 1}`
       const sample = Number.parseInt(inputSha256.slice(0, 8), 16) / 0xffffffff < this.modelTrace.sampleRate
@@ -376,6 +389,7 @@ export class AgentRuntime {
         hop: hop + 1, callId: modelCallId, ...(memoryForModel ? { memorySnapshotId: memoryForModel.id, memorySnapshot: memoryForModel }
           : liveContext.memory ? { memoryOmittedForBudget: true } : {}),
         model: model.modelId ?? 'unknown', providerConfigSha256: model.configurationFingerprint ?? 'unknown', inputSha256,
+        program: promptProgram(session.promptContext.manifest!, execution, model, inputSha256, liveContext.harness?.hash),
         ...(this.recordModelPayloads && sample ? { input: tracePayload(modelInput) } : {}), traceExpiresAt,
         sessionRevision: session.revision, compactionEpoch: session.compactionEpoch,
         prompt: session.promptContext.manifest, promptFingerprint: session.promptContext.fingerprint,
@@ -388,7 +402,8 @@ export class AgentRuntime {
           instructions,
           ...(session.promptContext.manifest ? { prompt: session.promptContext.manifest } : {}),
           items: modelItems,
-          ...(liveContext.tools ? { tools: liveContext.tools } : {}),
+          tools: modelTools,
+          codeExecution,
           signal: signals.lifecycle.signal,
         })
       } catch (error) {
@@ -399,7 +414,9 @@ export class AgentRuntime {
         if (error instanceof ModelDriverError && error.diagnostics.kind === 'protocol' && budget.consume('tool_protocol', errorMessage(error))) {
           protocolCorrection = {
             role: 'user',
-            content: 'Protocol correction: the previous response violated the tool protocol. Reply again with valid structured tools, an ipython call, or the candidate answer.',
+            content: codeExecution === 'enabled'
+              ? 'Protocol correction: the previous response violated the tool protocol. Reply again with valid structured tools, an ipython call, or the candidate answer.'
+              : 'Protocol correction: the previous response violated the tool protocol. Python execution is disabled for this request. Reply with an exposed structured tool or the candidate answer.',
           }
           continue
         }
@@ -486,7 +503,10 @@ export class AgentRuntime {
           data: { violation: 'A partial candidate was returned while execution budget remains', gaps: assessment.gaps } })
         protocolCorrection = { role: 'user', content: 'Your candidate still has unfinished requirements and execution budget remains. '
           + 'Continue any work that can be completed with available authorized capabilities; do not end with a promise to execute it. '
-          + 'Use the actual ipython tool for Python execution. Inspect existing receipts first and never blindly repeat uncertain side effects. '
+          + (codeExecution === 'enabled'
+            ? 'Use the actual ipython tool for Python execution. '
+            : 'Python execution is disabled for this request; use only the exposed direct tools and do not simulate execution. ')
+          + 'Inspect existing receipts first and never blindly repeat uncertain side effects. '
           + 'If a real limitation prevents further progress, explain that limitation and submit the partial or blocked result.' }
         continue
       }
@@ -498,7 +518,7 @@ export class AgentRuntime {
         let resourceGaps: string[] = []
         if (liveContext.pendingApproval?.approved === false) resourceGaps.push('The human rejected the required action; the original requested change was not completed')
         let fileObservations: import('../outcome/verification.js').VerificationRecord[] = []
-        let needsContentCheck = Boolean(session.request && requiresReview(session.request, executedSteps, liveContext.tools ?? [], artifacts) || liveContext.dependencies?.length || artifacts.length || session.request?.contract || session.request?.resourceChecks?.some(record =>
+        let needsContentCheck = Boolean(resourceGaps.length || session.request && requiresReview(session.request, executedSteps, liveContext.tools ?? [], artifacts) || liveContext.dependencies?.length || artifacts.length || session.request?.contract || session.request?.resourceChecks?.some(record =>
           (record.result.value as Record<string, unknown> | undefined)?.['requestVersion'] === session.request!.revisions.length + 1))
         if (!violation) {
           const checked = await this.hostFor(work).verifyCandidate(work, { body: turn.text.trim(), artifacts,
@@ -526,12 +546,14 @@ export class AgentRuntime {
         if (!violation && session.request) {
           const identity = { runId: work.id, cellId: `completion-inspect:${work.fence}:${hop}`, callIndex: 0 }
           const result = await this.hostFor(work).executeAction(work, { ...identity, idempotencyKey: actionKeyOf(identity), action: 'task.inspect', args: {} })
-          const value = result.value as { requestVersion?: number; pending?: Array<{ action: string; state: string }>; truncated?: boolean } | undefined
+          const value = result.value as { requestVersion?: number; pending?: Array<{ action: string; state: string }>; truncated?: boolean; completedBusinessAction?: boolean } | undefined
           if (!result.ok || value?.requestVersion !== (session.request?.revisions.length ?? 0) + 1 || !Array.isArray(value.pending)) {
             resourceGaps.push('Durable business action reconciliation was unavailable')
           } else {
             resourceGaps.push(...value.pending.map(item => `Business action ${item.action} remains ${item.state}; completion is not confirmed`))
             if (value.truncated) resourceGaps.push('Additional unresolved actions exceed the observation limit')
+            const actionGap = businessActionDeliveryGap(session.request, value.completedBusinessAction === true, artifacts.length > 0)
+            if (actionGap) resourceGaps.push(actionGap)
           }
           needsContentCheck ||= resourceGaps.length > 0
           acceptanceGaps = [...resourceGaps]
@@ -627,7 +649,7 @@ export class AgentRuntime {
           const part = nextStreamPartIndex
           nextStreamPartIndex += onlyReads ? 2 : 0
           return this.executeCall(work, runId, session, call, signals, budget, part,
-            this.policy.kernelCapabilities(liveContext), artifacts)
+            execution.grants, artifacts, codeExecution)
         })) } catch (error) {
           if (!(error instanceof ModelBudgetExceededError)) throw error
           acceptanceGaps.push(error.message)
@@ -717,9 +739,27 @@ export class AgentRuntime {
     streamPartIndex: number,
     capabilities: readonly { name: string; methods?: readonly string[] }[],
     artifacts: KernelArtifact[],
+    codeExecution: import('../protocol/types.js').CodeExecutionMode,
   ): Promise<{ nextStreamPartIndex: number; terminal: boolean; correction?: ModelItem }> {
     let nextStreamPartIndex = streamPartIndex
     const receipts: Array<{ action: string; idempotencyKey: string; result: HostActionResult }> = []
+
+    if (call.name === 'ipython' && codeExecution === 'disabled') {
+      const message = 'Python execution is disabled by trusted runtime authorization for this request'
+      session.history.push({
+        type: 'function_call_output', callId: call.callId,
+        output: boundedToolOutput({ error: message, protocolError: true, executionState: 'not_started' }),
+      })
+      await this.event(work, runId, {
+        kind: 'ipython.failed', stage: 'failed', visibility: 'internal',
+        data: { callId: call.callId, error: message, protocolError: true, executionState: 'not_started' },
+      })
+      return {
+        nextStreamPartIndex, terminal: false,
+        correction: this.correctionOrThrow(budget, 'tool_protocol',
+          'Protocol correction: Python execution is disabled for this request. Do not call ipython; use only exposed direct tools or provide a non-executing answer.'),
+      }
+    }
 
     let code: string
     try {
@@ -741,7 +781,9 @@ export class AgentRuntime {
       return {
         nextStreamPartIndex, terminal: false,
         correction: this.correctionOrThrow(budget, 'tool_protocol',
-          `Protocol correction: ${message}. Call ipython once with strict JSON containing exactly one non-empty code string.`),
+          call.name === 'ipython'
+            ? `Protocol correction: ${message}. Call ipython once with strict JSON containing exactly one non-empty code string.`
+            : `Protocol correction: ${message}. Call ${call.name} with one valid JSON object matching its exposed schema.`),
       }
     }
 
@@ -804,7 +846,7 @@ export class AgentRuntime {
       const output = boundedToolOutput({
           stdout: execution.stdout, stderr: execution.stderr, result: execution.result,
           truncated: execution.truncated, artifacts: execution.artifacts, receipts,
-        })
+        }, undefined, capabilities.some(grant => grant.name === 'observations') ? receiptReferences(receipts) : [])
       await this.hostFor(work).saveStep(work, { ...step, output, artifacts: execution.artifacts })
       const failures = receipts.filter(receipt => !receipt.result.ok && !receipt.result.approval)
       let correction: ModelItem | undefined
@@ -929,7 +971,7 @@ export class AgentRuntime {
   // Session restore / prompt-context freezing
   // -------------------------------------------------------------------------
 
-  private async restoreSession(work: WorkItem, context: TurnContext): Promise<SessionRecord> {
+  private async restoreSession(work: WorkItem, context: TurnContext, execution: ExecutionSnapshot): Promise<SessionRecord> {
     const key = sessionKeyOf(work)
     const stored = await this.hostFor(work).loadSession(work, key)
     if (stored && (stored.key !== key || stored.tenantId !== work.tenantId || stored.agentId !== work.agentId
@@ -990,7 +1032,8 @@ export class AgentRuntime {
       }
       session.history.push({
         type: 'function_call_output', callId,
-        output: boundedToolOutput({ recovered: true, localExecutionOutput: 'not_recovered', receipts }),
+        output: boundedToolOutput({ recovered: true, localExecutionOutput: 'not_recovered', receipts }, undefined,
+          execution.tools.some(tool => tool.action === 'observations.read') ? receiptReferences(receipts) : []),
       })
     }
     session.compactionEpoch ??= 0
@@ -1003,7 +1046,7 @@ export class AgentRuntime {
       session.request = snapshotRequest(context)
     }
 
-    session.promptContext = buildPromptContext(context, this.policy, session.compactionEpoch, this.promptContractVersion)
+    session.promptContext = buildPromptContext(context, this.policy, session.compactionEpoch, this.promptContractVersion, undefined, execution)
 
     if (!session.appliedWorkIds.includes(work.id)) {
       session.history.push(...this.policy.turnInputItems(context, session.history.length > 0))

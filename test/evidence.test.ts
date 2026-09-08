@@ -86,7 +86,7 @@ it('freezes source versions, allows prose around citations and does not invent s
     { status: 'partial', verification: 'not_run', requestVersion: 1 }, snapshot)
   assert.equal(envelope.citations[0]?.support, 'not_assessed')
   assert.deepEqual(envelope.citations[0]?.sources, [{ sourceId: 'source', sourceVersion: 'v1', chunkIds: ['chunk'] }])
-  assert.deepEqual(responseSegments(envelope).map((part) => [part.type, part.text]), [
+  assert.deepEqual(responseSegments(envelope).map((part) => [part.type, 'text' in part ? part.text : undefined]), [
     ['text', 'Explanation. '], ['citation', 'First claim'], ['text', ' Further discussion.'],
   ])
   assert.throws(() => createResponseEnvelope('[Unknown](#cite-S2)', envelope.goalOutcome, snapshot), /unknown citation/)

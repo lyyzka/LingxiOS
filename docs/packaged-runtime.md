@@ -10,9 +10,11 @@ The consuming product owns authentication, authorization policy, native services
 
 ## Installation and versions
 
-`packageResources()` returns the package schema and Python runner. Apply the schema in an explicit product migration while holding that product's migration lock. Application startup must call its own migration-readiness check before `createLingxiOS()` and must not execute package DDL.
+`packageResources()` returns the fresh-install schema, the `migration008` upgrade from schema 7, and the Python runner. Apply exactly the appropriate SQL in an explicit product migration while holding that product's migration lock. Application startup must call its own migration-readiness check before `createLingxiOS()` and must not execute package DDL.
 
-Every public entry uses runtime version `2.1.0`, schema `7`, control-plane protocol `5`, Kernel protocol `2`, and assistant message `2`. Consumers should pin the exact npm version and verify the installed schema marker.
+Every public entry uses runtime version `3.0.0`, schema `8`, control-plane protocol `6`, Kernel protocol `2`, and assistant message `2`. Protocol 6 rejects older workers that cannot enforce execution modes. Consumers should pin the exact npm version and verify the installed schema marker. The major release removes `smallModel` and `AGENT_OS_SMALL_MODEL*`; every generation, review, synthesis and compaction call uses the configured primary `model`. Optional embeddings remain a separate vector protocol.
+
+Before upgrading, stop ingress and workers, drain running tasks and explicitly resolve unknown effects and pending approvals. Never backfill an old approval with a new tool hash: the migration leaves the new column NULL. Approval resumption requires a new preview/action identity after the old intent has been settled. A configured `HarnessProfile` pins new runs to its behavior hash; changed profile, authored workflow, tool semantics or worker model configuration blocks recovery under a different deployment. Roll back new-run routing to a retained matching deployment; do not downgrade schema 8 underneath active workers or replay unknown effects. Restoring a schema-7 backup also requires restoring the matching application and accounting for externally committed effects.
 
 The package exports only:
 
@@ -54,3 +56,5 @@ Memory synthesis may propose tenant-scoped experience, skill, or strategy candid
 `listRuns()`, `readDiagnostics()`, `readOperations()`, metrics, and delivery retry APIs expose bounded metadata without prompts, credentials, tool payloads, or lease secrets. Products must authorize tenant, conversation, or platform-administrator scope before calling them.
 
 Use `doctor()` for schema, Python, storage, and isolation readiness. `npm test` includes package-boundary installation. PostgreSQL recovery, capacity, and Linux image checks are separate release gates. Live-model evaluation is opt-in because it requires provider credentials; its report must retain completion rate, failures, latency, token usage, and cost.
+
+`npm run check:release` emits `release-results/qualifications/<source-hash>.json` only after its gates pass. It binds the exact source files, test-set hash, commit, package/protocol/schema versions and environment to the result. Source changes during a check prevent qualification. The report explicitly records live-model and consuming-product integration as not run; deterministic qualification alone does not authorize a production rollout.

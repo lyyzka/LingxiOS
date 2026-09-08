@@ -7,12 +7,24 @@ import { parseFinalCandidate, type GoalAssessment } from './assessment.js'
 
 export function requiresReview(request: RequestSnapshot, steps: readonly ExecutionStep[], tools: readonly ToolDefinition[], artifacts: readonly KernelArtifact[] = []): boolean {
   const actions = steps.filter(step => !step.kind.startsWith('runtime.') && !step.kind.startsWith('task__') && step.kind !== 'discover')
-  // A missing tool call must not turn an omitted file or write into a simple answer.
-  const requestedEffect = request.originalText.split(/[。；;\n]/).some(clause => !/(?:不要|不得|禁止|do not|don't|never)\s*/i.test(clause)
-    && /(?:创建|生成|保存|导出|提交|写入).{0,32}(?:文件|文档|报告|幻灯片|邮件)|\b(?:create|save|write|export|attach)\b.{0,40}\b(?:file|document|report|attachment)\b/i.test(clause))
-  return Boolean(request.contract || request.delegatedAssignment || artifacts.length || actions.length > 1
+  // Compatibility inference only. Products should set deliveryMode='action'
+  // when the request semantically requires a business side effect.
+  const requestedEffect = request.deliveryMode !== 'text' && request.originalText.split(/[。；;\n]/).some(clause => !/(?:不要|不得|禁止|do not|don't|never)\s*/i.test(clause)
+    && /(?:创建|生成|保存|导出|提交|写入|发送|通知|发布|上传|删除|修改|更新|部署|预约|预订|支付).{0,48}(?:文件|文档|报告|幻灯片|邮件|消息|通知|作业|资源|记录|订单|预约)?|\b(?:create|save|write|export|attach|send|notify|publish|submit|upload|delete|update|modify|deploy|book|purchase|pay|post)\b/i.test(clause))
+  return Boolean(request.contract || request.obligations?.length || request.mode === 'execute' || request.delegatedAssignment || artifacts.length || actions.length > 1
     || actions.some(step => step.kind === 'ipython' || tools.find(tool => tool.name === step.kind)?.effect !== 'read')
-    || requestedEffect || request.revisions.length || /\n\s*(?:[-*]|\d+[.)、])\s|(?:然后|并且|同时|多步骤|分步|分别|以及)|\b(?:and|multi-step|step by step)\b/i.test(request.originalText))
+    || request.deliveryMode === 'action' || requestedEffect || request.revisions.length || /\n\s*(?:[-*]|\d+[.)、])\s|(?:然后|并且|同时|多步骤|分步|分别|以及)|\b(?:and|multi-step|step by step)\b/i.test(request.originalText))
+}
+
+/**
+ * Hard completion obligation for requests classified as business actions.
+ * Approval decisions, Python execution alone, prose claims and failed/unknown
+ * receipts are deliberately not accepted as evidence that the action happened.
+ */
+export function businessActionDeliveryGap(request: RequestSnapshot, hasSuccessfulReceipt: boolean, hasCheckedArtifact = false): string | null {
+  const required = request.deliveryMode === 'action' || request.mode === 'execute' && !request.obligations?.length && !hasCheckedArtifact
+  if (!required || hasSuccessfulReceipt) return null
+  return 'Requested business action has no durable successful receipt for the current request version'
 }
 
 export function validateCompletion(body: string, assessment: GoalAssessment | undefined, request: RequestSnapshot,

@@ -44,7 +44,7 @@ it('does not reset repeated failures for timestamps or wording in observations a
 async function fixture(original: string, model: ModelDriver, tools?: TurnContext['tools']) {
   let message: AssistantMessage | undefined, session: SessionRecord | undefined
   const steps: import('../src/control-plane/steps.js').ExecutionStep[] = []
-  const context: TurnContext = { work, persona: { name: 'A', role: 'assistant', instructions: 'Default preference.' }, capabilities: [],
+  const context: TurnContext = { work, persona: { name: 'A', role: 'assistant', instructions: 'Default preference.' }, capabilities: (tools ?? []).map(tool => tool.action.split('.')[0]!),
     messages: [{ ref: work.triggerRef, authorId: 'u', authorName: 'U', authorKind: 'human', body: original, createdAt: 'now' }], ...(tools ? { tools } : {}) }
   const host: HostPort = { ...durableProtocol(), claimWork: async () => null, heartbeat: async () => ({ ok: true }), loadContext: async () => ({ ...context, executionSteps: steps }),
     loadSession: async () => null, saveSession: async (_work, value) => { session = structuredClone(value) },

@@ -47,3 +47,22 @@ it('preserves exact long input and ordered revisions independently of history', 
   assert.equal(child.originalText, text)
   assert.ok(JSON.stringify(requestItems(child)).includes('New constraint'))
 })
+
+it('captures trusted execution and delivery policy and does not let delegation relax disabled code', () => {
+  const base: TurnContext = {
+    work: { id: 'policy', tenantId: 't', agentId: 'a', sessionId: 's', principalId: 'u', kind: 'turn', lane: 'interactive', triggerRef: 'm',
+      fence: 1, homeEpoch: 1, leaseToken: 'token', meta: { codeExecution: 'disabled', deliveryMode: 'action' } },
+    persona: { name: 'Assistant', role: 'assistant', instructions: '' }, capabilities: [],
+    messages: [{ ref: 'm', authorId: 'u', authorName: 'User', authorKind: 'human', body: 'Send the notification.', createdAt: 'now' }],
+  }
+  const parent = snapshotRequest(base)
+  assert.equal(parent.codeExecution, 'disabled')
+  assert.equal(parent.deliveryMode, 'action')
+  const child = snapshotRequest({ ...base, work: { ...base.work, id: 'child', sessionId: 'child-session', meta: {
+    codeExecution: 'enabled', delegation: { parentRequest: parent, parentWorkId: parent.workId, parentRequestVersion: 1,
+      instructionAuthorId: 'helper', assignment: 'Prepare supporting text' },
+  } } })
+  assert.equal(child.codeExecution, 'disabled')
+  assert.equal(child.deliveryMode, undefined)
+  assert.throws(() => snapshotRequest({ ...base, work: { ...base.work, meta: { codeExecution: 'invalid' } } }), /code execution policy/)
+})

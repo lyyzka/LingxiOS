@@ -25,7 +25,7 @@ export async function checkCandidateContent(model: ModelDriver, request: Request
   const revisions = [...(request.inheritedRevisions ?? []), ...request.revisions]
   const input = { workId: request.workId, sourceRef: request.sourceRef, requestVersion: request.revisions.length + 1,
     originalText: request.originalText, revisions, attachments: request.attachments,
-    checklist: request.contract, resourceChecks: request.resourceChecks ?? [], resourceRefreshGaps, body, artifacts, fileObservations, observations }
+    checklist: request.contract, obligations: request.obligations ?? [], resourceChecks: request.resourceChecks ?? [], resourceRefreshGaps, body, artifacts, fileObservations, observations }
   const serialized = JSON.stringify(input)
   const identity = { workId: request.workId, requestVersion: request.revisions.length + 1,
     candidateHash: candidateHash({ body, requestVersion: request.revisions.length + 1, artifacts: [...artifacts] }),
@@ -35,7 +35,7 @@ export async function checkCandidateContent(model: ModelDriver, request: Request
     return { ...identity, missing: [], error: 'Content check input exceeds the model context budget' }
   }
   try {
-    const result = await model.structured({ instructions: prompt.instructions, prompt: prompt.manifest, input, signal })
+    const result = await model.structured({ purpose: 'content-review', instructions: prompt.instructions, prompt: prompt.manifest, input, signal })
     const value = result.value as { missing?: unknown } | null
     const texts = [request.originalText, ...revisions.map(item => item.text)]
     if (!value || !Array.isArray(value.missing) || value.missing.length > 16

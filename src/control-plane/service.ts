@@ -1,6 +1,10 @@
 import { candidateHash, type Candidate, type CandidateVerification } from '../outcome/verification.js'
 import { grantedTools, TASK_TOOLS, parseTaskArgs, type ToolDefinition } from '../tools/catalog.js'
 import { NoEffectError } from '../tools/definition.js'
+import { permitsTool, executionMode } from '../runtime/execution-policy.js'
+import { canonicalJson } from '../context/compiler.js'
+import { toolContractHash } from '../tools/contracts.js'
+import { snapshotObligations } from '../outcome/obligations.js'
 import { modelPricing } from '../model/execution.js'
 import { appendResearchEvidence } from '../context/research-evidence.js'
 import { appendResourceCheck } from '../context/resource-checks.js'
@@ -24,7 +28,7 @@ import { isDeepStrictEqual } from 'node:util'
 import { snapshotEvidence } from '../context/evidence.js'
 import { createResponseEnvelope, snapshotArtifacts } from '../outcome/envelope.js'
 import { parseFinalCandidate } from '../outcome/assessment.js'
-import { requiresReview, validateCompletion } from '../outcome/completion.js'
+import { businessActionDeliveryGap, requiresReview, validateCompletion } from '../outcome/completion.js'
 import type { KernelArtifact } from '../protocol/types.js'
 import { errorMessage } from '../errors.js'
 import { nullLogger, type Logger } from '../logging.js'
@@ -79,15 +83,6 @@ function hashToken(token: string): string {
 }
 
 const RUN_STAGES = new Set(['started', 'delta', 'completed', 'failed', 'cancelled'])
-
-function canonicalJson(value: unknown): string {
-  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`
-  if (value && typeof value === 'object') {
-    const record = value as Record<string, unknown>
-    return `{${Object.keys(record).sort().map((key) => `${JSON.stringify(key)}:${canonicalJson(record[key])}`).join(',')}}`
-  }
-  return JSON.stringify(value) ?? 'null'
-}
 
 export function actionFingerprint(work: Pick<WorkItem, 'tenantId' | 'principalId' | 'agentId' | 'sessionId'>, action: Pick<HostAction, 'action' | 'args'>): string {
   return createHash('sha256').update(canonicalJson({
@@ -395,7 +390,7 @@ export class ControlPlaneService {
     }
     const grants = await this.deps.capabilityResolver.resolve(work)
     if (typeof work.meta?.['text'] === 'string' && !grants.some(grant => grant.name === 'task')) grants.push({ name: 'task', methods: TASK_TOOLS.map(tool => tool.action.split('.')[1]!) })
-    return { work: { ...work, leaseToken: proof.leaseToken }, ...context, executionSteps: steps, ...(checkpoint ? { executionCheckpoint: checkpoint.input as unknown as import('../runtime/corrections.js').ProgressCheckpoint } : {}), grants, dependencies: await this.deps.work.children(work), tools: grantedTools(this.deps.tools ?? TASK_TOOLS, grants), priorArtifacts: [...priorArtifacts.values()] }
+    return { work: { ...work, leaseToken: proof.leaseToken }, ...context, executionSteps: steps, ...(checkpoint ? { executionCheckpoint: checkpoint.input as unknown as import('../runtime/corrections.js').ProgressCheckpoint } : {}), grants, dependencies: await this.deps.work.children(work), tools: grantedTools(this.deps.tools ?? TASK_TOOLS, grants).filter(tool => permitsTool(work, tool)), priorArtifacts: [...priorArtifacts.values()] }
   }
 
   // -------------------------------------------------------------------------
@@ -458,6 +453,15 @@ export class ControlPlaneService {
     }
 
     const tool = (this.deps.tools ?? TASK_TOOLS).find(tool => tool.action === action.action)
+    const contractHash = tool ? toolContractHash(tool) : undefined
+    const existingIntent = await this.deps.actions.findIntent(action.idempotencyKey)
+    if (existingIntent && (existingIntent.workId !== work.id || existingIntent.requestVersion !== requestVersion
+      || existingIntent.tenantId !== work.tenantId || existingIntent.principalId !== (work.principalId ?? null)
+      || existingIntent.agentId !== work.agentId || existingIntent.sessionId !== work.sessionId || existingIntent.threadId !== (work.threadId ?? null)
+      || !isDeepStrictEqual(existingIntent.action, action))) throw new ControlPlaneError(409, 'action identity mismatch; reconcile before replay')
+    if (action.action !== 'task.inspect' && (tool ? !permitsTool(work, tool) : executionMode(work) !== 'execute')) {
+      return reject('mode_forbidden', `execution mode ${executionMode(work)} does not permit ${action.action}`)
+    }
     const options = { requestVersion, deadlineAt: new Date(Date.now() + 30_000).toISOString(),
       signal: AbortSignal.any([AbortSignal.timeout(30_000), ...(signal ? [signal] : [])]) }
     if (tool && Object.keys(action.args).some(key => !Object.hasOwn(tool.parameters.properties, key))) return { ok: false, executionState: 'rejected', code: 'invalid_arguments', error: 'unknown tool argument' }
@@ -469,6 +473,12 @@ export class ControlPlaneService {
       try { await this.deps.actionExecutor.prepare(work, action, options) }
       catch (error) { return reject(error instanceof NoEffectError ? error.code : 'invalid_arguments', errorMessage(error)) }
     }
+    if (existingIntent && existingIntent.toolContractHash !== contractHash) {
+      const prior = await this.deps.actions.find(action.idempotencyKey)
+      if (prior && !prior.approval && prior.executionState !== 'unknown') return prior
+      if (prior?.approval) return reject('tool_contract_changed', 'Tool semantics changed; create a new preview and approval')
+      return { ok: false, executionState: 'unknown', code: 'tool_contract_changed', error: 'Tool semantics changed; settle the existing intent before continuing' }
+    }
     if (tool?.effect !== 'read' && namespace !== 'task') {
       const pending = await this.deps.actions.unsettled(work.id)
       if (pending.some(item => item.actionKey !== action.idempotencyKey)) return {
@@ -479,6 +489,7 @@ export class ControlPlaneService {
     const reservation = await this.deps.actions.reserve(action.idempotencyKey, fingerprint, {
       workId: work.id, tenantId: work.tenantId, principalId: work.principalId ?? null, agentId: work.agentId,
       sessionId: work.sessionId, threadId: work.threadId ?? null, requestVersion, action: structuredClone(action),
+      ...(contractHash ? { toolContractHash: contractHash } : {}),
     })
     const replayed = await this.deps.actions.find(action.idempotencyKey)
     if (replayed && !replayed.approval) {
@@ -502,7 +513,9 @@ export class ControlPlaneService {
           }
         }
         const pending = await this.deps.actions.unsettled(work.id)
-        result = { ok: true, value: { requestVersion, pending: pending.slice(0, 64), truncated: pending.length > 64 } }
+        const sideEffects = (this.deps.tools ?? TASK_TOOLS).filter(candidate => !candidate.action.startsWith('task.') && candidate.effect !== 'read').map(candidate => candidate.action)
+        const completedBusinessAction = await this.deps.actions.hasSuccessfulAction(work.id, requestVersion, sideEffects)
+        result = { ok: true, value: { requestVersion, pending: pending.slice(0, 64), truncated: pending.length > 64, completedBusinessAction } }
       } else if (action.action === 'task.contract') {
         const request = (await this.getSession(proof, sessionKeyOf(work)))?.request
         if (!request || request.workId !== work.id) throw new Error('task contract requires the current request snapshot')
@@ -714,6 +727,10 @@ export class ControlPlaneService {
     try {
       const assessment = message.envelope.assessment
       const gaps: string[] = []
+      const sideEffects = (this.deps.tools ?? TASK_TOOLS).filter(tool => !tool.action.startsWith('task.') && tool.effect !== 'read').map(tool => tool.action)
+      const actionGap = businessActionDeliveryGap(session.request,
+        await this.deps.actions.hasSuccessfulAction(work.id, message.envelope.requestVersion, sideEffects), artifacts.length > 0)
+      if (actionGap) gaps.push(actionGap)
       if (requiresReview(session.request, steps, this.deps.tools ?? TASK_TOOLS, artifacts)
         || (await this.deps.work.children(work)).length) {
         const hash = candidateHash({ body: message.body, requestVersion: message.envelope.requestVersion, artifacts })
@@ -795,6 +812,8 @@ export class ControlPlaneService {
         || (typeof work.meta?.['text'] === 'string' && (work.meta?.['delegation']
           ? session.request.delegatedAssignment !== work.meta['text'] : session.request.originalText !== work.meta['text']))
         || typeof session.request.originalText !== 'string' || !Array.isArray(session.request.revisions)
+        || (session.request.codeExecution !== undefined && !['enabled','disabled'].includes(session.request.codeExecution))
+        || (session.request.deliveryMode !== undefined && !['auto','text','action'].includes(session.request.deliveryMode))
         || !session.request.revisions.every((item) => item && typeof item.id === 'string'
           && typeof item.text === 'string' && typeof item.createdAt === 'string')
       ))
@@ -818,6 +837,21 @@ export class ControlPlaneService {
         || !isDeepStrictEqual(session.request.inheritedRevisions ?? [], [...(parent.inheritedRevisions ?? []), ...parent.revisions])
         : Boolean(session.request.inheritedRevisions?.length)) {
         throw new ControlPlaneError(400, 'inherited human requirements differ from the durable delegation')
+      }
+      const configuredCode = work.meta?.['codeExecution']
+      const expectedCode = parent?.codeExecution === 'disabled' || configuredCode === 'disabled' ? 'disabled'
+        : configuredCode === 'enabled' || parent?.codeExecution === 'enabled' ? 'enabled' : undefined
+      const configuredDelivery = work.meta?.['deliveryMode']
+      if (session.request.codeExecution !== expectedCode
+        || session.request.deliveryMode !== configuredDelivery) {
+        throw new ControlPlaneError(400, 'request execution or delivery policy differs from trusted work metadata')
+      }
+      const parentMode = parent?.mode
+      const expectedMode = parentMode === 'chat' || parentMode === 'read' && executionMode(work) === 'execute'
+        ? parentMode : work.meta?.['mode']
+      if (session.request.mode !== expectedMode) throw new ControlPlaneError(400, 'request mode differs from trusted work metadata')
+      if (!isDeepStrictEqual(snapshotObligations(session.request.obligations ?? []), snapshotObligations(work.meta?.['obligations'] ?? []))) {
+        throw new ControlPlaneError(400, 'delivery obligations differ from trusted work metadata')
       }
     }
     if (session.request) {
@@ -873,6 +907,8 @@ export class ControlPlaneService {
       const next = session.request
       if (!next || next.originalText !== previous.originalText || next.authorId !== previous.authorId
         || next.sourceRef !== previous.sourceRef
+        || next.codeExecution !== previous.codeExecution || next.deliveryMode !== previous.deliveryMode || next.mode !== previous.mode
+        || !isDeepStrictEqual(next.obligations ?? [], previous.obligations ?? [])
 
         || !previous.revisions.every((revision, index) => isDeepStrictEqual(revision, next.revisions[index]))) {
         throw new ControlPlaneError(409, 'acquired request and evidence snapshots cannot be rewritten')

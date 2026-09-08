@@ -1,12 +1,12 @@
 import assert from 'node:assert/strict'
 import { it } from 'node:test'
-import { DEFAULT_MODEL, DEFAULT_SMALL_MODEL, OpenAIChatDriver } from '../src/model/openai.js'
+import { DEFAULT_MODEL, OpenAIChatDriver } from '../src/model/openai.js'
 import { loadWorkerConfig } from '../src/config.js'
 
 it('keeps worker provider options unset unless explicitly configured', async () => {
   const config = loadWorkerConfig({ AGENT_OS_CONTROL_PLANE_URL: 'http://localhost', AGENT_OS_SERVICE_TOKEN: 'test', AGENT_OS_MODEL_API_KEY: 'test' })
   assert.deepEqual(config.model, { id: DEFAULT_MODEL.id, baseUrl: DEFAULT_MODEL.baseUrl, apiKey: 'test' })
-  assert.deepEqual(config.smallModel, { id: DEFAULT_SMALL_MODEL.id, baseUrl: DEFAULT_MODEL.baseUrl, apiKey: 'test' })
+  assert.equal(Object.hasOwn(config, 'smallModel'), false)
   assert.throws(() => loadWorkerConfig({ AGENT_OS_REASONING_EFFORT: 'invalid' }), /REASONING_EFFORT/)
   let calls = 0
   const model = new OpenAIChatDriver(config.model.id, { ...config.model, fetchImpl: async (url, init) => {
@@ -23,12 +23,6 @@ it('keeps worker provider options unset unless explicitly configured', async () 
   await model.structured({ instructions: '', input: {} })
   await model.compact({ instructions: '', items: [] })
   assert.equal(calls, 3)
-  await new OpenAIChatDriver(config.smallModel.id, { ...DEFAULT_SMALL_MODEL, ...config.smallModel, fetchImpl: async (_url, init) => {
-    const body = JSON.parse(String(init?.body))
-    assert.deepEqual({ model: body.model, thinking: body.enable_thinking, budget: body.thinking_budget,
-      effort: body.reasoning_effort, output: body.max_tokens }, { model: DEFAULT_SMALL_MODEL.id, thinking: false, budget: undefined, effort: undefined, output: 2048 })
-    return Response.json({ choices: [{ finish_reason: 'stop', message: { content: '{}' } }] })
-  } }).compact({ instructions: '', items: [] })
 })
 
 it('passes explicitly configured worker reasoning options', async () => {
@@ -80,6 +74,22 @@ it('never invents tool names or call identities', async () => {
     .run({ instructions: '', items: [] })
   assert.equal(result.output.length, 2)
   assert.equal(result.finalCandidate, undefined, 'progress accompanying a tool call is not a final candidate')
+})
+
+it('removes Python from the provider tool surface when code execution is disabled', async () => {
+  let payload: Record<string, unknown> | undefined
+  const model = new OpenAIChatDriver('test', { apiKey: 'test', fetchImpl: async (_url, init) => {
+    payload = JSON.parse(String(init?.body))
+    return new Response('data: {"choices":[{"delta":{"content":"No execution."},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n')
+  } })
+  await model.run({ instructions: '', items: [], codeExecution: 'disabled' })
+  assert.equal(payload?.['tools'], undefined)
+  assert.equal(payload?.['tool_choice'], undefined)
+  assert.equal(payload?.['parallel_tool_calls'], undefined)
+  await model.run({ instructions: '', items: [], tools: [] })
+  assert.equal(payload?.['tools'], undefined, 'an explicit empty tool set must not implicitly enable Python')
+  await assert.rejects(driver({ tool_calls: [{ id: 'call-1', function: { name: 'ipython', arguments: '{"code":"1"}' } }] }, 'tool_calls')
+    .run({ instructions: '', items: [], codeExecution: 'disabled' }), /invalid tool identity/)
 })
 
 it('rejects truncated auxiliary calls and keeps compaction instructions independent', async () => {

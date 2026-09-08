@@ -467,6 +467,16 @@ export class MemoryActionLedger implements ActionLedgerStore {
     }
     return false
   }
+  async hasSuccessfulAction(workId: string, requestVersion: number, actions: readonly string[]): Promise<boolean> {
+    const allowed = new Set(actions)
+    if (!allowed.size) return false
+    for (const [key, intent] of this.intentDetails) {
+      if (intent.workId !== workId || intent.requestVersion !== requestVersion || !allowed.has(intent.action.action)) continue
+      const result = this.effectiveResult(key)
+      if (result?.ok === true && result.executionState !== 'unknown' && result.approval === undefined) return true
+    }
+    return false
+  }
   async unsettled(workId: string) {
     const pending: Array<{ actionKey: string; action: string; state: 'unknown' | 'awaiting_approval' }> = []
     for (const [actionKey, intent] of this.intentDetails) {

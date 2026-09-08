@@ -5,6 +5,7 @@ import type { RequestSnapshot } from '../context/request.js'
 import type { GoalOutcome } from '../protocol/outcome.js'
 import type { WorkItem, WorkLane, WorkStatus } from '../protocol/types.js'
 import type { RequestInput, MessageIdentity } from './index.js'
+import { executionMode } from '../runtime/execution-policy.js'
 
 export interface JobInput extends RequestInput {
   kind: string
@@ -101,7 +102,11 @@ export async function enqueueChild(database: SqlQueryable, parent: Omit<WorkItem
     || input.dependsOn && (input.dependsOn.length > 64 || input.dependsOn.some(id => !id.trim() || id === input.id))) throw new Error('invalid child request')
   const children = await database.query(`SELECT COUNT(*)::int AS count FROM lingxios.agent_work_items WHERE meta->>'parentWorkId'=$1`, [parent.id])
   if (Number(children.rows[0]?.['count']) >= 64) throw new Error('a parent may create at most 64 child tasks')
-  const meta = { ...input.meta, text: input.text, authorName: parent.agentId, attachments: request.attachments,
+  const { harnessHash: _untrustedHarness, mode: _untrustedMode, obligations: _untrustedObligations, codeExecution: childCode, deliveryMode: _untrustedDeliveryMode, ...childMeta } = input.meta ?? {}
+  const inheritedCode = parent.meta?.['codeExecution']
+  const codeExecution = inheritedCode === 'disabled' || childCode === 'disabled' ? 'disabled'
+    : inheritedCode === 'enabled' || childCode === 'enabled' ? 'enabled' : undefined
+  const meta = { ...childMeta, ...(parent.meta?.['harnessHash'] ? { harnessHash: parent.meta['harnessHash'] } : {}), mode: executionMode(parent), ...(codeExecution ? { codeExecution } : {}), text: input.text, authorName: parent.agentId, attachments: request.attachments,
     parentWorkId: parent.id, rootWorkId: parent.meta?.['rootWorkId'] ?? parent.id, parentRequestVersion: version,
     dependsOn: input.dependsOn ?? [], delegation: { parentWorkId: parent.id, rootWorkId: parent.meta?.['rootWorkId'] ?? parent.id,
       parentRequestVersion: version, instructionAuthorId: parent.agentId, parentRequest: request, assignment: input.text } }

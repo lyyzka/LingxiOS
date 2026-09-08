@@ -24,6 +24,14 @@ describe('parseIPythonArguments', () => {
 })
 
 describe('boundedToolOutput', () => {
+  it('keeps escaped previews and observation references within the same hard output bound', () => {
+    const refs = Array.from({ length: 64 }, (_, index) => ({ actionKey: `key-${index}` + 'k'.repeat(100), sha256: 'a'.repeat(64), characters: 20_000 }))
+    const output = boundedToolOutput({ blob: '\\"😀'.repeat(5000) }, 1000, refs)
+    assert.ok(output.length <= 1000)
+    const parsed = JSON.parse(output)
+    assert.ok(parsed.omittedReferences > 0)
+    assert.equal(parsed.observations[0].sha256, refs[0]!.sha256)
+  })
   it('passes small payloads through verbatim', () => {
     assert.equal(boundedToolOutput({ a: 1 }), '{"a":1}')
   })

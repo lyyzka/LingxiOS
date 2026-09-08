@@ -2,9 +2,9 @@ import { AGENT_OS_PROTOCOL_VERSION, KERNEL_PROTOCOL_VERSION } from './protocol/c
 
 /** Release compatibility identifiers; a matching number does not replace startup checks. */
 export const releaseVersions = Object.freeze({
-  runtime: '2.1.0',
+  runtime: '3.0.0',
   controlPlane: AGENT_OS_PROTOCOL_VERSION,
   kernel: KERNEL_PROTOCOL_VERSION,
-  schema: 7,
+  schema: 8,
   assistantMessage: 2,
 } as const)

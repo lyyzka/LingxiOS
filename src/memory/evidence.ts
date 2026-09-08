@@ -3,6 +3,7 @@ import type { RequestSnapshot } from '../context/request.js'
 import type { SqlQueryable } from '../control-plane/pg-store.js'
 import { sessionKeyOf, type AssistantMessage, type WorkItem } from '../protocol/types.js'
 import type { MemoryScope } from './store.js'
+import { currentMemoryScopes, lockMemoryScopes } from './forget.js'
 
 /** Called inside the message commit transaction, never for drafts or progress text. */
 export async function captureMemoryEvidence(database: SqlQueryable, work: Omit<WorkItem, 'leaseToken'>, message: AssistantMessage, scopes: readonly MemoryScope[]) {
@@ -14,14 +15,17 @@ export async function captureMemoryEvidence(database: SqlQueryable, work: Omit<W
   const request = rows[0]?.['request_snapshot'] as RequestSnapshot | undefined
   if (!request || request.workId !== work.id || request.authorId !== work.principalId
     || request.revisions.length + 1 !== message.envelope.requestVersion) throw new Error('memory evidence requires the committed request version')
+  const epochs = await currentMemoryScopes(database, await lockMemoryScopes(database, scopes), work.id)
+  if (!epochs.length) return
+  const currentScopes = scopes.filter(scope => epochs.some(item => item.scopeType === scope.scopeType && item.scopeId === scope.scopeId))
   const input = JSON.stringify({ originalText: request.originalText, inheritedRevisions: request.inheritedRevisions, revisions: request.revisions, attachments: request.attachments })
   const excerpt = (text: string) => text.slice(0, 16_000).replace(/[\uD800-\uDBFF]$/, '')
   const inputText = excerpt(input), assistantText = excerpt(message.body)
   await database.query(`INSERT INTO lingxios.agent_memory_evidence
-    (source_run_id,tenant_id,agent_id,principal_id,session_id,request_version,source_ref,input_sha256,input_text,assistant_text,input_truncated,assistant_truncated,scopes)
-    VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::jsonb) ON CONFLICT(source_run_id) DO NOTHING`,
+    (source_run_id,tenant_id,agent_id,principal_id,session_id,request_version,source_ref,input_sha256,input_text,assistant_text,input_truncated,assistant_truncated,scopes,scope_epochs)
+    VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::jsonb,$14::jsonb) ON CONFLICT(source_run_id) DO NOTHING`,
   [work.id, work.tenantId, work.agentId, work.principalId, work.sessionId, message.envelope.requestVersion, request.sourceRef,
-    createHash('sha256').update(input).digest('hex'), inputText, assistantText, inputText.length < input.length, assistantText.length < message.body.length,JSON.stringify(scopes)])
+    createHash('sha256').update(input).digest('hex'), inputText, assistantText, inputText.length < input.length, assistantText.length < message.body.length,JSON.stringify(currentScopes),JSON.stringify(epochs)])
   // One source per durable job; the current scoped memories provide cross-turn consolidation.
   await database.query(`INSERT INTO lingxios.agent_work_items
     (id,tenant_id,agent_id,principal_id,session_id,thread_id,kind,lane,trigger_ref,meta)

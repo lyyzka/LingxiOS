@@ -7,6 +7,7 @@ import type { HostActionResult } from '../protocol/types.js'
 import { sessionKeyOf, type HostAction, type WorkItem } from '../protocol/types.js'
 import type { ControlPlaneService } from './service.js'
 import { boundedToolOutput } from '../runtime/tool.js'
+import { toolContractHash } from '../tools/contracts.js'
 
 export interface ApprovalIdentity {
   approvalId: string
@@ -19,6 +20,7 @@ export interface ApprovalIdentity {
 export interface ApprovalDecision extends ApprovalIdentity { approved: boolean }
 export type ApprovalLookup = Pick<ApprovalIdentity, 'approvalId' | 'tenantId' | 'principalId'>
 export interface ApprovalSnapshot extends ApprovalIdentity {
+  toolContractHash: string | null
   runId: string
   requestVersion: number
   actionKey: string
@@ -37,10 +39,12 @@ export async function approvalGate(tool: ToolDefinition, context: ActionContext,
   const id = createHash('sha256').update(context.action.idempotencyKey).digest('hex')
   const preview = await tool.preview!(context, input)
   if (Buffer.byteLength(JSON.stringify(preview)) > 64_000) throw new NoEffectError('approval preview exceeds 64 KB')
-  await context.database.query(`INSERT INTO lingxios.agent_approvals(id,action_key,preview)
-    VALUES($1,$2,$3::jsonb) ON CONFLICT DO NOTHING`, [id,context.action.idempotencyKey,JSON.stringify(preview)])
-  const { rows } = await context.database.query('SELECT preview,decision FROM lingxios.agent_approvals WHERE id=$1 FOR UPDATE', [id])
+  const contractHash = toolContractHash(tool)
+  await context.database.query(`INSERT INTO lingxios.agent_approvals(id,action_key,preview,tool_contract_hash)
+    VALUES($1,$2,$3::jsonb,$4) ON CONFLICT DO NOTHING`, [id,context.action.idempotencyKey,JSON.stringify(preview),contractHash])
+  const { rows } = await context.database.query('SELECT preview,decision,tool_contract_hash FROM lingxios.agent_approvals WHERE id=$1 FOR UPDATE', [id])
   const approval = rows[0]!
+  if (approval['tool_contract_hash'] !== contractHash) throw new NoEffectError('Tool semantics changed; request a new preview and approval', 'tool_contract_changed')
   if (approval['decision'] === null) return { ok: false, executionState: 'awaiting_approval', approval: { id, status: 'PENDING' }, value: { preview } }
   if (approval['decision'] === false) return { ok: false, executionState: 'no_effect', code: 'approval_rejected', error: 'The original principal rejected this action' }
   if (!isDeepStrictEqual(approval['preview'], JSON.parse(JSON.stringify(preview)))) throw new NoEffectError('approved resource changed; request a new preview', 'approval_stale')
@@ -69,6 +73,7 @@ export async function readApproval(pool: SqlPool, input: ApprovalLookup): Promis
   return { ...input, runId: String(row['run_id']), agentId: String(row['agent_id']), sessionId: String(row['session_id']),
     ...(row['thread_id'] ? { threadId: String(row['thread_id']) } : {}), requestVersion: Number(row['request_version']),
     actionKey: String(row['action_key']), action: action.action, args: action.args, preview: row['preview'] as Record<string, unknown>,
+    toolContractHash: row['tool_contract_hash'] as string | null,
     decision: row['decision'] as boolean | null, createdAt: new Date(String(row['created_at'])).toISOString(),
     decidedAt: row['decided_at'] ? new Date(String(row['decided_at'])).toISOString() : null, result: row['result'] as HostActionResult | null }
 }

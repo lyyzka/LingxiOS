@@ -496,6 +496,21 @@ export class PgActionLedger implements ActionLedgerStore {
     return rows.length === 1
   }
 
+  async hasSuccessfulAction(workId: string, requestVersion: number, actions: readonly string[]): Promise<boolean> {
+    if (!actions.length) return false
+    const { rows } = await this.pool.query(`SELECT i.idempotency_key FROM lingxios.agent_action_intents i
+      LEFT JOIN lingxios.agent_action_ledger r USING(idempotency_key)
+      LEFT JOIN LATERAL (SELECT resolution->'result' AS result FROM lingxios.agent_action_resolutions
+        WHERE idempotency_key=i.idempotency_key ORDER BY resolution_seq DESC LIMIT 1) rr ON TRUE
+      WHERE i.intent->>'workId'=$1 AND i.intent->'requestVersion'=$2::jsonb
+        AND i.intent->'action'->>'action'=ANY($3::text[])
+        AND COALESCE(rr.result,r.result)->>'ok'='true'
+        AND COALESCE(COALESCE(rr.result,r.result)->>'executionState','')<>'unknown'
+        AND COALESCE(rr.result,r.result)->'approval' IS NULL LIMIT 1`,
+    [workId, JSON.stringify(requestVersion), [...actions]])
+    return rows.length === 1
+  }
+
   async unsettled(workId: string): Promise<Array<{ actionKey: string; action: string; state: 'unknown' | 'awaiting_approval' }>> {
     const { rows } = await this.pool.query(`WITH actions AS (
       SELECT i.idempotency_key,i.intent,COALESCE(rr.result,r.result) AS result

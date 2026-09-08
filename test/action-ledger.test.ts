@@ -28,7 +28,7 @@ it('reserves before execution, blocks concurrent replay and rejects changed argu
   assert.deepEqual(await actions.unsettled('w'), [{ actionKey: action.idempotencyKey, action: 'files.save', state: 'unknown' }])
   assert.deepEqual(await actions.unsettled('other'), [])
   assert.equal((await service.executeAction(work, action)).executionState, 'unknown')
-  await assert.rejects(service.executeAction(work, { ...action, args: { title: 'two' } }), /identity reused/)
+  await assert.rejects(service.executeAction(work, { ...action, args: { title: 'two' } }), /action identity mismatch/)
   finish()
   assert.deepEqual(await first, { ok: true, value: 'saved' })
   assert.deepEqual(await actions.unsettled('w'), [])
@@ -45,12 +45,17 @@ it('does not overwrite intent or replay a receipt without an intent', async () =
   await assert.rejects(ledger.reserve('intent', 'changed', intent), /identity reused/)
   await assert.rejects(ledger.record('orphan', { ok: true }), /intent is required/)
   await assert.rejects(ledger.reserve('wrong', 'fingerprint', intent), /must match/)
+  assert.equal(await ledger.hasSuccessfulAction('w', 1, ['files.save']), false)
   await ledger.record('intent', { ok: false, executionState: 'unknown', error: 'lost' })
+  assert.equal(await ledger.hasSuccessfulAction('w', 1, ['files.save']), false)
   const resolution = { id: 'resolution-1', actionKey: 'intent', result: { ok: true, value: { saved: true } },
     evidence: { source: 'authoritative-readback', version: 2 }, resolvedBy: 'operator:test' }
   assert.equal(await ledger.recordResolution(resolution), 'recorded')
   assert.equal(await ledger.recordResolution(resolution), 'existing')
   assert.deepEqual(await ledger.find('intent'), resolution.result)
+  assert.equal(await ledger.hasSuccessfulAction('w', 1, ['files.save']), true)
+  assert.equal(await ledger.hasSuccessfulAction('w', 2, ['files.save']), false)
+  assert.equal(await ledger.hasSuccessfulAction('w', 1, ['mail.send']), false)
   assert.deepEqual(await ledger.unsettled('w'), [])
   await assert.rejects(ledger.recordResolution({ ...resolution, evidence: { source: 'changed' } }), /identity reused/)
   const service = new ControlPlaneService({ modelBudgets: new MemoryModelBudgetStore(), steps: new MemoryStepStore(),

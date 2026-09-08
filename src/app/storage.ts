@@ -22,16 +22,17 @@ export async function checkStorage(database: SqlQueryable): Promise<void> {
     agent_claim_requests: 'request_id,worker_id,work_kinds,completed,response,created_at',
     agent_run_events: 'run_id,seq,tenant_id,agent_id,kind,stage,visibility,data,recorded_at,expires_at,delivery_work,delivered_at,available_at,claim_token,attempts',
     agent_action_ledger: 'idempotency_key,result,recorded_at',
-    agent_approvals: 'id,action_key,preview,decision,decided_by,decided_at,created_at',
+    agent_approvals: 'id,action_key,preview,tool_contract_hash,decision,decided_by,decided_at,created_at',
     agent_action_intents: 'idempotency_key,fingerprint,intent,recorded_at',
     agent_action_resolutions: 'resolution_id,resolution_seq,idempotency_key,resolution,recorded_at',
     agent_delivery_outbox: 'result_id,delivered_at,available_at,claim_token,attempts',
+    agent_memory_scopes: 'tenant_id,scope_type,scope_id,epoch,forgotten_at',
     agent_memories: 'tenant_id,id,scope_type,scope_id,body,kind,origin,pinned,version,status,source_refs,valid_until,updated_at',
     agent_memory_versions: 'tenant_id,memory_id,version,snapshot,replaced_at',
     agent_memory_embeddings: 'tenant_id,memory_id,version,model_key,model,embedding',
     agent_evolution_benchmarks: 'tenant_id,id,hash,definition,created_at',
     agent_evolution_evaluations: 'tenant_id,memory_id,candidate_version,benchmark_id,baseline,records,verdict,summary,evaluated_at',
-    agent_memory_evidence: 'source_run_id,tenant_id,agent_id,principal_id,session_id,request_version,source_ref,input_sha256,input_text,assistant_text,input_truncated,assistant_truncated,status,created_at',
+    agent_memory_evidence: 'source_run_id,tenant_id,agent_id,principal_id,session_id,request_version,source_ref,input_sha256,input_text,assistant_text,input_truncated,assistant_truncated,status,created_at,scope_epochs',
   }
   for (const [table, columns] of Object.entries(probes)) {
     await database.query(`SELECT ${columns} FROM lingxios.${table} WHERE FALSE`)

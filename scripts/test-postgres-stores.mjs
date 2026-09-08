@@ -2,8 +2,11 @@ import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
 import { readFile } from 'node:fs/promises'
 import { Pool } from 'pg'
-import { PgActionLedger, PgSessionStore, PgWorkStore } from '../dist/src/control-plane/pg-store.js'
+import { PgActionLedger, PgSessionStore, PgWorkStore, withTransaction } from '../dist/src/control-plane/pg-store.js'
 import { hashToken } from '../dist/src/control-plane/memory-store.js'
+import { checkStorage } from '../dist/src/app/storage.js'
+import { forgetMemoryScope } from '../dist/src/memory/forget.js'
+import { writeMemory } from '../dist/src/memory/store.js'
 
 const connectionString = process.env.LINGXIOS_TEST_DATABASE_URL
 if (!connectionString) throw new Error('LINGXIOS_TEST_DATABASE_URL must name an empty disposable PostgreSQL database')
@@ -13,6 +16,12 @@ try {
   assert.equal(existing.rows.length, 0, 'store checks require an empty disposable PostgreSQL database')
   await pool.query("CREATE TABLE public.agent_work_items(company_id text); INSERT INTO public.agent_work_items VALUES('untouched')")
   await pool.query(await readFile(new URL('../db/schema.sql', import.meta.url), 'utf8'))
+  await pool.query(`DROP TABLE lingxios.agent_memory_scopes;
+    ALTER TABLE lingxios.agent_memory_evidence DROP COLUMN scope_epochs;
+    ALTER TABLE lingxios.agent_approvals DROP COLUMN tool_contract_hash;
+    UPDATE lingxios.schema_version SET version=7`)
+  await pool.query(await readFile(new URL('../db/migrations/008-governance.sql', import.meta.url), 'utf8'))
+  await checkStorage(pool)
   let workStore = new PgWorkStore(pool)
   const input = { tenantId: 'tenant', agentId: 'agent', principalId: 'human', sessionId: 'session', kind: 'turn', lane: 'interactive', triggerRef: 'message' }
   await workStore.enqueue({ ...input, id: 'first' })
@@ -20,6 +29,23 @@ try {
   const leased = claims.filter(Boolean)
   assert.equal(leased.length, 1, 'one session must not execute on two workers')
   const original = leased[0]
+  const scope = { tenantId: 'tenant', scopeType: 'user', scopeId: 'human' }
+  const provenance = { actionId: 'memory-before-forget', workId: original.id, request: { workId: original.id, tenantId: 'tenant', authorId: 'human',
+    originalText: 'A preference', revisions: [], attachments: [], sourceRef: 'message' } }
+  const writer = await pool.connect(), forgetter = await pool.connect()
+  try {
+    await writer.query('BEGIN')
+    await writeMemory(writer, scope, { method: 'note', body: 'A preference' }, provenance)
+    await forgetter.query('BEGIN')
+    await forgetter.query("SET LOCAL lock_timeout='100ms'")
+    await assert.rejects(forgetMemoryScope(forgetter, scope), error => error.code === '55P03')
+    await forgetter.query('ROLLBACK')
+    await writer.query('COMMIT')
+  } finally { writer.release(); forgetter.release() }
+  assert.deepEqual(await withTransaction(pool, client => forgetMemoryScope(client, scope)), { epoch: 1 })
+  await assert.rejects(withTransaction(pool, client => writeMemory(client, scope, { method: 'note', body: 'Old source cannot return' },
+    { ...provenance, actionId: 'memory-after-forget' })), /predates forgetting/)
+  assert.equal((await pool.query('SELECT id FROM lingxios.agent_memories')).rows.length, 0)
   await workStore.enqueue({ ...input, id: 'second' })
   assert.equal(await workStore.claim(claims[0] ? 'worker-a' : 'worker-b'), null)
   assert.equal((await pool.query('SELECT * FROM lingxios.agent_os_session_leases')).rows.length, 1)
@@ -82,5 +108,5 @@ try {
   const independent = await Promise.all([workStore.claim('thread-worker-a'), workStore.claim('thread-worker-b')])
   assert.deepEqual(independent.map(item => item.id).sort(), ['thread-a', 'thread-b'])
   assert.deepEqual((await pool.query('SELECT * FROM public.agent_work_items')).rows, [{ company_id: 'untouched' }])
-  console.log('Real PostgreSQL stores passed: competing claims, session exclusion, concurrent intent reservation/CAS, separate-process recovery, stale fencing, cancellation and product-table isolation.')
+  console.log('Real PostgreSQL stores passed: schema 7 migration, atomic memory forgetting, competing claims, session exclusion, concurrent intent reservation/CAS, separate-process recovery, stale fencing, cancellation and product-table isolation.')
 } finally { await pool?.end() }

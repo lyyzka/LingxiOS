@@ -6,7 +6,7 @@ import { KernelManager, type KernelHostBridge, type KernelManagerOptions, type M
 import { kernelIsolation } from '../kernel/isolation.js'
 import { createLogger, type Logger } from '../logging.js'
 import { MetricsRegistry } from '../metrics.js'
-import { OpenAIChatDriver, DEFAULT_MODEL, DEFAULT_SMALL_MODEL } from '../model/openai.js'
+import { OpenAIChatDriver, DEFAULT_MODEL, type OpenAIDriverOptions } from '../model/openai.js'
 import type { ModelDriver } from '../model/driver.js'
 import { AgentRuntime, type AgentRuntimeOptions, type WorkProcessor } from '../runtime/runtime.js'
 import { memorySynthesisProcessor, memoryIndexProcessor, memoryEvaluationProcessor, type EvolutionEvaluator } from '../memory/processor.js'
@@ -15,11 +15,10 @@ import { AgentWorker } from './worker.js'
 export interface WorkerConnection {
   connectWorker(input: { workerId: string; workKinds: readonly string[] }): HostPort
 }
-export type ModelConfiguration = { id?: string; apiKey: string; baseUrl?: string; reasoningEffort?: 'high' | 'max'; maxOutputTokens?: number; maxThinkingTokens?: number; contextWindowTokens?: number }
-export interface WorkerOptions extends Omit<AgentRuntimeOptions, 'rootModelBudget' | 'smallModel'> {
+export type ModelConfiguration = { id?: string } & Omit<OpenAIDriverOptions, 'fetchImpl' | 'sleep' | 'maxAttempts' | 'retryBaseMs'>
+export interface WorkerOptions extends Omit<AgentRuntimeOptions, 'rootModelBudget'> {
   controlPlane: WorkerConnection | { url: string; serviceToken: string }
   model: ModelDriver | ModelConfiguration
-  smallModel?: ModelDriver | ModelConfiguration
   modelBudget?: AgentRuntimeOptions['rootModelBudget']
   processors?: Readonly<Record<string, WorkProcessor | 'conversation'>>
   evolutionEvaluator?: EvolutionEvaluator
@@ -43,14 +42,10 @@ export function createWorker(options: WorkerOptions): AgentWorker {
   const host = 'connectWorker' in connection ? connection.connectWorker({ workerId, workKinds })
     : new HttpHostClient({ baseUrl: connection.url, serviceToken: connection.serviceToken, workerId, workKinds })
   const model = 'run' in options.model ? options.model : new OpenAIChatDriver(options.model.id ?? DEFAULT_MODEL.id, options.model)
-  const smallModel = options.smallModel ? 'run' in options.smallModel ? options.smallModel
-    : new OpenAIChatDriver(options.smallModel.id ?? DEFAULT_SMALL_MODEL.id, { ...DEFAULT_SMALL_MODEL, ...options.smallModel })
-    : 'run' in options.model ? model : new OpenAIChatDriver(DEFAULT_SMALL_MODEL.id, { ...DEFAULT_SMALL_MODEL,
-      apiKey: options.model.apiKey, ...(options.model.baseUrl ? { baseUrl: options.model.baseUrl } : {}) })
   const bridge: KernelHostBridge = { execute: (work, action, signal) => host.executeAction(work, action, signal) }
   const kernels = options.kernelFactory?.(bridge) ?? new KernelManager(bridge, { ...options.kernel, logger, maxKernels: concurrency,
     isolation: kernelIsolation(options.kernel?.isolation ?? process.env['AGENT_OS_KERNEL_ISOLATION'], process.env['NODE_ENV'] === 'production', options.trustProcessKernel) })
-  const runtime = new AgentRuntime(host, model, kernels, { ...options, smallModel, ...(options.modelBudget ? { rootModelBudget: options.modelBudget } : {}) })
+  const runtime = new AgentRuntime(host, model, kernels, { ...options, ...(options.modelBudget ? { rootModelBudget: options.modelBudget } : {}) })
   runtime.registerProcessor('memory_synthesis', memorySynthesisProcessor)
   runtime.registerProcessor('memory_index', memoryIndexProcessor)
   if (options.evolutionEvaluator) runtime.registerProcessor('memory_evaluation', memoryEvaluationProcessor(options.evolutionEvaluator))

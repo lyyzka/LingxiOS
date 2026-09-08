@@ -41,6 +41,62 @@ it('reports every processor model call to the product ledger with durable work s
   assert.ok(observations[0]!.latencyMs >= 0)
 })
 
+it('blocks a forged ipython call at the runtime boundary when code execution is disabled', async () => {
+  const work: TurnContext['work'] = { id: 'no-code', tenantId: 't', agentId: 'a', sessionId: 's', principalId: 'u',
+    kind: 'turn', lane: 'interactive', triggerRef: 'm', fence: 1, homeEpoch: 1, leaseToken: 'token', meta: { codeExecution: 'disabled' } }
+  let turns = 0, kernelCalls = 0
+  let committed: import('../src/protocol/types.js').AssistantMessage | undefined
+  const host: HostPort = { ...durableProtocol(), claimWork: async () => null, heartbeat: async () => ({ ok: true }),
+    loadContext: async () => ({ work, persona: { name: 'A', role: '', instructions: '' }, capabilities: [],
+      messages: [{ ref: 'm', authorId: 'u', authorName: 'U', authorKind: 'human', body: 'Explain why 2 + 2 = 4 without executing code.', createdAt: 'now' }] }),
+    executeAction: async (_work, action) => {
+      assert.equal(action.action, 'task.inspect')
+      return { ok: true, value: { requestVersion: 1, pending: [], truncated: false, completedBusinessAction: false } }
+    }, loadSession: async () => null, saveSession: async () => {}, emitEvent: async () => {},
+    commitResult: async (_work, message) => { committed = message }, completeWork: async () => {}, yieldWork: async () => {} }
+  const usage = { available: false, inputTokens: 0, outputTokens: 0 }
+  const model: ModelDriver = {
+    compact: async () => { throw new Error('unexpected compaction') },
+    structured: async () => ({ value: { missing: [] }, model: 'reviewer', usage }),
+    run: async request => {
+      turns++
+      assert.equal(request.codeExecution, 'disabled')
+      if (turns === 1) return { text: '', output: [{ type: 'function_call', callId: 'forged', name: 'ipython', arguments: '{"code":"print(4)"}' }], usage }
+      assert.match(JSON.stringify(request.items), /Python execution is disabled/)
+      return { text: '2 + 2 = 4 by elementary arithmetic.', output: [{ role: 'assistant', content: '2 + 2 = 4 by elementary arithmetic.' }], usage }
+    },
+  }
+  const kernel: KernelExecutor = { execute: async () => {
+    kernelCalls++
+    throw new Error('kernel must not start when code execution is disabled')
+  } }
+  await new AgentRuntime(host, model, kernel).runWork(work)
+  assert.equal(turns, 2)
+  assert.equal(kernelCalls, 0)
+  assert.equal(committed?.body, '2 + 2 = 4 by elementary arithmetic.')
+})
+
+it('cannot turn an action-mode request into success without a durable successful business receipt', async () => {
+  const work: TurnContext['work'] = { id: 'action-required', tenantId: 't', agentId: 'a', sessionId: 's', principalId: 'u',
+    kind: 'turn', lane: 'interactive', triggerRef: 'm', fence: 1, homeEpoch: 1, leaseToken: 'token', meta: { deliveryMode: 'action' } }
+  let committed: import('../src/protocol/types.js').AssistantMessage | undefined
+  const host: HostPort = { ...durableProtocol(), claimWork: async () => null, heartbeat: async () => ({ ok: true }),
+    loadContext: async () => ({ work, persona: { name: 'A', role: '', instructions: '' }, capabilities: [],
+      messages: [{ ref: 'm', authorId: 'u', authorName: 'U', authorKind: 'human', body: 'Notify the teacher.', createdAt: 'now' }] }),
+    executeAction: async (_work, action) => {
+      assert.equal(action.action, 'task.inspect')
+      return { ok: true, value: { requestVersion: 1, pending: [], truncated: false, completedBusinessAction: false } }
+    }, loadSession: async () => null, saveSession: async () => {}, emitEvent: async () => {},
+    commitResult: async (_work, message) => { committed = message }, completeWork: async () => {}, yieldWork: async () => {} }
+  const usage = { available: false, inputTokens: 0, outputTokens: 0 }
+  const model: ModelDriver = { compact: async () => { throw new Error('unexpected compaction') },
+    structured: async () => ({ value: { missing: [] }, model: 'reviewer', usage }),
+    run: async () => ({ text: 'Done.', output: [{ role: 'assistant', content: 'Done.' }], usage }) }
+  await new AgentRuntime(host, model, { execute: async () => { throw new Error('unexpected kernel') } }).runWork(work)
+  assert.equal(committed?.envelope.goalOutcome.status, 'partial')
+  assert.match(JSON.stringify(committed?.envelope.goalOutcome.gaps), /no durable successful receipt/)
+})
+
 for (const format of ['object', 'plain text'] as const) it(`preserves ${format} content and observed artifacts when assessment correction is exhausted`, async () => {
   const work: TurnContext['work'] = { id: 'w', tenantId: 't', agentId: 'a', sessionId: 's', kind: 'turn', lane: 'interactive', triggerRef: 'm', fence: 1, homeEpoch: 1, leaseToken: 'token' }
   const artifact = { path: 'answer.json', size: 12, mime: 'application/json', sha256: 'a'.repeat(64) }

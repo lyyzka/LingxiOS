@@ -15,6 +15,8 @@ export interface CitationAnnotation {
 }
 
 export interface ResponseEnvelope {
+  /** Filled only by the server during the existing result/outbox transaction. */
+  presentations?: import('../presentation/definition.js').TrustedPresentation[]
   version: 1
   body: string
   requestVersion: number
