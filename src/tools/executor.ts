@@ -15,6 +15,9 @@ import { forgetMemoryScope } from '../memory/forget.js'
 import type { MemoryOptions } from '../memory/runtime.js'
 import { authorizedScopes, identityOf } from '../memory/access.js'
 import { assertObservation, assertToolContract, observeResult } from './contracts.js'
+import { enqueueGraph, readGraph, waitForChildren } from '../collaboration/graphs.js'
+import { createSharedState, readSharedState, updateSharedState } from '../collaboration/state.js'
+import { authorizeConversationWork } from '../collaboration/access.js'
 
 export function toolExecutor(database: SqlPool, definitions: readonly ToolDefinition[],
   createArtifact?: (work: Omit<WorkItem, 'leaseToken'>, input: ArtifactInput) => Promise<KernelArtifact>, memory?: MemoryOptions): ActionExecutor {
@@ -38,6 +41,12 @@ export function toolExecutor(database: SqlPool, definitions: readonly ToolDefini
   function context(work: Omit<WorkItem, 'leaseToken'>, action: HostAction, options: ActionExecutionOptions, db: SqlQueryable = database): ActionContext {
     const write = () => { options.signal.throwIfAborted(); if (db === database) throw new NoEffectError('child mutations require an action transaction') }
     const queryable = db === database ? deadlinePool(database,options.signal) : db
+    const stateScope = (stateId: string) => {
+      if (!work.conversation) throw new NoEffectError('shared state requires an IM conversation')
+      return { tenantId: work.tenantId, conversationId: work.conversation.conversationId, stateId,
+        ...(work.threadId === undefined ? {} : { threadId: work.threadId }) }
+    }
+    const actor = { principalId: work.principalId!, work, actionKey: action.idempotencyKey }
     const authorizeMemory = async (scope: MemoryScope) => {
       write()
       if (!memory || scope.tenantId !== work.tenantId || !(await authorizedScopes(memory,identityOf(work),db)).some(item =>
@@ -51,6 +60,12 @@ export function toolExecutor(database: SqlPool, definitions: readonly ToolDefini
       },
       forgetMemory: async scope => { await authorizeMemory(scope); return forgetMemoryScope(db, scope) },
       requestSnapshot: () => requestSnapshot(queryable, work.id, options.requestVersion),
+      enqueueGraph: input => { write(); return enqueueGraph(db, work, options.requestVersion, input) },
+      readGraph: id => readGraph(queryable, work, options.requestVersion!, id),
+      waitForChildren: ids => { write(); return waitForChildren(db, work, options.requestVersion, ids) },
+      createSharedState: (id, audience) => { write(); return createSharedState(db, stateScope(id), actor, audience) },
+      readSharedState: id => readSharedState(queryable, stateScope(id), actor),
+      updateSharedState: (id, changes) => { write(); return updateSharedState(db, stateScope(id), actor, { operationId: action.idempotencyKey, changes }) },
       enqueueChild: input => { write(); return enqueueChild(db, work, options.requestVersion, input) },
       readChild: async id => readRun(queryable, await childIdentity(queryable, work, id)),
       cancelChild: async id => { write(); return cancelRun(db, await childIdentity(db, work, id)) },
@@ -63,6 +78,7 @@ export function toolExecutor(database: SqlPool, definitions: readonly ToolDefini
   }
   return {
     async reconcile(work, action, options) {
+      await authorizeConversationWork(database, work)
       const tool = definition(action)
       if (!tool.reconcile) return null
       const input = tool.parse(action.args), ctx = context(work, action, options)
@@ -71,6 +87,7 @@ export function toolExecutor(database: SqlPool, definitions: readonly ToolDefini
       return abortable(tool.reconcile(ctx, input), options.signal)
     },
     async prepare(work, action, options) {
+      await authorizeConversationWork(database, work)
       const tool = definition(action)
       let input: Record<string, unknown>
       try { input = tool.parse(action.args) }
@@ -82,6 +99,7 @@ export function toolExecutor(database: SqlPool, definitions: readonly ToolDefini
       const tool = definition(action)
       const input = tool.parse(action.args)
       const run = async (db: SqlQueryable) => {
+        await authorizeConversationWork(db, work, 'execute', true)
         const ctx = context(work, action, options, db)
         await assertToolContract(tool, ctx)
         await tool.authorize(ctx, input)
@@ -91,6 +109,7 @@ export function toolExecutor(database: SqlPool, definitions: readonly ToolDefini
         return pending ?? tool.execute(ctx, input)
       }
       if (tool.effect !== 'transaction') {
+        await authorizeConversationWork(database, work)
         const ctx = context(work, action, options)
         await assertToolContract(tool, ctx)
         await abortable(tool.authorize(ctx, input), options.signal)
@@ -161,6 +180,7 @@ export function toolExecutor(database: SqlPool, definitions: readonly ToolDefini
       } finally { active = false; client.release() }
     },
     async readResource(work, action, options) {
+      await authorizeConversationWork(database, work, 'read')
       const tool = definition(action)
       if (tool.effect !== 'read') throw new NoEffectError('resource check requires a read tool')
       const input = tool.parse(action.args)
@@ -171,6 +191,7 @@ export function toolExecutor(database: SqlPool, definitions: readonly ToolDefini
       return result.value
     },
     async verifyResult(work, action, value, options) {
+      await authorizeConversationWork(database, work, 'read')
       const tool = definition(action)
       if (!tool.verify) return { status: 'inconclusive', evidence: { reason: 'Native tool has no independent resource check' } }
       const input = tool.parse(action.args)

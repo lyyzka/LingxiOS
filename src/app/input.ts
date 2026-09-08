@@ -3,6 +3,7 @@ import { sessionKeyOf, type SteerInput } from '../protocol/types.js'
 import { isDeepStrictEqual } from 'node:util'
 import { snapshotAttachments, type RequestAttachment } from '../context/attachments.js'
 import type { RequestSnapshot } from '../context/request.js'
+import { authorizeRunRead } from '../collaboration/api.js'
 
 export interface InputContinuation {
   runId: string
@@ -26,6 +27,7 @@ export async function continueInput(database: SqlPool, input: InputContinuation)
     || (input.threadId !== undefined && typeof input.threadId !== 'string')) throw new Error('invalid input continuation')
   const attachments = snapshotAttachments(input.attachments ?? [])
   return withTransaction(database, async client => {
+    await authorizeRunRead(client, input, 'execute')
     await client.query("SET LOCAL lock_timeout='5s'")
     await client.query("SET LOCAL statement_timeout='15s'")
     // ponytail: serialize rare human continuations with lease acquisition; shard if contention matters.

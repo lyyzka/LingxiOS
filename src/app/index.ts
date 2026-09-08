@@ -55,6 +55,12 @@ import { grantedTools } from '../tools/catalog.js'
 import { permitsTool } from '../runtime/execution-policy.js'
 import { canonicalJson, textSha256 } from '../context/compiler.js'
 import { toolContractHash } from '../tools/contracts.js'
+import { syncConversation, registerThread, ingestMessage, conversationMessages, imDeliveryContext } from '../collaboration/conversations.js'
+import { authorizeConversationWork, containsAudience, identifier } from '../collaboration/access.js'
+import { collaborationTools } from '../collaboration/tools.js'
+import { authorizeRunRead, createCollaborationAPI } from '../collaboration/api.js'
+import { verifyGraphResults } from '../collaboration/graphs.js'
+import { enqueueChild, requestSnapshot } from './jobs.js'
 
 export interface LingxiOSOptions {
   harness?: HarnessProfile
@@ -113,6 +119,9 @@ export interface MessageIdentity {
   tenantId: string
   agentId: string
   sessionId: string
+  /** Required for IM content reads; legacy server reads keep their existing contract. */
+  principalId?: string
+  threadId?: string
 }
 
 export type ActionResolutionInput = ActionResolution & Pick<RequestInput,
@@ -169,12 +178,16 @@ export async function createLingxiOS(options: LingxiOSOptions) {
     } }
   const memory = options.memory ? createMemoryRuntime(options.database, options.memory, options.modelBudget) : undefined
   const harness = options.harness ? assembleHarness(options.harness) : undefined
+  const nativeCollaboration = collaborationTools()
   const businessTools = [...options.tools ?? [], ...harness?.tools ?? []]
   const skills = [...options.skills ?? [], ...harness?.skills ?? []], presentations = [...options.presentations ?? [], ...harness?.presentations ?? []]
-  const capabilities = options.capabilityResolver ?? { resolve: async () => [...new Set(businessTools.map(tool => tool.action.split('.')[0]!))]
-    .map(name => ({ name, methods: businessTools.filter(tool => tool.action.startsWith(name + '.')).map(tool => tool.action.split('.')[1]!) })) }
+  const capabilities = options.capabilityResolver ?? { resolve: async (work: Omit<WorkItem, 'leaseToken'>) => {
+    const tools = [...businessTools, ...(work.conversation ? nativeCollaboration : [])]
+    return [...new Set(tools.map(tool => tool.action.split('.')[0]!))]
+      .map(name => ({ name, methods: tools.filter(tool => tool.action.startsWith(name + '.')).map(tool => tool.action.split('.')[1]!) }))
+  } }
   const allowed = async (context: import('../tools/definition.js').ActionContext, actions: string[]) => {
-    const tools = grantedTools(businessTools, await capabilities.resolve(context.work)).filter(tool => permitsTool(context.work, tool))
+    const tools = grantedTools(businessTools, await integration.capabilityResolver.resolve(context.work)).filter(tool => permitsTool(context.work, tool))
     if (actions.some(action => !tools.some(tool => tool.action === action))) throw new Error('required capability was revoked or is unavailable in this mode')
   }
   const extensionTools = [...(skills.length ? [skillTool(skills, allowed)] : []), ...(presentations.length ? [presentationTool(presentations, allowed)] : [])]
@@ -182,7 +195,7 @@ export async function createLingxiOS(options: LingxiOSOptions) {
   const helperTools = [...extensionTools, ...(readableTools.length ? [observationTool(readableTools, async (context, actions) => {
     if (actions.every(action => businessTools.some(tool => tool.action === action))) await allowed(context, actions)
   })] : []), ...(businessTools.some(tool => tool.deferred) ? [discoveryTool(businessTools, context => capabilities.resolve(context.work))] : [])]
-  const definitions = [...businessTools, ...helperTools, ...memory?.tools ?? []]
+  const definitions = [...businessTools, ...helperTools, ...nativeCollaboration, ...memory?.tools ?? []]
   const behavior = harness?.context ?? (skills.length || presentations.length ? { id: 'authored', version: '1', hash: '', rules: [], skills: [], presentations: [] } : undefined)
   if (behavior) {
     behavior.skills = skills.map(skillIndex)
@@ -199,14 +212,39 @@ export async function createLingxiOS(options: LingxiOSOptions) {
     actionExecutor: toolExecutor(options.database, definitions, (work, input) => createNativeArtifact(
       resolve(options.homesRoot ?? process.env['AGENT_OS_HOMES_ROOT'] ?? '.agent-os/homes'), work, input), options.memory),
     capabilityResolver: { async resolve(work: Omit<WorkItem, 'leaseToken'>) {
+      await authorizeConversationWork(options.database, work)
       if (memory && ['memory_synthesis','memory_index','memory_evaluation'].includes(work.kind)) return [{ name: work.kind,
         methods: memory.tools.filter(tool => tool.action.startsWith(work.kind + '.')).map(tool => tool.action.split('.')[1]!) }]
-      return [...await capabilities.resolve(work), ...helperTools.map(tool => ({ name: tool.action.split('.')[0]!, methods: [tool.action.split('.')[1]!] })),
+      let grants = await capabilities.resolve(work)
+      if (typeof work.meta?.['parentWorkId'] === 'string') {
+        const ancestors = await options.database.query(`WITH RECURSIVE lineage AS (
+          SELECT parent.*,ARRAY[parent.id] AS path FROM lingxios.agent_work_items parent
+            WHERE parent.id=$1 AND parent.tenant_id=$2 AND parent.principal_id IS NOT DISTINCT FROM $3
+          UNION ALL SELECT parent.*,child.path||parent.id FROM lingxios.agent_work_items parent
+            JOIN lineage child ON parent.id=child.meta->>'parentWorkId' AND parent.tenant_id=child.tenant_id
+              AND parent.principal_id IS NOT DISTINCT FROM child.principal_id
+            WHERE NOT parent.id=ANY(child.path) AND cardinality(child.path)<64
+        ) SELECT * FROM lineage`, [work.meta['parentWorkId'], work.tenantId, work.principalId ?? null])
+        if (!ancestors.rows.some(row => row['id'] === work.meta?.['rootWorkId'])
+          || ancestors.rows.some(row => row['cancel_requested_at'] || !['queued','leased','waiting'].includes(String(row['status'])))) throw new Error('delegation ancestry is no longer authorized')
+        let tools = grantedTools(definitions, grants)
+        for (const row of ancestors.rows) tools = grantedTools(tools, await capabilities.resolve(workItemFromRow(row, '', 1)))
+        grants = [...new Set(tools.map(tool => tool.action.split('.')[0]!))]
+          .map(name => ({ name, methods: tools.filter(tool => tool.action.startsWith(name + '.')).map(tool => tool.action.split('.')[1]!) }))
+      }
+      return [...grants,
+        ...helperTools.map(tool => ({ name: tool.action.split('.')[0]!, methods: [tool.action.split('.')[1]!] })),
         ...memory?[{name:'memory',methods:memory.tools.filter(tool=>tool.action.startsWith('memory.')).map(tool=>tool.action.split('.')[1]!)}]:[]]
     } },
     contextProvider: { async loadContext(work: Omit<WorkItem, 'leaseToken'>) {
       if (behavior && !['memory_synthesis','memory_index','memory_evaluation'].includes(work.kind) && work.meta?.['harnessHash'] !== behavior.hash) throw new Error('harness version mismatch; resume with the pinned deployment or drain the old run')
       const context = { ...await contextProvider.loadContext(work), ...(behavior ? { harness: structuredClone(behavior) } : {}) }
+      if (work.conversation) {
+        if ((context.evidence?.length || context.memory || context.dynamic) && (!context.audience || !containsAudience(context.audience, work.conversation.audience))) {
+          throw new Error('IM context evidence, memory and dynamic data require an authorized audience')
+        }
+        context.messages = await conversationMessages(options.database, work)
+      }
       let discoveredTools: string[] | undefined
       if (businessTools.some(tool => tool.deferred)) {
         const discovered = await options.database.query(`SELECT DISTINCT tool->>'name' AS name FROM lingxios.agent_action_intents i
@@ -226,18 +264,32 @@ export async function createLingxiOS(options: LingxiOSOptions) {
   const sessions = new PgSessionStore(options.database)
   async function flushDeliveries() {
     if (!integration?.delivery) return
-    await flushOutbox(options.database, 'agent_delivery_outbox', (row, context) => {
+    await flushOutbox(options.database, 'agent_delivery_outbox', async (row, context) => {
       const { leaseToken: _token, ...work } = workItemFromRow(row['delivery_work'] as Record<string, unknown>, '', Number(row['home_epoch']))
-      return integration.delivery!.deliverMessage(work, row['message'] as AssistantMessage,
-        { ...context, commit: { resultId: String(row['result_id']), fence: Number(row['result_fence']) } })
+      const resultId = String(row['result_id']), im = await imDeliveryContext(options.database, work, resultId)
+      const receipt = await integration.delivery!.deliverMessage(work, row['message'] as AssistantMessage,
+        { ...context, ...(im ? { im } : {}), commit: { resultId, fence: Number(row['result_fence']) } })
+      if (im) {
+        identifier(receipt?.messageId)
+        const recorded = await options.database.query(`UPDATE lingxios.agent_delivery_outbox SET receipt=$3::jsonb
+          WHERE result_id=$1 AND claim_token=$2 AND (receipt IS NULL OR receipt=$3::jsonb) RETURNING result_id`,
+        [resultId, row['claim_token'], JSON.stringify({ ...receipt, messageKey: im.messageKey, replyKey: im.replyKey })])
+        if (!recorded.rows.length) throw new Error('IM delivery receipt changed or delivery lease was lost')
+      }
     }, { signal: shutdown.signal })
   }
   async function flushEvents() {
     if (!integration?.delivery) return
-    await flushOutbox(options.database, 'agent_run_events', (row, context) => integration.delivery!.onEvent(
-      row['delivery_work'] as Omit<WorkItem, 'leaseToken'>, { runId: String(row['run_id']), seq: Number(row['seq']),
+    await flushOutbox(options.database, 'agent_run_events', async (row, context) => {
+      const work = row['delivery_work'] as Omit<WorkItem, 'leaseToken'>
+      if (work.conversation) {
+        if (work.conversation.internal || row['visibility'] !== 'user') return
+        await authorizeConversationWork(options.database, work, 'speak')
+      }
+      await integration.delivery!.onEvent(work, { runId: String(row['run_id']), seq: Number(row['seq']),
         kind: String(row['kind']), stage: row['stage'] as RunEvent['stage'], visibility: row['visibility'] as RunEvent['visibility'],
-        data: row['data'] as RunEvent['data'] }, context), { signal: shutdown.signal })
+        data: row['data'] as RunEvent['data'] }, context)
+    }, { signal: shutdown.signal })
   }
   async function flushModelUsage() {
     if (!options.onModelCall) return
@@ -246,7 +298,8 @@ export async function createLingxiOS(options: LingxiOSOptions) {
   }
 
   async function verifyNative(work: Omit<WorkItem, 'leaseToken'>, candidate: import('../outcome/verification.js').Candidate, database: SqlQueryable) {
-    if (!options.verifyRun) return []
+    const graphChecks = await verifyGraphResults(database, work, candidate.requestVersion)
+    if (!options.verifyRun) return graphChecks
     const deadlineAt = new Date(Date.now() + 10_000).toISOString(), signal = AbortSignal.any([shutdown.signal,AbortSignal.timeout(10_000)])
     let active = true
     try {
@@ -257,11 +310,12 @@ export async function createLingxiOS(options: LingxiOSOptions) {
         || !['passed','failed','inconclusive'].includes(record.status)) || new Set(records.map(record => record.checker)).size !== records.length) {
         throw new Error('native verification returned invalid acceptance records')
       }
-      return records
+      return [...graphChecks, ...records]
     } finally { active = false }
   }
 
   const service = new ControlPlaneService({
+    authorizeWork: async work => { await authorizeConversationWork(options.database, work) },
     ...memory ? { memory } : {},
     ...(integration?.tools ? { tools: integration.tools } : {}),
     steps: new PgStepStore(options.database),
@@ -302,7 +356,7 @@ export async function createLingxiOS(options: LingxiOSOptions) {
       },
       onEvent: async () => { background('events', flushEvents) },
       deliverMessage: async (work, message) => {
-        const recordMemory = options.memory && !['memory_synthesis','memory_index','memory_evaluation'].includes(work.kind)
+        const recordMemory = options.memory && !work.conversation?.internal && !['memory_synthesis','memory_index','memory_evaluation'].includes(work.kind)
         await persistArtifacts(resolve(options.homesRoot ?? process.env['AGENT_OS_HOMES_ROOT'] ?? '.agent-os/homes'), work, message)
         await withTransaction(options.database, async client => {
           const current = await client.query(
@@ -312,6 +366,7 @@ export async function createLingxiOS(options: LingxiOSOptions) {
                 AND ($3::integer IS NULL OR jsonb_array_length(steer_inputs)+1=$3)
               FOR UPDATE`, [work.id, work.fence, message.envelope.requestVersion])
           if (!current.rows.length) throw new Error('request changed or lease expired before message persistence')
+          await authorizeConversationWork(client, work, work.conversation?.internal ? 'execute' : 'speak', true)
           if (presentations.length) {
             const rendered = await client.query(`SELECT i.intent,r.result FROM lingxios.agent_action_intents i JOIN lingxios.agent_action_ledger r USING(idempotency_key)
               WHERE i.intent->>'workId'=$1 AND (i.intent->>'requestVersion')::integer=$2 AND i.intent->'action'->>'action'='presentation.render'
@@ -369,7 +424,7 @@ export async function createLingxiOS(options: LingxiOSOptions) {
             [work.id, work.fence, status, resultId, JSON.stringify(message.envelope.goalOutcome)])
           await client.query('DELETE FROM lingxios.agent_os_session_leases WHERE work_id=$1 AND fence=$2', [work.id, work.fence])
           if (status !== 'waiting') await cancelDescendants(client, work.id)
-          if (integration.delivery) await client.query('INSERT INTO lingxios.agent_delivery_outbox(result_id) VALUES($1) ON CONFLICT DO NOTHING', [resultId])
+          if (integration.delivery && !work.conversation?.internal) await client.query('INSERT INTO lingxios.agent_delivery_outbox(result_id) VALUES($1) ON CONFLICT DO NOTHING', [resultId])
           await client.query(`INSERT INTO lingxios.agent_run_events(run_id,seq,tenant_id,agent_id,kind,stage,visibility,data,delivery_work)
             SELECT $1,COALESCE(MAX(seq),$2::bigint)+1,$3,$4,'response.committed','completed','user',$5::jsonb,$6::jsonb
             FROM lingxios.agent_run_events WHERE run_id=$1`,
@@ -447,6 +502,12 @@ export async function createLingxiOS(options: LingxiOSOptions) {
       } }
     },
     memory: memory?.api,
+    conversations: {
+      sync: (policy: import('../collaboration/types.js').ConversationPolicy) => syncConversation(options.database, policy),
+      registerThread: (scope: import('../collaboration/types.js').ConversationIdentity & { threadId: string; policyVersion: number }) => registerThread(options.database, scope),
+      ingest: (input: import('../collaboration/types.js').IMMessageInput) => ingestMessage(options.database, input, policyMeta({})),
+    },
+    ...createCollaborationAPI(options.database),
     metrics: () => metrics.expose(),
     listRuns: (query?: RunListQuery) => listRuns(options.database,query),
     readOperations: () => readOperations(options.database),
@@ -548,20 +609,21 @@ export async function createLingxiOS(options: LingxiOSOptions) {
       })
     },
     async enqueueDelegated(input: DelegatedRequestInput) {
-      const { delegation, ...request } = input
-      if (!delegation || delegation.parentRequest.workId !== delegation.parentWorkId
-        || delegation.parentRequest.revisions.length + 1 !== delegation.parentRequestVersion) throw new Error('invalid delegated request')
-      const requestPolicy = policyMeta(request)
-      if (delegation.parentRequest.codeExecution === 'disabled') requestPolicy.codeExecution = 'disabled'
-      const parentMode = delegation.parentRequest.mode
-      if (parentMode === 'chat' || parentMode === 'read' && requestPolicy.mode !== 'chat') requestPolicy.mode = parentMode
-      return service.enqueue({ ...request, kind: 'turn', lane: 'collaboration', triggerRef: request.sourceRef ?? request.id ?? randomUUID(),
-        meta: { ...requestPolicy, text: request.text, authorName: request.authorName ?? 'Agent', attachments: snapshotAttachments(request.attachments ?? []),
-          parentWorkId: delegation.parentWorkId, rootWorkId: delegation.rootWorkId,
-          parentRequestVersion: delegation.parentRequestVersion, delegation: { ...delegation, assignment: request.text } },
+      const delegation = input.delegation
+      if (!delegation) throw new Error('invalid delegated request')
+      return withTransaction(options.database, async db => {
+        const parentRow = (await db.query(`SELECT * FROM lingxios.agent_work_items WHERE id=$1 AND tenant_id=$2 AND principal_id=$3 FOR UPDATE`,
+          [delegation.parentWorkId, input.tenantId, input.principalId])).rows[0]
+        if (!parentRow) throw new Error('delegation parent is outside this principal')
+        const parent = workItemFromRow(parentRow, '', 1), request = await requestSnapshot(db, parent.id, delegation.parentRequestVersion)
+        if (canonicalJson(request) !== canonicalJson(delegation.parentRequest) || delegation.rootWorkId !== (parent.meta?.['rootWorkId'] ?? parent.id)
+          || delegation.instructionAuthorId !== parent.agentId) throw new Error('delegation differs from its durable parent')
+        return enqueueChild(db, parent, delegation.parentRequestVersion, { id: input.id ?? randomUUID(), agentId: input.agentId, text: input.text,
+          sessionId: input.sessionId, ...(input.threadId === undefined ? {} : { threadId: input.threadId }), meta: policyMeta(input) })
       })
     },
     async readMessage(identity: MessageIdentity): Promise<AssistantMessage | null> {
+      await authorizeRunRead(options.database, identity)
       const { rows } = await options.database.query(
         `SELECT result.message FROM lingxios.agent_work_items work JOIN lingxios.agent_results result ON result.id=work.result_id
           WHERE work.id=$1 AND work.tenant_id=$2 AND work.agent_id=$3 AND work.session_id=$4`,
@@ -570,6 +632,7 @@ export async function createLingxiOS(options: LingxiOSOptions) {
       return (rows[0]?.['message'] as AssistantMessage | undefined) ?? null
     },
     async readOutcome(identity: MessageIdentity): Promise<GoalOutcome | null> {
+      await authorizeRunRead(options.database, identity)
       const { rows } = await options.database.query(
         'SELECT goal_outcome FROM lingxios.agent_work_items WHERE id=$1 AND tenant_id=$2 AND agent_id=$3 AND session_id=$4',
         [identity.runId, identity.tenantId, identity.agentId, identity.sessionId],
@@ -577,6 +640,7 @@ export async function createLingxiOS(options: LingxiOSOptions) {
       return (rows[0]?.['goal_outcome'] as GoalOutcome | undefined) ?? null
     },
     async readEvents(identity: MessageIdentity, afterSeq = 0): Promise<{ events: RunEvent[]; nextSeq: number }> {
+      await authorizeRunRead(options.database, identity)
       if (!Number.isSafeInteger(afterSeq) || afterSeq < 0) throw new Error('event cursor must be a non-negative safe integer')
       const { rows } = await options.database.query(`SELECT event.* FROM lingxios.agent_run_events event
         JOIN lingxios.agent_work_items work ON work.id=event.run_id
@@ -589,6 +653,7 @@ export async function createLingxiOS(options: LingxiOSOptions) {
       return { events, nextSeq: events.at(-1)?.seq ?? afterSeq }
     },
     async readUsage(identity: MessageIdentity) {
+      await authorizeRunRead(options.database, identity)
       const { rows } = await options.database.query(`SELECT
         (SELECT COALESCE(MAX(seq),0) FROM lingxios.agent_run_events WHERE run_id=work.id) AS last_seq,
         COUNT(calls.call_id)::integer AS calls,COUNT(calls.call_id) FILTER (WHERE calls.observation IS NULL)::integer AS pending_calls,
@@ -603,6 +668,7 @@ export async function createLingxiOS(options: LingxiOSOptions) {
         estimatedCalls: Number(row['estimated_calls']), inputTokens: Number(row['input_tokens']), outputTokens: Number(row['output_tokens']), costMicros: Number(row['cost_micros']) } : null
     },
     async readDelivery(identity: MessageIdentity): Promise<'pending' | 'delivered' | 'failed' | 'not_observed' | null> {
+      await authorizeRunRead(options.database, identity)
       const { rows } = await options.database.query(
         `SELECT CASE WHEN outbox.result_id IS NULL THEN 'not_observed'
            WHEN outbox.failed_at IS NOT NULL THEN 'failed' WHEN outbox.delivered_at IS NULL THEN 'pending' ELSE 'delivered' END AS state

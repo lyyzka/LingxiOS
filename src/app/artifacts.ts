@@ -9,6 +9,7 @@ import { snapshotArtifacts } from '../outcome/envelope.js'
 import type { AssistantMessage, KernelArtifact, WorkItem } from '../protocol/types.js'
 import type { MessageIdentity, RequestInput } from './index.js'
 import type { ArtifactInput } from '../tools/definition.js'
+import { authorizeRunRead } from '../collaboration/api.js'
 
 export async function createNativeArtifact(homesRoot: string, work: Omit<WorkItem, 'leaseToken'>, input: ArtifactInput) {
   const artifact = snapshotArtifacts([{ path: input.path, mime: input.mime, size: input.bytes.byteLength,
@@ -96,6 +97,7 @@ export async function persistArtifacts(homesRoot: string, work: Omit<WorkItem, '
 
 export async function readArtifact(database: SqlPool, homesRoot: string,
   identity: MessageIdentity & Pick<RequestInput, 'principalId' | 'threadId'>, path: string) {
+  await authorizeRunRead(database, identity)
   if (!identity.principalId?.trim()) throw new Error('authenticated principalId is required')
   const { rows } = await database.query(`SELECT result.message FROM lingxios.agent_work_items work
     JOIN lingxios.agent_results result ON result.id=work.result_id

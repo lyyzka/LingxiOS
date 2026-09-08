@@ -68,6 +68,8 @@ export interface WorkItem {
   triggerRef: string
   /** Human principal whose authorization the work runs under, if any. */
   principalId?: string
+  /** Authenticated IM context. sessionId remains the isolated execution session. */
+  conversation?: import('../collaboration/types.js').WorkConversation
   createdAt?: string
   availableAt?: string
   attempts?: number

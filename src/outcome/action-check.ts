@@ -13,7 +13,7 @@ export async function candidateActions(database: SqlQueryable, workId: string, r
     LEFT JOIN LATERAL (SELECT resolution->'result' AS result FROM lingxios.agent_action_resolutions
       WHERE idempotency_key=intent.idempotency_key ORDER BY resolution_seq DESC LIMIT 1) resolved ON TRUE
     WHERE intent.intent->>'workId'=$1 AND (intent.intent->>'requestVersion')::integer=$2
-      AND intent.intent->'action'->>'action' NOT LIKE 'task.%'
+      AND intent.intent->'action'->>'action' NOT LIKE 'task.%' AND intent.intent->'action'->>'action' NOT LIKE 'graph.%'
       AND NOT (intent.intent->'action'->>'action'=ANY($3::text[]))
     ORDER BY intent.recorded_at,intent.idempotency_key LIMIT 1025`,
   [workId,requestVersion,tools.filter(tool => tool.effect === 'read').map(tool => tool.action)])

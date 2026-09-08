@@ -47,6 +47,7 @@ import type {
 import { isModelItem } from './stores.js'
 
 export interface ControlPlaneDeps {
+  authorizeWork?: (work: Omit<WorkItem, 'leaseToken'>) => Promise<void>
   memory?: {
     prepareReview(work: Omit<WorkItem,'leaseToken'>,action: HostAction): Promise<import('../memory/types.js').MemoryReviewRequest|null>
     recordReview(work: Omit<WorkItem,'leaseToken'>,action: HostAction,hash: string,review: import('../memory/types.js').MemoryReview): Promise<void>
@@ -153,6 +154,7 @@ export class ControlPlaneService {
 
   async reserveModelCall(proof: LeaseProof, callId: string, limits: ModelBudgetLimits) {
     const work = await this.requireLease(proof, { rejectCancelled: true })
+    await this.deps.authorizeWork?.(work)
     const rootWorkId = typeof work.meta?.['rootWorkId'] === 'string' ? work.meta['rootWorkId'] : work.id
     if (!await this.deps.work.ownsBudgetRoot(work, rootWorkId)) throw new ControlPlaneError(409, 'model budget root is outside this work lineage')
     if (!callId || callId.length > 256 || !Number.isSafeInteger(limits?.maxModelCalls) || limits.maxModelCalls < 1
@@ -392,6 +394,7 @@ export class ControlPlaneService {
 
   async loadContext(proof: LeaseProof): Promise<TurnContext> {
     const work = await this.requireLease(proof)
+    await this.deps.authorizeWork?.(work)
     const context = await this.deps.contextProvider.loadContext(work)
     if (typeof work.meta?.['text'] === 'string') {
       context.capabilities = [...new Set([...context.capabilities, 'task'])]
@@ -535,7 +538,7 @@ export class ControlPlaneService {
           }
         }
         const pending = await this.deps.actions.unsettled(work.id)
-        const sideEffects = (this.deps.tools ?? TASK_TOOLS).filter(candidate => !candidate.action.startsWith('task.') && candidate.effect !== 'read').map(candidate => candidate.action)
+        const sideEffects = (this.deps.tools ?? TASK_TOOLS).filter(candidate => !candidate.action.startsWith('task.') && !candidate.action.startsWith('graph.') && candidate.effect !== 'read').map(candidate => candidate.action)
         const completedBusinessAction = await this.deps.actions.hasSuccessfulAction(work.id, requestVersion, sideEffects)
         result = { ok: true, value: { requestVersion, pending: pending.slice(0, 64), truncated: pending.length > 64, completedBusinessAction } }
       } else if (action.action === 'task.contract') {
@@ -749,7 +752,7 @@ export class ControlPlaneService {
     try {
       const assessment = message.envelope.assessment
       const gaps: string[] = []
-      const sideEffects = (this.deps.tools ?? TASK_TOOLS).filter(tool => !tool.action.startsWith('task.') && tool.effect !== 'read').map(tool => tool.action)
+      const sideEffects = (this.deps.tools ?? TASK_TOOLS).filter(tool => !tool.action.startsWith('task.') && !tool.action.startsWith('graph.') && tool.effect !== 'read').map(tool => tool.action)
       const actionGap = businessActionDeliveryGap(session.request,
         await this.deps.actions.hasSuccessfulAction(work.id, message.envelope.requestVersion, sideEffects), artifacts.length > 0)
       if (actionGap) gaps.push(actionGap)
@@ -801,6 +804,7 @@ export class ControlPlaneService {
 
   async getSession(proof: LeaseProof, key: string): Promise<SessionRecord | null> {
     const work = await this.requireLease(proof)
+    await this.deps.authorizeWork?.(work)
     if (key !== sessionKeyOf(work)) throw new ControlPlaneError(403, 'session is outside this work lease')
     const session = await this.deps.sessions.get(key, work.id)
     if (session && (session.tenantId !== work.tenantId || session.agentId !== work.agentId
@@ -812,6 +816,7 @@ export class ControlPlaneService {
 
   async saveSession(proof: LeaseProof, session: SessionRecord): Promise<{ revision: number }> {
     const work = await this.requireLease(proof)
+    await this.deps.authorizeWork?.(work)
     const expectedKey = sessionKeyOf(work)
     if (
       !session || typeof session !== 'object'
@@ -828,6 +833,7 @@ export class ControlPlaneService {
       || (session.request !== undefined && (
         !session.request || session.request.version !== 1 || session.request.workId !== work.id
         || session.request.tenantId !== work.tenantId || session.request.sessionId !== work.sessionId
+        || !isDeepStrictEqual(session.request.conversation, work.conversation)
         || typeof session.request.authorId !== 'string' || typeof session.request.sourceRef !== 'string'
         || session.request.sourceRef !== work.triggerRef
         || (work.principalId !== undefined && session.request.authorId !== work.principalId)

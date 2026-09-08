@@ -35,6 +35,7 @@ export interface RequestSnapshot {
   parentRequestVersion?: number
   instructionAuthor?: { id: string; kind: 'agent' | 'system' }
   delegatedAssignment?: string
+  conversation?: import('../collaboration/types.js').WorkConversation
 }
 
 export function snapshotRequest(context: TurnContext): RequestSnapshot {
@@ -57,7 +58,8 @@ export function snapshotRequest(context: TurnContext): RequestSnapshot {
     const { contract: _contract, resourceChecks: _checks, deliveryMode: _parentDelivery, mode: parentMode, obligations: _parentObligations, codeExecution: parentCode, ...inherited } = structuredClone(parent)
     const codeExecution = parentCode === 'disabled' || configuredCode === 'disabled' ? 'disabled'
       : configuredCode ?? parentCode
-    return { ...inherited, workId: context.work.id, sessionId: context.work.sessionId, sourceRef: message.ref,
+    return { ...inherited, ...(context.work.conversation ? { conversation: structuredClone(context.work.conversation) } : {}),
+      workId: context.work.id, sessionId: context.work.sessionId, sourceRef: message.ref,
       revisions: [], inheritedRevisions: [...(parent.inheritedRevisions ?? []), ...parent.revisions],
       ...(codeExecution ? { codeExecution } : {}),
       ...(obligations.length ? { obligations } : {}),
@@ -71,6 +73,7 @@ export function snapshotRequest(context: TurnContext): RequestSnapshot {
   return {
     version: 1, workId: context.work.id, tenantId: context.work.tenantId,
     sessionId: context.work.sessionId, authorId: message.authorId,
+    ...(context.work.conversation ? { conversation: structuredClone(context.work.conversation) } : {}),
     sourceRef: message.ref, originalText: message.body, revisions: [],
     ...(obligations.length ? { obligations } : {}),
     ...(context.work.meta?.['mode'] !== undefined ? { mode } : {}),

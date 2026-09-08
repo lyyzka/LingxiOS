@@ -60,7 +60,9 @@ export async function recoverWait(database: SqlPool, service: ControlPlaneServic
     if (child.rows[0] && !['queued','leased','waiting'].includes(String(child.rows[0]['status']))) {
       const active = await database.query(`SELECT 1 FROM lingxios.agent_work_items WHERE tenant_id=$1
         AND principal_id IS NOT DISTINCT FROM $2 AND meta->>'parentWorkId'=$3 AND meta->'parentRequestVersion'=$4::jsonb
-        AND status IN ('queued','leased','waiting') LIMIT 1`, [work.tenantId,work.principalId ?? null,work.id,JSON.stringify(requestVersion)])
+        AND (NOT EXISTS(SELECT 1 FROM lingxios.agent_work_waits WHERE parent_work_id=$3 AND request_version=$5 AND task_ref=$6)
+          OR id IN(SELECT jsonb_array_elements_text(children) FROM lingxios.agent_work_waits WHERE parent_work_id=$3 AND request_version=$5 AND task_ref=$6))
+        AND status IN ('queued','leased','waiting') LIMIT 1`, [work.tenantId,work.principalId ?? null,work.id,JSON.stringify(requestVersion),requestVersion,goalOutcome.taskRef])
       if (!active.rows.length) return false
     }
   } else return false

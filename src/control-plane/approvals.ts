@@ -8,6 +8,7 @@ import { sessionKeyOf, type HostAction, type WorkItem } from '../protocol/types.
 import type { ControlPlaneService } from './service.js'
 import { boundedToolOutput } from '../runtime/tool.js'
 import { toolContractHash } from '../tools/contracts.js'
+import { authorizeRunRead } from '../collaboration/api.js'
 
 export interface ApprovalIdentity {
   approvalId: string
@@ -69,6 +70,8 @@ export async function readApproval(pool: SqlPool, input: ApprovalLookup): Promis
     WHERE approval.id=$1 AND work.tenant_id=$2 AND work.principal_id=$3`, [input.approvalId,input.tenantId,input.principalId])
   const row = rows[0]
   if (!row) return null
+  await authorizeRunRead(pool, { runId: String(row['run_id']), tenantId: input.tenantId, principalId: input.principalId,
+    agentId: String(row['agent_id']), sessionId: String(row['session_id']), ...(row['thread_id'] == null ? {} : { threadId: String(row['thread_id']) }) })
   const action = row['action'] as HostAction
   return { ...input, runId: String(row['run_id']), agentId: String(row['agent_id']), sessionId: String(row['session_id']),
     ...(row['thread_id'] ? { threadId: String(row['thread_id']) } : {}), requestVersion: Number(row['request_version']),
@@ -89,6 +92,7 @@ export async function decideApproval(pool: SqlPool, input: ApprovalDecision) {
       WHERE approval.id=$1 AND ${scope} FOR UPDATE OF work,approval`, identityParams(input))
     const row = rows[0]
     if (!row) throw new Error('approval is outside this principal and session')
+    await authorizeRunRead(db, { ...input, runId: String(row['id']) }, 'execute')
     if (row['cancel_requested_at'] || row['current_version'] !== row['approved_version']) throw new Error('approval belongs to a cancelled or revised request')
     if (row['decision'] !== null && row['decision'] !== input.approved) throw new Error('approval already has a different decision')
     await db.query(`UPDATE lingxios.agent_approvals SET decision=$2,decided_at=NOW(),decided_by=$3 WHERE id=$1 AND decision IS NULL`,

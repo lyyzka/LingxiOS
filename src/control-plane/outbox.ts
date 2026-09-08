@@ -19,7 +19,12 @@ const definitions = {
 } satisfies Record<string, { keys: string[]; join?: string; where?: string; select?: string; returning?: string }>
 type Table = keyof typeof definitions
 const pending = new WeakMap<SqlQueryable, Map<Table, Promise<void>>>()
-export interface DeliveryContext { signal: AbortSignal; deadlineAt: string; commit?: { resultId: string; fence: number } }
+export interface DeliveryContext {
+  signal: AbortSignal
+  deadlineAt: string
+  commit?: { resultId: string; fence: number }
+  im?: import('../collaboration/types.js').IMDeliveryContext
+}
 type Deliver = (row: Record<string, unknown>, context: DeliveryContext) => Promise<void>
 
 /** One outstanding batch per channel. Non-abortable native transports cannot block scheduling or pile up promises. */

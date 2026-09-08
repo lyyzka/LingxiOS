@@ -17,6 +17,12 @@ export interface ActionContext {
   writeMemory(scope: import('../memory/store.js').MemoryScope, mutation: import('../memory/store.js').MemoryMutation): Promise<import('../memory/types.js').MemoryDocument | { id: string; deleted: boolean }>
   forgetMemory(scope: import('../memory/store.js').MemoryScope): Promise<{ epoch: number }>
   requestSnapshot(): Promise<import('../context/request.js').RequestSnapshot>
+  enqueueGraph(input: import('../collaboration/types.js').GraphInput): Promise<{ id: string; nodes: Array<{ id: string; workId: string }>; deduplicated: boolean }>
+  readGraph(id: string): Promise<Awaited<ReturnType<typeof import('../collaboration/graphs.js').readGraph>>>
+  waitForChildren(ids: string[]): Promise<import('../protocol/types.js').HostDirective>
+  createSharedState(id: string, audience?: import('../collaboration/types.js').AudienceInput): Promise<import('../collaboration/types.js').SharedStateSnapshot>
+  readSharedState(id: string): Promise<import('../collaboration/types.js').SharedStateSnapshot | null>
+  updateSharedState(id: string, changes: import('../collaboration/types.js').SharedStateChange[]): Promise<import('../collaboration/types.js').SharedStateResult>
   enqueueChild(input: import('../app/jobs.js').ChildInput): Promise<{ id: string; deduplicated: boolean }>
   readChild(id: string): Promise<import('../app/jobs.js').RunSnapshot | null>
   cancelChild(id: string): Promise<boolean>
