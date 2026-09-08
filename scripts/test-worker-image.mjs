@@ -30,19 +30,19 @@ await mkdir('/data/homes/own', { recursive: true })
 await mkdir('/data/homes/sibling', { recursive: true })
 await writeFile('/data/homes/sibling/secret', 'private')
 await writeFile('/tmp/host-secret', 'private')
-if (${apparmor}) {
-  assert.equal((await readFile('/proc/self/attr/current', 'utf8')).trim(), 'lingxios-worker (enforce)')
-  const forbidden = spawnSync('unshare', ['--user', '--map-root-user', '--mount', '--', 'mount', '-t', 'tmpfs', 'tmpfs', '/data/homes/own'], { encoding: 'utf8', timeout: 5000 })
-  assert.ifError(forbidden.error)
-  assert.notEqual(forbidden.status, 0, 'AppArmor must deny mounts outside Bubblewrap setup paths')
-  assert.match(forbidden.stderr, /^mount:.*(?:permission denied|operation not permitted)/im, 'namespace setup must succeed before the mount is rejected')
-}
 const sandbox = sandboxCommand('/data/homes/own', '/app/kernel/runner.py', 'python3',
   { memoryBytes: 512*1024*1024, cpuSeconds: 30, maxProcesses: 512, tmpBytes: 1024*1024 }, false, ['-I', '-c',
   'import os,socket,resource; assert not os.path.exists("/data/homes/sibling"); assert not os.path.exists("/tmp/host-secret"); assert not os.path.exists("/app"); assert resource.getrlimit(resource.RLIMIT_AS)[1]==512*1024*1024; s=socket.socket(); s.settimeout(1); assert s.connect_ex(("192.0.2.1",80))!=0; print("isolated")'])
 const isolation = spawnSync(sandbox.command, sandbox.args, { encoding: 'utf8', timeout: 10000 })
 assert.equal(isolation.status, 0, isolation.stderr)
 assert.equal(isolation.stdout.trim(), 'isolated')
+if (${apparmor}) {
+  assert.equal((await readFile('/proc/self/attr/current', 'utf8')).trim(), 'lingxios-worker (enforce)')
+  const forbidden = spawnSync('unshare', ['--user', '--map-root-user', '--mount', '--propagation=slave', '--', 'mount', '-t', 'tmpfs', 'tmpfs', '/data/homes/own'], { encoding: 'utf8', timeout: 5000 })
+  assert.ifError(forbidden.error)
+  assert.notEqual(forbidden.status, 0, 'AppArmor must deny mounts outside Bubblewrap setup paths')
+  assert.match(forbidden.stderr, /^mount:.*(?:permission denied|operation not permitted)/im, 'namespace setup must succeed before the mount is rejected')
+}
 for (const [code, expected] of [
   ['a=bytearray(1024*1024*1024)', /MemoryError/],
   ['open("/tmp/full", "wb").write(b"x"*(2*1024*1024))', /No space left/],
