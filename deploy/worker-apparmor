@@ -18,15 +18,15 @@ profile lingxios-worker flags=(attach_disconnected,mediate_deleted) {
 
   # Bubblewrap 0.8 constructs its root under /tmp, then pivots twice.
   # The container still has no capabilities in the parent user namespace.
-  mount options=(rw,rslave) -> /,
+  mount options=(rw,rslave) options in (silent) -> /,
   mount fstype=tmpfs -> /tmp/,
-  mount options=(rw,rbind) /tmp/newroot/ -> /tmp/newroot/,
+  mount options=(rw,rbind,silent) /tmp/newroot/ -> /tmp/newroot/,
   pivot_root oldroot=/tmp/oldroot/ /tmp/,
   mount fstype=(tmpfs,proc,devpts) -> /newroot/**,
-  mount options=(rw,rbind) -> /newroot/**,
-  mount options=(rw,bind) -> /newroot/**,
-  remount options=(bind,nosuid) options in (ro,nodev,noexec,relatime,noatime,nodiratime,strictatime) /newroot/**,
-  mount options=(rw,rprivate) -> /oldroot/,
+  mount options=(rw,rbind,silent) -> /newroot/**,
+  mount options=(rw,bind,silent) -> /newroot/**,
+  remount options=(bind,nosuid,silent) options in (ro,nodev,noexec,relatime,noatime,nodiratime,strictatime) /newroot/**,
+  mount options=(rw,rprivate,silent) -> /oldroot/,
   umount /oldroot/,
   pivot_root oldroot=/newroot/ /newroot/,
   umount /,
