@@ -285,8 +285,9 @@ it('isolates tenants and direct audiences, rejects malformed state and rechecks 
 })
 
 it('reauthorizes IM approvals and prevents cancelled workers from writing shared state', async () => {
-  let effects = 0
-  const f = await setup({ tools: [{ name: 'documents__save', action: 'documents.save', description: 'Save with approval.',
+  let effects = 0, publicEvents = 0
+  const f = await setup({ delivery: { onEvent: async () => { publicEvents++ }, deliverMessage: async () => ({ messageId: 'unused' }) },
+    tools: [{ name: 'documents__save', action: 'documents.save', description: 'Save with approval.',
     effect: 'transaction', approval: true, parameters: { type: 'object', properties: {}, additionalProperties: false },
     parse: () => ({}), authorize: async () => {}, preview: async () => ({ version: 1 }),
     execute: async () => { effects++; return { ok: true, value: { saved: true } } },
@@ -310,5 +311,13 @@ it('reauthorizes IM approvals and prevents cancelled workers from writing shared
     await assert.rejects(f.action(work, 'late-state', 'shared_state.update', { id: scope.stateId,
       changes: [{ field: 'title', expectedVersion: 0, value: 'late' }] }), /cancel/)
     assert.deepEqual((await f.control.sharedState.read(scope))!.fields, {})
+    await f.host.emitEvent(work, { runId: work.id, seq: 1, kind: 'model.delta', stage: 'delta', visibility: 'user', data: { partType: 'text', delta: 'Late cancelled output' } })
+    for (let n = 0; n < 80; n++) {
+      const flushed = (await f.db.query<{ delivered_at: unknown }>('SELECT delivered_at FROM lingxios.agent_run_events WHERE run_id=$1 AND seq=1', [work.id])).rows[0]
+      if (flushed?.['delivered_at']) break
+      await delay(25)
+    }
+    assert.ok((await f.db.query<{ delivered_at: unknown }>('SELECT delivered_at FROM lingxios.agent_run_events WHERE run_id=$1 AND seq=1', [work.id])).rows[0]!['delivered_at'])
+    assert.equal(publicEvents, 0)
   } finally { await f.close() }
 })

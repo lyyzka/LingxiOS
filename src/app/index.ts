@@ -284,6 +284,9 @@ export async function createLingxiOS(options: LingxiOSOptions) {
       const work = row['delivery_work'] as Omit<WorkItem, 'leaseToken'>
       if (work.conversation) {
         if (work.conversation.internal || row['visibility'] !== 'user') return
+        const current = await options.database.query(`SELECT 1 FROM lingxios.agent_work_items
+          WHERE id=$1 AND fence=$2 AND cancel_requested_at IS NULL`, [work.id, work.fence])
+        if (!current.rows.length) return
         await authorizeConversationWork(options.database, work, 'speak')
       }
       await integration.delivery!.onEvent(work, { runId: String(row['run_id']), seq: Number(row['seq']),
