@@ -525,7 +525,7 @@ export async function createLingxiOS(options: LingxiOSOptions) {
   const notificationListener = options.performance?.notifications === false ? Promise.resolve() : listenWakeups(notificationPool, channel => {
     if (channel === 'work') workWakeup.notify()
     runWakeup.notify()
-    flushDeliveryChannels()
+    if (channel === 'outbox') flushDeliveryChannels()
   }, shutdown.signal, logger)
   let stopPromise: Promise<void> | undefined
   let listening: Promise<number> | undefined
