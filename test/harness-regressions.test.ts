@@ -149,18 +149,20 @@ it('enforces modes, scoped observations, skill revocation, exact obligations and
 it('migrates existing schema 7 without approving old semantics and rejects accidental reapplication', async () => {
   const db = new PGlite()
   try {
-    await db.exec(await readFile(new URL('../../db/schema.sql', import.meta.url), 'utf8'))
+    await db.exec(await readFile(new URL('../../test/fixtures/schema-8.sql', import.meta.url), 'utf8'))
     await db.exec(`DROP TABLE lingxios.agent_memory_scopes;
       ALTER TABLE lingxios.agent_memory_evidence DROP COLUMN scope_epochs;
       ALTER TABLE lingxios.agent_approvals DROP COLUMN tool_contract_hash;
       UPDATE lingxios.schema_version SET version=7`)
     const migration = await readFile(new URL('../../db/migrations/008-governance.sql', import.meta.url), 'utf8')
     await db.exec(migration)
-    await checkStorage({ query: async (sql, params) => ({ rows: (await db.query<Record<string, unknown>>(sql, params)).rows, rowCount: null }) })
     assert.deepEqual((await db.query('SELECT version FROM lingxios.schema_version')).rows, [{ version: 8 }])
     const defaults = await db.query<Record<string, unknown>>("SELECT column_default FROM information_schema.columns WHERE table_schema='lingxios' AND table_name='agent_approvals' AND column_name='tool_contract_hash'")
     assert.equal(defaults.rows[0]?.['column_default'], null)
     await assert.rejects(db.exec(migration), /requires schema version 7/)
+    await db.exec('ROLLBACK')
+    await db.exec(await readFile(new URL('../../db/migrations/009-cognitive-memory-reset.sql',import.meta.url),'utf8'))
+    await checkStorage({ query: async (sql, params) => ({ rows: (await db.query<Record<string, unknown>>(sql, params)).rows, rowCount: null }) })
   } finally { await db.close() }
 })
 

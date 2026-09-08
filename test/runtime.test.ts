@@ -165,12 +165,15 @@ it('drops optional recalled memory before allowing it to crowd out the original 
     claimWork: async () => null, heartbeat: async () => ({ ok: true }),
     loadContext: async () => ({ work, persona: { name: 'A', role: '', instructions: '' }, capabilities: [],
       messages: [{ ref: 'm', authorId: 'u', authorName: 'U', authorKind: 'human', body: original, createdAt: 'now' }],
-      memory: { id: 'large-memory', status: 'available', omitted: 0, items: [{ body: 'optional memory '.repeat(750) }] } }),
+      memory: { id: 'large-memory', status: 'available', omitted:{core:0,directory:0,recalled:0,strategies:0},core:[],directory:[],recalled:[],
+        strategies:[{body:'optional memory '.repeat(750)}],budget:{ratio:0.08,maxTokens:8000},retrieval:['keyword'] } }),
     executeAction: async (_work, action) => {
       assert.equal(action.action, 'task.inspect')
       return { ok: true, value: { requestVersion: 1, pending: [], truncated: false } }
     }, loadSession: async () => null, saveSession: async () => {},
-    emitEvent: async (_work, event) => { if (event.kind === 'model.started') { omitted = event.data['memoryOmittedForBudget'] === true; assert.equal(event.data['memorySnapshot'], undefined) } },
+    emitEvent: async (_work, event) => { if (event.kind === 'model.started') {
+      omitted=event.data['memoryOmittedForBudget']===true || Number((event.data['memorySnapshot'] as {omitted?:{strategies:number}}|undefined)?.omitted?.strategies)>0
+    } },
     commitResult: async (_work, message) => {
       assert.equal(message.body, 'Answer.')
       assert.deepEqual(message.envelope.goalOutcome, { status: 'satisfied', verification: 'not_run', requestVersion: 1 })

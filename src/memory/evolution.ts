@@ -5,6 +5,7 @@ import type { WorkItem } from '../protocol/types.js'
 import type { MemoryScope } from './store.js'
 import { memoryWriteBody, type MemoryWritePolicy } from './policy.js'
 import { lockMemoryScopes, sameMemoryEpochs, type MemoryEpoch } from './forget.js'
+import { memorySearchText } from './text.js'
 
 export interface EvolutionCandidate { kind: 'experience' | 'skill' | 'strategy'; scopeType: string; body: string }
 export interface EvolutionCase { id: string; split: 'target' | 'holdout'; input: unknown }
@@ -71,8 +72,7 @@ export async function proposeEvolution(database: SqlQueryable, work: Omit<WorkIt
     JOIN lingxios.agent_evolution_benchmarks benchmark ON benchmark.tenant_id=e.tenant_id AND benchmark.id=$6
     WHERE job.id=$1 AND job.fence=$2 AND job.kind='memory_synthesis' AND job.status='leased'
       AND job.lease_expires_at>NOW() AND job.cancel_requested_at IS NULL
-      AND job.tenant_id=e.tenant_id AND job.agent_id=e.agent_id AND job.principal_id=e.principal_id AND job.session_id=e.session_id
-      AND source.session_id=job.session_id AND source.thread_id IS NOT DISTINCT FROM job.thread_id
+      AND job.tenant_id=e.tenant_id AND job.agent_id=e.agent_id AND job.principal_id=e.principal_id
       AND e.tenant_id=$3 AND e.agent_id=$4 AND e.principal_id=$5 AND e.status='processed'
       AND source.cancel_requested_at IS NULL AND source.status IN ('succeeded','partial') AND source.result_id IS NOT NULL
       AND e.request_version=jsonb_array_length(source.steer_inputs)+1 FOR UPDATE OF source,e`,
@@ -92,10 +92,10 @@ export async function proposeEvolution(database: SqlQueryable, work: Omit<WorkIt
     const id = `evolution:${digest([work.id,candidate])}`
     const baseline = (await database.query(`SELECT * FROM lingxios.agent_memories WHERE tenant_id=$1 AND scope_type=$2
       AND scope_id=$3 AND kind=$4 AND origin='evolved' AND status='active'`, [scope.tenantId,scope.scopeType,scope.scopeId,candidate.kind])).rows[0]
-    await database.query(`INSERT INTO lingxios.agent_memories(tenant_id,id,scope_type,scope_id,kind,body,origin,status,source_refs)
-      VALUES($1,$2,$3,$4,$5,$6,'evolved','candidate',$7::jsonb) ON CONFLICT(tenant_id,id) DO NOTHING`,
+    await database.query(`INSERT INTO lingxios.agent_memories(tenant_id,id,scope_type,scope_id,kind,body,origin,status,source_refs,path,title,description,search_text)
+      VALUES($1,$2,$3,$4,$5,$6,'evolved','candidate',$7::jsonb,$8,$5,'Independently evaluated procedure',$9) ON CONFLICT(tenant_id,id) DO NOTHING`,
     [scope.tenantId,id,scope.scopeType,scope.scopeId,candidate.kind,body,JSON.stringify([{ workId: source['source_run_id'],
-      resultId: source['result_id'], requestVersion: source['request_version'], inputSha256: source['input_sha256'] }])])
+      resultId: source['result_id'], requestVersion: source['request_version'], inputSha256: source['input_sha256'] }]),`evolution/${digest(id)}.md`,memorySearchText(body)])
     await database.query(`INSERT INTO lingxios.agent_evolution_evaluations(tenant_id,memory_id,candidate_version,benchmark_id,baseline)
       VALUES($1,$2,1,$3,$4::jsonb) ON CONFLICT(tenant_id,memory_id) DO NOTHING`,
     [scope.tenantId,id,benchmarkId,JSON.stringify(baseline ? { reference: referenceOf(baseline), candidate: candidateOf(baseline) } : null)])

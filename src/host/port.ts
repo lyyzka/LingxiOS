@@ -10,6 +10,9 @@ import type {
 import type { ModelBudgetLimits, ModelBudgetReservation } from '../control-plane/stores.js'
 
 export interface HostPort {
+  /** Private worker review channel; it is not exposed through the agent tool catalog or Kernel SDK. */
+  prepareMemoryReview?(work: WorkItem,action: HostAction,signal?: AbortSignal): Promise<import('../memory/types.js').MemoryReviewRequest | null>
+  recordMemoryReview?(work: WorkItem,action: HostAction,hash: string,review: import('../memory/types.js').MemoryReview,signal?: AbortSignal): Promise<void>
   verifyCandidate(work: WorkItem, candidate: import('../outcome/verification.js').Candidate, signal?: AbortSignal): Promise<import('../outcome/verification.js').CandidateVerification>
   saveStep(work: WorkItem, step: import('../control-plane/steps.js').ExecutionStep, signal?: AbortSignal): Promise<void>
   /** Claim one queued work item, or null when none is available. */

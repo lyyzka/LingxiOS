@@ -11,6 +11,7 @@ import type { ModelDriver } from '../model/driver.js'
 import { AgentRuntime, type AgentRuntimeOptions, type WorkProcessor } from '../runtime/runtime.js'
 import { memorySynthesisProcessor, memoryIndexProcessor, memoryEvaluationProcessor, type EvolutionEvaluator } from '../memory/processor.js'
 import { AgentWorker } from './worker.js'
+import { reviewedMemoryHost } from '../memory/worker-review.js'
 
 export interface WorkerConnection {
   connectWorker(input: { workerId: string; workKinds: readonly string[] }): HostPort
@@ -39,9 +40,10 @@ export function createWorker(options: WorkerOptions): AgentWorker {
   const metrics = options.metrics ?? new MetricsRegistry()
   const workKinds = ['turn', 'resume', 'memory_synthesis', 'memory_index', ...options.evolutionEvaluator ? ['memory_evaluation'] : [], ...Object.keys(options.processors ?? {})]
   const connection = options.controlPlane
-  const host = 'connectWorker' in connection ? connection.connectWorker({ workerId, workKinds })
+  const connectionHost = 'connectWorker' in connection ? connection.connectWorker({ workerId, workKinds })
     : new HttpHostClient({ baseUrl: connection.url, serviceToken: connection.serviceToken, workerId, workKinds })
   const model = 'run' in options.model ? options.model : new OpenAIChatDriver(options.model.id ?? DEFAULT_MODEL.id, options.model)
+  const host = reviewedMemoryHost(connectionHost,model,options.modelBudget)
   const bridge: KernelHostBridge = { execute: (work, action, signal) => host.executeAction(work, action, signal) }
   const kernels = options.kernelFactory?.(bridge) ?? new KernelManager(bridge, { ...options.kernel, logger, maxKernels: concurrency,
     isolation: kernelIsolation(options.kernel?.isolation ?? process.env['AGENT_OS_KERNEL_ISOLATION'], process.env['NODE_ENV'] === 'production', options.trustProcessKernel) })

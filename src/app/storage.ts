@@ -27,12 +27,16 @@ export async function checkStorage(database: SqlQueryable): Promise<void> {
     agent_action_resolutions: 'resolution_id,resolution_seq,idempotency_key,resolution,recorded_at',
     agent_delivery_outbox: 'result_id,delivered_at,available_at,claim_token,attempts',
     agent_memory_scopes: 'tenant_id,scope_type,scope_id,epoch,forgotten_at',
-    agent_memories: 'tenant_id,id,scope_type,scope_id,body,kind,origin,pinned,version,status,source_refs,valid_until,updated_at',
+    agent_memories: 'tenant_id,id,scope_type,scope_id,path,title,description,layer,body,kind,origin,pinned,version,status,source_refs,valid_until,updated_at,search_text,search_vector',
     agent_memory_versions: 'tenant_id,memory_id,version,snapshot,replaced_at',
     agent_memory_embeddings: 'tenant_id,memory_id,version,model_key,model,embedding',
     agent_evolution_benchmarks: 'tenant_id,id,hash,definition,created_at',
     agent_evolution_evaluations: 'tenant_id,memory_id,candidate_version,benchmark_id,baseline,records,verdict,summary,evaluated_at',
     agent_memory_evidence: 'source_run_id,tenant_id,agent_id,principal_id,session_id,request_version,source_ref,input_sha256,input_text,assistant_text,input_truncated,assistant_truncated,status,created_at,scope_epochs',
+    agent_memory_evidence_scopes: 'tenant_id,agent_id,principal_id,scope_type,scope_id,epoch,source_run_id,status,job_id,created_at',
+    agent_memory_commands: 'tenant_id,scope_type,scope_id,epoch,action_id,fingerprint,result',
+    agent_memory_reviews: 'action_id,tenant_id,scope_type,scope_id,work_id,fence,request_version,epoch,preview_hash,review',
+    agent_memory_conflicts: 'id,tenant_id,scope_type,scope_id,source_run_ids,memory_ids,reason,created_at',
   }
   for (const [table, columns] of Object.entries(probes)) {
     await database.query(`SELECT ${columns} FROM lingxios.${table} WHERE FALSE`)

@@ -179,6 +179,11 @@ export class ControlPlaneServer {
             json(res, 200, await service.recoverStep(proof, stringField(body, 'cellId'))); return
           case 'verify':
             json(res, 200, await service.verifyCandidate(proof, body['candidate'] as never)); return
+          case 'memory-review':
+            json(res,200,await service.prepareMemoryReview(proof,body['action'] as never)); return
+          case 'memory-review-result':
+            await service.recordMemoryReview(proof,body['action'] as never,stringField(body,'hash'),body['review'] as never)
+            json(res,200,{ok:true}); return
           case 'checkpoint':
             await service.saveStep(proof, body['step'] as never); json(res, 200, { ok: true }); return
           case 'artifacts':

@@ -40,7 +40,10 @@ export { DefaultRuntimePolicy, type RuntimePolicy } from './runtime/policy.js'
 export { executionSnapshot, type ExecutionSnapshot, type HarnessMode } from './runtime/execution-policy.js'
 export type { ModelCallObservation, ModelCallObserver } from './runtime/runtime.js'
 export type { CapabilityGrant, CodeExecutionMode, ContextMessage, ModelItem, PromptContext, TurnContext, WorkItem } from './protocol/types.js'
-export { recallMemories, readMemory, writeMemory, type MemoryScope, type MemoryMutation } from './memory/store.js'
+export type { MemoryIdentity, MemoryScope, MemoryLayer, MemorySource, MemoryDocument, MemoryEntry, MemoryPage, MemoryListQuery,
+  MemorySearchQuery, MemoryHit, MemoryHistoryHit, MemorySearchResult, MemoryContent, MemoryChange, MemoryApplyInput,
+  MemoryApplyResult, MemoryVersion, MemoryRestoreInput, MemoryDiagnostics, MemorySnapshot } from './memory/types.js'
+export type { MemoryAPI } from './memory/service.js'
 export type { MemoryOptions } from './memory/runtime.js'
 export type { MemoryWritePolicy, MemoryWriteInput, MemoryWriteDecision } from './memory/policy.js'
 export type { EvolutionBenchmark, EvolutionCase, EvolutionCandidate, EvolutionReport, EvolutionReference } from './memory/evolution.js'

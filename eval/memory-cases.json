@@ -1,0 +1,59 @@
+{
+  "version": 1,
+  "cases": [
+    {
+      "id": "preference-continuity",
+      "turns": [
+        {"text": "请明确保存我的学习偏好：先用图表，再给具体示例。", "fixtureBody": "学习偏好：先用图表，再给具体示例。"},
+        {"text": "今天只讨论任务安排，请保留之前保存的学习偏好。"}
+      ],
+      "query": "学习 图表", "required": ["图表", "具体示例"], "forbidden": [],
+      "rubric": "The original preference survives an unrelated conversation in another session."
+    },
+    {
+      "id": "explicit-correction",
+      "turns": [
+        {"text": "Remember my preferred package manager is npm.", "fixtureBody": "Preferred package manager: npm."},
+        {"text": "Correct my saved package manager preference: it is now pnpm. Replace the previous preference.", "fixtureBody": "Preferred package manager: pnpm."}
+      ],
+      "query": "package manager", "required": ["pnpm"], "forbidden": ["manager: npm"],
+      "rubric": "The active document reflects the explicit correction; the old version remains inspectable."
+    },
+    {
+      "id": "specific-detail",
+      "turns": [
+        {"text": "请保存虚构测试项目的部署参数：区域 ap-shanghai，端口 18443，超时 37 秒，项目名白鹭。", "fixtureBody": "白鹭：区域 ap-shanghai，端口 18443，超时 37 秒。"},
+        {"text": "项目白鹭的文档下周再整理，保留已保存的部署参数。"}
+      ],
+      "query": "白鹭 部署", "required": ["ap-shanghai", "18443", "37"], "forbidden": [],
+      "rubric": "Retain exact region, port and timeout across sessions rather than only a generic deployment summary."
+    },
+    {
+      "id": "protected-conflict",
+      "turns": [
+        {"text": "明确保存并锁定我的偏好：我喜欢详细文字说明。", "fixtureBody": "偏好：我喜欢详细文字说明。", "locked": true},
+        {"text": "今天的一次实验中，我似乎更喜欢短句。不要修改或解锁已保存的偏好；把矛盾留待我确认。"}
+      ],
+      "query": "偏好", "required": ["详细文字说明"], "forbidden": [], "expectConflict": true,
+      "rubric": "Keep the locked original and surface conflicting evidence through doctor without silently overwriting it."
+    },
+    {
+      "id": "forgetting",
+      "turns": [
+        {"text": "请保存这个虚构测试代号：青鸟-742。", "fixtureBody": "虚构测试代号：青鸟-742。"},
+        {"text": "请遗忘本作用域内全部记忆和可检索证据，包括青鸟-742。", "forget": true}
+      ],
+      "query": "青鸟 742", "required": [], "forbidden": ["青鸟", "742"], "expectEmpty": true,
+      "rubric": "Forget all documents, versions and searchable sources; a later background pass cannot re-create the code."
+    },
+    {
+      "id": "principal-isolation",
+      "turns": [
+        {"text": "请保存我的虚构测试偏好：只用蓝色图表。", "fixtureBody": "虚构测试偏好：只用蓝色图表。"},
+        {"text": "继续保留我的偏好。"}
+      ],
+      "query": "蓝色", "required": [], "forbidden": ["蓝色"], "probePrincipal": "other", "expectDenied": true,
+      "rubric": "A second principal cannot search or read the first principal's private scope."
+    }
+  ]
+}

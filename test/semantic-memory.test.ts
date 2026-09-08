@@ -7,6 +7,9 @@ import { PGlite } from '@electric-sql/pglite'
 import { PgWorkStore, type SqlPool } from '../src/control-plane/pg-store.js'
 import { createSemanticMemory } from '../src/memory/semantic.js'
 import type { WorkItem } from '../src/protocol/types.js'
+import { memorySearchText } from '../src/memory/text.js'
+import type { MemoryHit, MemorySearchResult } from '../src/memory/types.js'
+const hits=(result:MemorySearchResult)=>result.items as MemoryHit[]
 
 it('indexes scoped memories durably and ranks old semantic matches without trusting stale vectors', async () => {
   const db = new PGlite()
@@ -17,6 +20,7 @@ it('indexes scoped memories durably and ranks old semantic matches without trust
   let fail = false
   let model = 'test-embedding'
   let requests = 0
+  let indexedTail=false
   let beforeResponse: (() => Promise<void>) | undefined
   const server = http.createServer((req, res) => {
     const chunks: Buffer[] = []
@@ -24,6 +28,11 @@ it('indexes scoped memories durably and ranks old semantic matches without trust
     req.on('end', () => { void (async () => {
       requests++
       const payload = JSON.parse(Buffer.concat(chunks).toString()) as { input: string[] }
+      if(payload.input.some(text=>text.includes('tail marker'))) {
+        indexedTail=true
+        assert.equal(payload.input.join(''),'detail '.repeat(1500)+'tail marker')
+        assert.ok(payload.input.every(text=>Buffer.byteLength(text)<=8000))
+      }
       await beforeResponse?.()
       beforeResponse = undefined
       res.writeHead(fail ? 503 : 200, { 'content-type': 'application/json' })
@@ -53,24 +62,25 @@ it('indexes scoped memories durably and ranks old semantic matches without trust
     await db.exec(await readFile(new URL('../../db/schema.sql', import.meta.url), 'utf8'))
     await db.exec(`INSERT INTO lingxios.agent_work_items(id,tenant_id,agent_id,principal_id,session_id,kind,lane,trigger_ref,status,fence,lease_expires_at,lease_token_hash)
       VALUES('turn','t','a','u','s','turn','interactive','m','leased',1,NOW()+INTERVAL '1 hour','${createHash('sha256').update(work.leaseToken).digest('hex')}')`)
-    for (let i = 0; i < 40; i++) await db.query(`INSERT INTO lingxios.agent_memories(tenant_id,id,scope_type,scope_id,body,kind,origin,source_refs,updated_at)
-      VALUES('t',$1,'learner','u',$2,'observation','explicit','[{"workId":"turn"}]',NOW()+$3*INTERVAL '1 second')`,
-    [`m${i}`, i === 0 ? 'Prefers diagrams' : `Unrelated ${i}`, i])
-    await db.exec(`INSERT INTO lingxios.agent_memories(tenant_id,id,scope_type,scope_id,body,kind,origin,source_refs)
-      VALUES('foreign','secret','learner','u','Prefers diagrams','observation','explicit','[{"workId":"turn"}]'),
-      ('t','other-scope','course','elsewhere','Prefers diagrams','observation','explicit','[{"workId":"turn"}]')`)
+    for (let i = 0; i < 40; i++) await db.query(`INSERT INTO lingxios.agent_memories(tenant_id,id,scope_type,scope_id,body,kind,origin,source_refs,updated_at,path,title,description,search_text)
+      VALUES('t',$1,'learner','u',$2,'observation','explicit','[{"workId":"turn"}]',NOW()+$3*INTERVAL '1 second',$1||'.md','Preference','User preference',$4)`,
+    [`m${i}`, i === 0 ? 'Prefers diagrams' : i===1?'detail '.repeat(1500)+'tail marker':`Unrelated ${i}`, i,memorySearchText(i===0?'Prefers diagrams':`Unrelated ${i}`)])
+    await db.exec(`INSERT INTO lingxios.agent_memories(tenant_id,id,scope_type,scope_id,body,kind,origin,source_refs,path,title,description,search_text)
+      VALUES('foreign','secret','learner','u','Prefers diagrams','observation','explicit','[{"workId":"turn"}]','secret.md','Preference','Preference','prefers diagrams'),
+      ('t','other-scope','course','elsewhere','Prefers diagrams','observation','explicit','[{"workId":"turn"}]','secret.md','Preference','Preference','prefers diagrams')`)
     const initial = await semantic.recall(work, scope, 'pictures', 3)
-    assert.ok(initial.every(row => row['retrieval'] === 'recency_unindexed'))
+    assert.deepEqual(initial.items,[])
     assert.equal(await drain(), 32)
     await semantic.recall(work, scope, 'pictures', 3)
     assert.equal(await drain(), 8)
+    assert.equal(indexedTail,true)
     const ranked = await semantic.recall(work, scope, 'pictures', 3)
-    assert.equal(ranked[0]!['id'], 'm0')
-    assert.equal(ranked[0]!['retrieval'], 'semantic')
+    assert.equal(hits(ranked)[0]!.id, 'm0')
+    assert.equal(ranked.retrieval, 'hybrid')
     assert.equal(requests, 41) // One cached query plus each of the 40 indexed bodies.
     assert.equal((await db.query('SELECT memory_id FROM lingxios.agent_memory_embeddings')).rows.length, 40)
     await db.exec("UPDATE lingxios.agent_memories SET body='Now prefers text',version=2 WHERE id='m0' AND tenant_id='t'")
-    assert.notEqual((await semantic.recall(work, scope, 'pictures', 3))[0]!['id'], 'm0')
+    assert.equal((await semantic.recall(work, scope, 'pictures', 3)).items.length,0)
     const pending = await store.claim('index-worker')
     assert.ok(pending)
     beforeResponse = async () => { await db.exec("UPDATE lingxios.agent_memories SET body='Prefers diagrams again',version=3 WHERE id='m0' AND tenant_id='t'") }
@@ -86,17 +96,19 @@ it('indexes scoped memories durably and ranks old semantic matches without trust
     let authCalls = 0
     await assert.rejects(semantic.refresh(forbidden, async () => { if (++authCalls === 2) throw new Error('permission revoked') }), /permission revoked/)
     assert.equal((await semantic.refresh(forbidden, async () => {})).outcome, 'indexed')
-    assert.equal((await semantic.recall(work, scope, 'pictures', 3))[0]!['id'], 'm0')
+    assert.equal(hits(await semantic.recall(work, scope, 'pictures', 3))[0]!.id, 'm0')
     await store.complete(forbidden.id, forbidden.fence, createHash('sha256').update(forbidden.leaseToken).digest('hex'), { status: 'completed' })
     model = 'test-embedding-v2'
-    assert.ok((await semantic.recall(work, scope, 'pictures after model change', 3)).every(row => row['retrieval'] === 'recency_unindexed'))
+    assert.deepEqual((await semantic.recall(work, scope, 'pictures after model change', 3)).items,[])
     assert.equal(await drain(), 32)
     await semantic.recall(work, scope, 'pictures after model change', 3)
     assert.equal(await drain(), 8)
-    assert.equal((await semantic.recall(work, scope, 'pictures after model change', 3))[0]!['id'], 'm0')
+    assert.equal(hits(await semantic.recall(work, scope, 'pictures after model change', 3))[0]!.id, 'm0')
     await assert.rejects(semantic.recall(work, { ...scope, tenantId: 'foreign' }, 'pictures', 3), /scope/)
     fail = true
-    assert.ok((await semantic.recall(work, scope, 'new query', 3)).every(row => row['retrieval'] === 'recency_embedding_unavailable'))
+    const fallback=await semantic.recall(work,scope,'unrelated',3)
+    assert.equal(fallback.retrieval,'keyword_embedding_unavailable')
+    assert.equal(fallback.items.length,3)
     await db.exec("DELETE FROM lingxios.agent_memories WHERE tenant_id='t' AND id='m0'")
     assert.deepEqual((await db.query("SELECT memory_id FROM lingxios.agent_memory_embeddings WHERE memory_id='m0'")).rows, [])
   } finally {

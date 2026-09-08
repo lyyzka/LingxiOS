@@ -41,8 +41,17 @@ export async function forgetMemoryScope(database: SqlQueryable, scope: MemorySco
   // ponytail: invalidate all old sources in this scope; use source tombstones if selective resynthesis is needed.
   const updated = await database.query(`UPDATE lingxios.agent_memory_scopes SET epoch=epoch+1,forgotten_at=clock_timestamp()
     WHERE tenant_id=$1 AND scope_type=$2 AND scope_id=$3 RETURNING epoch`, [scope.tenantId, scope.scopeType, scope.scopeId])
-  await database.query(`UPDATE lingxios.agent_memory_evidence SET status='superseded',input_text='',assistant_text=''
+  await database.query(`UPDATE lingxios.agent_memory_evidence SET status='superseded',input_text='',assistant_text='',search_text=''
     WHERE tenant_id=$1 AND scopes @> $2::jsonb`, [scope.tenantId, JSON.stringify([scope])])
+  await database.query(`UPDATE lingxios.agent_memory_evidence_scopes SET status='superseded'
+    WHERE source_run_id IN (SELECT source_run_id FROM lingxios.agent_memory_evidence WHERE tenant_id=$1 AND status='superseded')`, [scope.tenantId])
+  for (const table of ['agent_memory_commands','agent_memory_reviews','agent_memory_conflicts']) {
+    await database.query(`DELETE FROM lingxios.${table} WHERE tenant_id=$1 AND scope_type=$2 AND scope_id=$3`,[scope.tenantId,scope.scopeType,scope.scopeId])
+  }
+  await database.query(`UPDATE lingxios.agent_work_items SET cancel_requested_at=clock_timestamp(),
+    status=CASE WHEN status='queued' THEN 'cancelled' ELSE status END,meta=meta-'memorySnapshot'
+    WHERE tenant_id=$1 AND kind='memory_synthesis' AND meta->>'scopeType'=$2 AND meta->>'scopeId'=$3
+      AND status IN ('queued','leased','failed')`,[scope.tenantId,scope.scopeType,scope.scopeId])
   if (purge) await database.query('DELETE FROM lingxios.agent_memories WHERE tenant_id=$1 AND scope_type=$2 AND scope_id=$3',
     [scope.tenantId, scope.scopeType, scope.scopeId])
   return { epoch: Number(updated.rows[0]!['epoch']) }

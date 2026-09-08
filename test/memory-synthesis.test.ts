@@ -1,168 +1,135 @@
 import assert from 'node:assert/strict'
-import { readFile } from 'node:fs/promises'
+import { createHash } from 'node:crypto'
 import { it } from 'node:test'
-import { PGlite } from '@electric-sql/pglite'
-import { PgWorkStore, withTransaction, type SqlPool } from '../src/control-plane/pg-store.js'
-import { sessionKeyOf, type WorkItem } from '../src/protocol/types.js'
-import { captureMemoryEvidence, retryMemorySynthesis } from '../src/memory/evidence.js'
-import { executeMemorySynthesis as synthesize, parseMemoryChanges, type MemoryBatch } from '../src/memory/synthesis.js'
+import { withTransaction } from '../src/control-plane/pg-store.js'
+import { executeMemorySynthesis,parseMemoryChanges,type MemoryBatch } from '../src/memory/synthesis.js'
 import { memorySynthesisProcessor } from '../src/memory/processor.js'
-import { recallMemories } from '../src/memory/store.js'
-import { createResponseEnvelope } from '../src/outcome/envelope.js'
-import { snapshotEvidence } from '../src/context/evidence.js'
+import { retryMemorySynthesis,scheduleMemoryReflection } from '../src/memory/evidence.js'
+import { memoryFixture,content,identity,scope } from './memory-fixture.js'
+import type { WorkItem } from '../src/protocol/types.js'
 import type { WorkProcessorContext } from '../src/runtime/runtime.js'
 
-const scopes = [{ tenantId: 't', scopeType: 'learner', scopeId: 'u' }, { tenantId: 't', scopeType: 'course', scopeId: 's' }, { tenantId: 't', scopeType: 'agent_role', scopeId: 'a' }]
-const executeMemorySynthesis = (database: SqlPool, work: WorkItem, method: string, args: Record<string, unknown>) =>
-  withTransaction(database, client => synthesize(client, work, method, args, scopes))
+it('batches five committed interactions, keeps per-scope progress and learns with two independent model calls',async()=>{
+  const other={...scope,scopeType:'project',scopeId:'p'}
+  const f=await memoryFixture({resolveScopes:async()=>[scope,other]})
+  try{
+    for(let i=0;i<4;i++) await f.source({scopes:[scope,other]})
+    assert.deepEqual(await scheduleMemoryReflection(f.pool,f.options),{jobIds:[]})
+    const latest=await f.source({text:'我仍然喜欢图表和具体示例。',scopes:[scope,other]})
+    const scheduled=await scheduleMemoryReflection(f.pool,f.options)
+    assert.equal(scheduled.jobIds.length,2)
+    assert.deepEqual(await scheduleMemoryReflection(f.pool,f.options),{jobIds:[]})
+    const job=(await f.store.claim('memory-worker'))!
+    assert.equal(job.kind,'memory_synthesis')
+    assert.notEqual(job.sessionId,latest.work.sessionId)
+    const invoke=(method:string,args:Record<string,unknown>)=>withTransaction(f.pool,db=>executeMemorySynthesis(db,job,method,args,f.options))
+    const batch=await invoke('load',{}) as MemoryBatch
+    assert.equal(batch.evidence.length,5)
+    const changes=[{sourceRunIds:batch.evidence.map(item=>item.sourceRunId),change:{action:'create',content:content()}}]
+    let calls=0
+    const context={signal:new AbortController().signal,emit:async()=>{},host:{executeAction:async(_work:WorkItem,action:{action:string;args:Record<string,unknown>})=>({
+      ok:true,executionState:'succeeded',value:await invoke(action.action.split('.')[1]!,action.args),
+    })},model:{structured:async(request:{instructions:string;input:unknown})=>{
+      calls++
+      if(calls===2){assert.match(request.instructions,/Independently audit/);assert.deepEqual((request.input as {changes:unknown}).changes,changes)}
+      return{value:calls===1?{changes,conflicts:[]}:{approved:true,confidence:0.95},model:'test',usage:{available:true,inputTokens:500,outputTokens:100}}
+    }}} as unknown as WorkProcessorContext
+    await memorySynthesisProcessor.process(job,context)
+    assert.equal(calls,2)
+    assert.equal(await invoke('load',{}),null)
+    const learned=await f.api.list(identity,batch.scope)
+    assert.equal(learned.items.length,1)
+    const doc=await f.api.read(identity,batch.scope,learned.items[0]!.id)
+    assert.equal(doc!.origin,'synthesized')
+    assert.equal(doc!.sources.length,5)
+    const state=(await f.db.query<{status:string;count:number}>('SELECT status,COUNT(*)::int AS count FROM lingxios.agent_memory_evidence_scopes GROUP BY status ORDER BY status')).rows
+    assert.deepEqual(state,[{status:'pending',count:5},{status:'processed',count:5}])
+    assert.equal(await f.store.complete(job.id,job.fence,createHash('sha256').update(job.leaseToken).digest('hex'),{status:'completed'}),true)
+  }finally{await f.close()}
+})
 
-it('executes durable memory synthesis with independent verification, fenced atomic writes and bounded retries', async () => {
-  const db = new PGlite()
-  const pool: SqlPool = { query: async (sql, args) => {
-    const result = await db.query<Record<string, unknown>>(sql, args)
-    return { rows: result.rows, rowCount: result.affectedRows ?? result.rows.length }
-  }, connect: async () => ({ query: pool.query, release: () => {} }) }
-  let sequence = 0
-  const source = async (revisionTime?: string) => {
-    const work: WorkItem = { id: `source-${sequence++}`, tenantId: 't', agentId: 'a', principalId: 'u', sessionId: 's',
-      kind: 'turn', lane: 'interactive', triggerRef: 'm', fence: 1, homeEpoch: 1, leaseToken: 'test' }
-    await db.query(`INSERT INTO lingxios.agent_work_items(id,tenant_id,agent_id,principal_id,session_id,kind,lane,trigger_ref,status)
-      VALUES($1,'t','a','u','s','turn','interactive','m','succeeded')`, [work.id])
-    const revisions = revisionTime ? [{ id: 'revision', text: 'I still prefer visual examples.', createdAt: revisionTime }] : []
-    if (revisionTime) await db.query("UPDATE lingxios.agent_work_items SET created_at='2000-01-01',steer_inputs=$2::jsonb WHERE id=$1", [work.id, JSON.stringify(revisions)])
-    const request = { workId: work.id, sourceRef: 'm', authorId: 'u', originalText: 'I prefer visual examples.', revisions, attachments: [] }
-    await db.query(`INSERT INTO lingxios.agent_os_sessions(session_key,tenant_id,agent_id,session_id,request_snapshot)
-      VALUES($1,'t','a','s',$2::jsonb) ON CONFLICT(session_key) DO UPDATE SET request_snapshot=EXCLUDED.request_snapshot`,
-    [sessionKeyOf(work), JSON.stringify(request)])
-    const message = { version: 2 as const, runId: work.id, agentId: 'a', sessionId: 's', body: 'Understood.',
-      envelope: createResponseEnvelope('Understood.', { status: 'partial', verification: 'not_run', requestVersion: revisions.length + 1 }, snapshotEvidence('e', [])) }
-    await captureMemoryEvidence(pool, work, message, scopes)
-    const job = { ...work, id: `memory-synthesis:${work.id}`, kind: 'memory_synthesis', lane: 'background' as const, meta: { sourceRunId: work.id } }
-    await db.query("UPDATE lingxios.agent_work_items SET status='leased',fence=1,attempts=1,lease_expires_at=NOW()+INTERVAL '1 hour' WHERE id=$1", [job.id])
-    return job
-  }
-  const load = (work: WorkItem) => executeMemorySynthesis(pool, work, 'load', {}) as Promise<MemoryBatch>
-  const apply = (work: WorkItem, changes: unknown[], approved = true, confidence = 0.9) => executeMemorySynthesis(pool, work, 'apply', { changes, approved, confidence })
-  const create = (work: WorkItem) => ({ action: 'create', scopeType: 'learner', sourceRunIds: [work.meta!['sourceRunId']], body: 'Prefers visual examples' })
-  const status = async (work: WorkItem) => (await db.query<{ status: string }>('SELECT status FROM lingxios.agent_memory_evidence WHERE source_run_id=$1', [work.meta!['sourceRunId']])).rows[0]!.status
-  try {
-    await db.exec(await readFile(new URL('../../db/schema.sql', import.meta.url), 'utf8'))
-    const first = await source()
-    await assert.rejects(withTransaction(pool, client => synthesize(client,first,'load',{},[])), /scope is unavailable/)
-    let calls = 0
-    const events: Array<Record<string, unknown>> = []
-    const context = { signal: new AbortController().signal, emit: async (event: Record<string, unknown>) => { events.push(event) },
-      host: { executeAction: async (work: WorkItem, action: { action: string; args: Record<string, unknown> }) => ({ ok: true,
-        value: await executeMemorySynthesis(pool, work, action.action.split('.')[1]!, action.args) }) },
-      model: { structured: async (request: { instructions: string; input: unknown }) => {
-        calls++
-        if (calls === 2) {
-          assert.match(request.instructions, /Independently audit/)
-          assert.deepEqual((request.input as { changes: unknown[] }).changes, [create(first)])
-        }
-        return { value: calls === 1 ? { changes: [create(first)] } : { approved: true, confidence: 0.9 }, model: 'test',
-          usage: { available: true, inputTokens: 100, outputTokens: 20 } }
-      } },
-    } as unknown as WorkProcessorContext
-    await memorySynthesisProcessor.process(first, context)
-    assert.equal(calls, 2)
-    assert.deepEqual(events.at(-1)?.['data'], { result: { outcome: 'committed', changeCount: 1 } })
-    assert.equal(await status(first), 'processed')
-    assert.equal(await load(first), null)
-    assert.deepEqual(await apply(first, [create(first)]), { outcome: 'processed', changeCount: 0 })
-    const memory = (await db.query<{ id: string; scope_type: string; scope_id: string; origin: string; version: number; source_refs: Array<Record<string, unknown>> }>('SELECT * FROM lingxios.agent_memories')).rows[0]!
-    assert.deepEqual([memory.scope_type, memory.scope_id, memory.origin, memory.version], ['learner', 'u', 'synthesized', 1])
-    assert.deepEqual([memory.source_refs[0]!['workId'], memory.source_refs[0]!['synthesisWorkId'], memory.source_refs[0]!['confidence']], [first.meta!['sourceRunId'], first.id, 0.9])
+it('uses persisted idle timestamps, bounds batches and retries, and never schedules uncommitted sources',async()=>{
+  const f=await memoryFixture()
+  try{
+    const first=await f.source()
+    assert.deepEqual(await scheduleMemoryReflection(f.pool,f.options),{jobIds:[]})
+    await f.db.exec("UPDATE lingxios.agent_memory_evidence_scopes SET created_at=NOW()-INTERVAL '11 minutes'")
+    assert.equal((await scheduleMemoryReflection(f.pool,{...f.options})).jobIds.length,1)
+    const job=(await f.store.claim('worker'))!
+    await f.db.query("UPDATE lingxios.agent_work_items SET status='failed',updated_at=NOW()-INTERVAL '61 seconds' WHERE id=$1",[job.id])
+    await retryMemorySynthesis(f.pool)
+    assert.equal((await f.db.query<{status:string}>('SELECT status FROM lingxios.agent_work_items WHERE id=$1',[job.id])).rows[0]!.status,'queued')
+    await f.db.query("UPDATE lingxios.agent_work_items SET status='failed',attempts=3 WHERE id=$1",[job.id])
+    await retryMemorySynthesis(f.pool)
+    assert.equal((await f.db.query<{status:string}>('SELECT status FROM lingxios.agent_memory_evidence_scopes WHERE source_run_id=$1',[first.work.id])).rows[0]!.status,'rejected')
+    for(let i=0;i<24;i++) await f.source()
+    assert.equal((await scheduleMemoryReflection(f.pool,f.options)).jobIds.length,1)
+    assert.equal((await f.db.query<{count:number}>("SELECT COUNT(*)::int AS count FROM lingxios.agent_memory_evidence_scopes WHERE status='pending' AND job_id IS NOT NULL")).rows[0]!.count,20)
+    await f.db.exec(`UPDATE lingxios.agent_memory_evidence_scopes SET status='processed' WHERE status='pending' AND job_id IS NOT NULL;
+      UPDATE lingxios.agent_work_items SET status='succeeded' WHERE kind='memory_synthesis' AND status='queued'`)
+    assert.equal((await scheduleMemoryReflection(f.pool,f.options)).jobIds.length,1,'the four remaining sources continue without waiting for another interaction')
+    const uncommitted=await f.source({leased:true})
+    await f.db.query("UPDATE lingxios.agent_memory_evidence_scopes SET created_at=NOW()-INTERVAL '1 day' WHERE source_run_id=$1",[uncommitted.work.id])
+    assert.ok(!(await scheduleMemoryReflection(f.pool,f.options)).jobIds.includes(`memory-synthesis:${uncommitted.work.id}`))
+  }finally{await f.close()}
+})
 
-    const update = await source()
-    await load(update)
-    await assert.rejects(apply(update,[{ ...create(update), scopeType: 'unauthorized' }]), /unauthorized scope/)
-    const change = { ...create(update), action: 'update', id: memory.id, expectedVersion: 1, body: 'Prefers diagrams for examples' }
-    await assert.rejects(apply(update, [{ ...create(update), sourceRunIds: ['foreign'] }]), /unknown evidence/)
-    await assert.rejects(apply(update, [{ ...change, expectedVersion: 2 }]), /loaded snapshot/)
-    await assert.rejects(apply({ ...update, fence: 2 }, [change]), /lease or source/)
-    await assert.rejects(apply({ ...update, tenantId: 'other' }, [change]), /lease or source/)
-    for (const protection of ["origin='explicit'", "origin='synthesized',pinned=TRUE"]) {
-      await db.query(`UPDATE lingxios.agent_memories SET ${protection} WHERE id=$1`, [memory.id])
-      await assert.rejects(apply(update, [create(update), change]), /protected/)
-      assert.equal((await db.query('SELECT id FROM lingxios.agent_memories')).rows.length, 1)
-      assert.equal(await status(update), 'pending')
-    }
-    await db.query('UPDATE lingxios.agent_memories SET pinned=FALSE,version=2 WHERE id=$1', [memory.id])
-    await assert.rejects(apply(update, [create(update), change]), /stale/)
-    assert.equal((await db.query('SELECT id FROM lingxios.agent_memories')).rows.length, 1)
-    assert.deepEqual((await db.query('SELECT version FROM lingxios.agent_memory_versions WHERE memory_id=$1 ORDER BY version', [memory.id])).rows, [{ version: 1 }])
-    await load(update)
-    assert.deepEqual(await apply(update, [{ ...change, expectedVersion: 2 }]), { outcome: 'committed', changeCount: 1 })
-    const expire = await source()
-    await load(expire)
-    assert.deepEqual(await apply(expire, [{ action: 'expire', scopeType: 'learner', sourceRunIds: [expire.meta!['sourceRunId']], id: memory.id, expectedVersion: 3 }]),
-      { outcome: 'committed', changeCount: 1 })
-    assert.deepEqual((await db.query('SELECT body,status,version FROM lingxios.agent_memories')).rows,
-      [{ body: 'Prefers diagrams for examples', status: 'expired', version: 4 }])
-    assert.deepEqual((await db.query("SELECT version,snapshot->>'body' AS body,snapshot->>'status' AS status FROM lingxios.agent_memory_versions WHERE memory_id=$1 ORDER BY version", [memory.id])).rows,
-      [{ version: 1, body: 'Prefers visual examples', status: 'active' }, { version: 2, body: 'Prefers visual examples', status: 'active' },
-        { version: 3, body: 'Prefers diagrams for examples', status: 'active' }])
-    await assert.rejects(db.query('UPDATE lingxios.agent_memories SET version=1 WHERE id=$1', [memory.id]), /versions must increase/)
-    assert.deepEqual(await recallMemories(pool, { tenantId: 't', scopeType: 'learner', scopeId: 'u' }, '', 12), [])
-    const renewal = await source()
-    const expiredSnapshot = await load(renewal)
-    assert.equal(expiredSnapshot.currentMemories.find(row => row['id'] === memory.id)?.['needsReverification'], true)
-    await assert.rejects(apply(renewal, [{ ...change, sourceRunIds: [renewal.meta!['sourceRunId']], expectedVersion: 4 }]), /unavailable/)
-    const renewedChange = { ...change, sourceRunIds: [renewal.meta!['sourceRunId']], expectedVersion: 4, validUntil: '2099-01-01T00:00:00Z' }
-    await db.query("UPDATE lingxios.agent_work_items SET created_at='2000-01-01' WHERE id=$1", [renewal.meta!['sourceRunId']])
-    await assert.rejects(apply(renewal, [renewedChange]), /unavailable/)
-    assert.equal(await status(renewal), 'pending')
-    await db.query('UPDATE lingxios.agent_work_items SET created_at=NOW() WHERE id=$1', [renewal.meta!['sourceRunId']])
-    assert.deepEqual(await apply(renewal, [renewedChange]), { outcome: 'committed', changeCount: 1 })
-    assert.equal((await recallMemories(pool, { tenantId: 't', scopeType: 'learner', scopeId: 'u' }, '', 12))[0]!['version'], 5)
-    await db.query("UPDATE lingxios.agent_memories SET status='expired',version=6,updated_at=NOW()-INTERVAL '1 minute' WHERE id=$1", [memory.id])
-    for (const revisionTime of ['invalid', '2099-01-01T00:00:00Z', new Date().toISOString()]) {
-      const revised = await source(revisionTime)
-      await load(revised)
-      const proposed = [{ ...renewedChange, expectedVersion: 6, sourceRunIds: [revised.meta!['sourceRunId']] }]
-      if (revisionTime === 'invalid' || revisionTime.startsWith('2099')) await assert.rejects(apply(revised, proposed), /unavailable/)
-      else assert.deepEqual(await apply(revised, proposed), { outcome: 'committed', changeCount: 1 })
-    }
-    assert.equal((await recallMemories(pool, { tenantId: 't', scopeType: 'learner', scopeId: 'u' }, '', 12))[0]!['version'], 7)
+it('protects explicit memory, records conflicts, rejects unknown evidence and stale leases, and fences forgetting',async()=>{
+  const f=await memoryFixture()
+  try{
+    const explicit=(await f.api.initialize(identity,{scope,documents:[content('I prefer prose.')],idempotencyKey:'seed',sourceRef:'settings'})).documents[0]!
+    const source=await f.source({text:'I prefer diagrams now.'})
+    const {job}=await f.reflection()
+    assert.ok(job)
+    const invoke=(method:string,args:Record<string,unknown>,work=job)=>withTransaction(f.pool,db=>executeMemorySynthesis(db,work!,method,args,f.options))
+    const batch=await invoke('load',{}) as MemoryBatch
+    assert.equal(batch.currentMemories[0]!.id,explicit.id)
+    const change={sourceRunIds:[source.work.id],change:{action:'update',id:explicit.id,expectedVersion:1,content:content('I prefer diagrams.')}}
+    await assert.rejects(invoke('apply',{changes:[change],approved:true,confidence:1}),/protected/)
+    assert.equal((await f.api.read(identity,scope,explicit.id))!.body,'I prefer prose.')
+    await assert.rejects(invoke('apply',{changes:[{...change,sourceRunIds:['foreign']}],approved:true,confidence:1}),/unknown evidence/)
+    await assert.rejects(invoke('load',{}, {...job,fence:job.fence+1}),/lease/)
+    const conflict={sourceRunIds:[source.work.id],memoryIds:[explicit.id],reason:'New evidence contradicts the protected preference.'}
+    assert.deepEqual(await invoke('apply',{changes:[],conflicts:[conflict],approved:true,confidence:1}),{outcome:'committed',changeCount:0})
+    assert.equal((await f.api.doctor(identity,scope)).conflicts.length,1)
+    await f.api.forget(identity,scope)
+    assert.equal((await f.api.doctor(identity,scope)).conflicts.length,0)
+    await assert.rejects(invoke('load',{}),/lease/)
+    assert.equal((await f.api.search(identity,scope,{target:'history',query:'diagrams'})).items.length,0)
+    assert.throws(()=>parseMemoryChanges([{sourceRunIds:['s'],change:{action:'delete',id:'x',expectedVersion:1}}]),/cannot delete/)
+  }finally{await f.close()}
+})
 
-    for (const [approved, confidence] of [[false, 0.9], [true, 0.59]] as const) {
-      const rejected = await source()
-      await load(rejected)
-      assert.deepEqual(await apply(rejected, [create(rejected)], approved, confidence), { outcome: 'rejected', changeCount: 0 })
-      assert.equal(await status(rejected), 'rejected')
-    }
-    const cancelled = await source()
-    await load(cancelled)
-    await db.query('UPDATE lingxios.agent_work_items SET cancel_requested_at=NOW() WHERE id=$1', [cancelled.meta!['sourceRunId']])
-    await assert.rejects(apply(cancelled, [create(cancelled)]), /lease or source/)
-    assert.equal(await status(cancelled), 'superseded')
-    assert.equal((await db.query('SELECT id FROM lingxios.agent_memories')).rows.length, 1)
-    assert.throws(() => parseMemoryChanges([{ ...change, body: 'x'.repeat(501) }]), /body/)
-    assert.throws(() => parseMemoryChanges([change, change]), /unique identity/)
-    assert.throws(() => parseMemoryChanges([{ ...change, scopeId: 'foreign' }]), /invalid/)
+it('rechecks source permissions and request revisions between proposal and apply',async()=>{
+  let revoked=false
+  const f=await memoryFixture({resolveScopes:async()=>revoked?[]:[scope]})
+  try{
+    const source=await f.source()
+    const {job}=await f.reflection()
+    assert.ok(job)
+    const invoke=(method:string,args:Record<string,unknown>)=>withTransaction(f.pool,db=>executeMemorySynthesis(db,job,method,args,f.options))
+    await invoke('load',{})
+    revoked=true
+    await assert.rejects(invoke('apply',{changes:[],approved:true,confidence:1}),/revoked/)
+    revoked=false
+    await f.db.query("UPDATE lingxios.agent_work_items SET steer_inputs='[{\"id\":\"new\",\"text\":\"Do not remember this\",\"createdAt\":\"2026-09-08T00:00:00Z\"}]' WHERE id=$1",[source.work.id])
+    assert.deepEqual(await invoke('apply',{changes:[],approved:true,confidence:1}),{outcome:'processed',changeCount:0})
+    assert.equal((await f.api.list(identity,scope)).items.length,0)
+  }finally{await f.close()}
+})
 
-    const retry = await source()
-    await db.query("UPDATE lingxios.agent_work_items SET status='failed',updated_at=NOW() WHERE id=$1", [retry.id])
-    await retryMemorySynthesis(pool)
-    assert.deepEqual((await db.query('SELECT status FROM lingxios.agent_work_items WHERE id=$1', [retry.id])).rows, [{ status: 'failed' }])
-    await db.query("UPDATE lingxios.agent_work_items SET updated_at=NOW()-INTERVAL '61 seconds' WHERE id=$1", [retry.id])
-    await retryMemorySynthesis(pool)
-    assert.deepEqual((await db.query('SELECT status FROM lingxios.agent_work_items WHERE id=$1', [retry.id])).rows, [{ status: 'queued' }])
-    await db.query("UPDATE lingxios.agent_work_items SET status='leased',attempts=3,lease_expires_at=NOW()-INTERVAL '1 second' WHERE id=$1", [retry.id])
-    assert.equal(await new PgWorkStore(pool).claim('test-worker'), null)
-    await db.query("UPDATE lingxios.agent_work_items SET status='queued' WHERE id=$1", [retry.id])
-    assert.equal(await new PgWorkStore(pool).claim('test-worker'), null)
-    await retryMemorySynthesis(pool)
-    assert.deepEqual((await db.query('SELECT status FROM lingxios.agent_work_items WHERE id=$1', [retry.id])).rows, [{ status: 'failed' }])
-    assert.equal(await status(retry), 'rejected')
-    const revoked = await source()
-    await load(revoked)
-    await apply(revoked, [create(revoked), { ...create(revoked), scopeType: 'course' }, { ...create(revoked), scopeType: 'agent_role' }])
-    await db.exec("UPDATE lingxios.agent_memories SET pinned=TRUE WHERE scope_type='course'; UPDATE lingxios.agent_memories SET origin='explicit' WHERE scope_type='agent_role'")
-    await db.query('UPDATE lingxios.agent_work_items SET cancel_requested_at=NOW() WHERE id=$1', [revoked.meta!['sourceRunId']])
-    assert.equal(await status(revoked), 'superseded')
-    assert.deepEqual((await db.query("SELECT scope_type,status,version FROM lingxios.agent_memories WHERE id<>$1 ORDER BY scope_type", [memory.id])).rows,
-      [{ scope_type: 'agent_role', status: 'active', version: 1 }, { scope_type: 'course', status: 'active', version: 1 }, { scope_type: 'learner', status: 'expired', version: 2 }])
-  } finally { await db.close() }
+it('does not renew expired knowledge from an old request committed after expiry',async()=>{
+  const f=await memoryFixture()
+  try{
+    const saved=(await f.api.initialize(identity,{scope,documents:[content('Temporary preference')],idempotencyKey:'seed',sourceRef:'settings'})).documents[0]!
+    const source=await f.source()
+    await f.db.query("UPDATE lingxios.agent_memories SET origin='synthesized',valid_until=NOW()-INTERVAL '1 hour' WHERE id=$1",[saved.id])
+    await f.db.query("UPDATE lingxios.agent_work_items SET created_at=NOW()-INTERVAL '2 hours' WHERE id=$1",[source.work.id])
+    const {job}=await f.reflection()
+    assert.ok(job)
+    const invoke=(method:string,args:Record<string,unknown>)=>withTransaction(f.pool,db=>executeMemorySynthesis(db,job,method,args,f.options))
+    await invoke('load',{})
+    await assert.rejects(invoke('apply',{changes:[{sourceRunIds:[source.work.id],change:{action:'update',id:saved.id,expectedVersion:1,
+      content:{...content('Renewed'),validUntil:new Date(Date.now()+3600_000).toISOString()}}}],approved:true,confidence:1}),/new evidence/)
+  }finally{await f.close()}
 })

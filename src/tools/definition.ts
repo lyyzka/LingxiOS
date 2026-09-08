@@ -14,7 +14,7 @@ export interface ArtifactInput {
 /** Trusted native context. The principal authorizes; the agent is the operator. */
 export interface ActionContext {
   /** Uses the configured memory content policy and this action's transaction. */
-  writeMemory(scope: import('../memory/store.js').MemoryScope, mutation: import('../memory/store.js').MemoryMutation): Promise<Record<string, unknown>>
+  writeMemory(scope: import('../memory/store.js').MemoryScope, mutation: import('../memory/store.js').MemoryMutation): Promise<import('../memory/types.js').MemoryDocument | { id: string; deleted: boolean }>
   forgetMemory(scope: import('../memory/store.js').MemoryScope): Promise<{ epoch: number }>
   requestSnapshot(): Promise<import('../context/request.js').RequestSnapshot>
   enqueueChild(input: import('../app/jobs.js').ChildInput): Promise<{ id: string; deduplicated: boolean }>

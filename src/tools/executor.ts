@@ -13,6 +13,7 @@ import { deadlinePool } from '../control-plane/deadline-pool.js'
 import { writeMemory, type MemoryScope } from '../memory/store.js'
 import { forgetMemoryScope } from '../memory/forget.js'
 import type { MemoryOptions } from '../memory/runtime.js'
+import { authorizedScopes, identityOf } from '../memory/access.js'
 import { assertObservation, assertToolContract, observeResult } from './contracts.js'
 
 export function toolExecutor(database: SqlPool, definitions: readonly ToolDefinition[],
@@ -39,7 +40,7 @@ export function toolExecutor(database: SqlPool, definitions: readonly ToolDefini
     const queryable = db === database ? deadlinePool(database,options.signal) : db
     const authorizeMemory = async (scope: MemoryScope) => {
       write()
-      if (!memory || scope.tenantId !== work.tenantId || !(await memory.resolveScopes(work, db)).some(item =>
+      if (!memory || scope.tenantId !== work.tenantId || !(await authorizedScopes(memory,identityOf(work),db)).some(item =>
         item.tenantId === scope.tenantId && item.scopeType === scope.scopeType && item.scopeId === scope.scopeId)) throw new NoEffectError('memory scope is unavailable')
     }
     return { work, action, database: queryable, ...options,
