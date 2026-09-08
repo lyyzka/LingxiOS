@@ -37,6 +37,7 @@ export async function checkStorage(database: SqlQueryable): Promise<void> {
     agent_action_intents: 'idempotency_key,fingerprint,intent,recorded_at',
     agent_action_resolutions: 'resolution_id,resolution_seq,idempotency_key,resolution,recorded_at',
     agent_delivery_outbox: 'result_id,delivered_at,available_at,claim_token,attempts,receipt',
+    agent_memory_capture: 'result_id,available_at,attempts,claim_token,claim_until,completed_at',
     agent_memory_scopes: 'tenant_id,scope_type,scope_id,epoch,forgotten_at',
     agent_memories: 'tenant_id,id,scope_type,scope_id,path,title,description,layer,body,kind,origin,pinned,version,status,source_refs,valid_until,updated_at,search_text,search_vector',
     agent_memory_versions: 'tenant_id,memory_id,version,snapshot,replaced_at',

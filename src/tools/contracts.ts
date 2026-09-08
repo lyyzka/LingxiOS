@@ -8,6 +8,7 @@ import type { HostActionResult } from '../protocol/types.js'
 export function toolContractHash(tool: ToolDefinition): string {
   return textSha256(canonicalJson({ action: tool.action, name: tool.name, parameters: tool.parameters,
     effect: tool.effect, approval: tool.approval, semanticVersion: tool.semanticVersion ?? '1',
+    ...(tool.execution ? { execution: tool.execution } : {}),
     readback: tool.readback ?? null, observation: tool.observation ?? null, preconditions: tool.preconditions ?? null }))
 }
 

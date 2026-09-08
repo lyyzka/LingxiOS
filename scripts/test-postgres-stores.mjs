@@ -1,6 +1,9 @@
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
 import { readFile } from 'node:fs/promises'
+import { setTimeout as delay } from 'node:timers/promises'
+import { listenWakeups } from '../dist/src/control-plane/wakeup.js'
+import { nullLogger } from '../dist/src/logging.js'
 import { Pool } from 'pg'
 import { PgActionLedger, PgSessionStore, PgWorkStore, withTransaction } from '../dist/src/control-plane/pg-store.js'
 import { hashToken } from '../dist/src/control-plane/memory-store.js'
@@ -32,7 +35,34 @@ try {
   await assert.rejects(pool.query(await readFile(new URL('../db/migrations/009-cognitive-memory-reset.sql', import.meta.url),'utf8')),/schema version 8/)
   await pool.query('ROLLBACK')
   await pool.query(await readFile(new URL('../db/migrations/010-im-collaboration.sql', import.meta.url), 'utf8'))
+  await pool.query(await readFile(new URL('../db/migrations/011-performance-notifications.sql', import.meta.url), 'utf8'))
+  await pool.query(await readFile(new URL('../db/migrations/012-async-admission.sql', import.meta.url), 'utf8'))
   await checkStorage(pool)
+  const stopListener = new AbortController()
+  let listenerPid, workNotifications = 0
+  const listening = listenWakeups({ connect: async () => {
+    const client = await pool.connect()
+    listenerPid = (await client.query('SELECT pg_backend_pid() AS pid')).rows[0].pid
+    return client
+  } }, channel => { if (channel === 'work') workNotifications++ }, stopListener.signal, nullLogger)
+  const untilNotification = async check => {
+    const deadline = Date.now() + 5000
+    while (!check()) { assert.ok(Date.now() < deadline, 'PostgreSQL notification/reconnect timed out'); await delay(10) }
+  }
+  try {
+    await untilNotification(() => workNotifications === 1) // Initial scan after LISTEN.
+    const producer = spawnSync(process.execPath, ['--input-type=module'], { encoding: 'utf8', timeout: 5000, input: `
+      import { Pool } from 'pg'
+      const pool = new Pool({ connectionString: process.env.LINGXIOS_TEST_DATABASE_URL })
+      try { await pool.query("INSERT INTO lingxios.agent_work_items(id,tenant_id,agent_id,session_id,kind,lane,trigger_ref,status) VALUES('wake-only','test','a','s','turn','interactive','notification','cancelled')") }
+      finally { await pool.end() }
+    ` })
+    assert.ifError(producer.error); assert.equal(producer.status, 0, producer.stderr)
+    await untilNotification(() => workNotifications === 2) // Separate producer process, not a local hint.
+    const oldPid = listenerPid
+    await pool.query('SELECT pg_terminate_backend($1)', [oldPid])
+    await untilNotification(() => listenerPid !== oldPid && workNotifications === 3) // Reconnect rescan.
+  } finally { stopListener.abort(); await listening }
   const conversation = { tenantId: 'im-concurrency', conversationId: 'room', version: 1, kind: 'group',
     owner: { kind: 'participant', id: 'human' }, defaultAgentId: 'agent', participants: [
       { id: 'human', kind: 'human', capabilities: ['read', 'execute'] },
@@ -191,5 +221,5 @@ try {
   const independent = await Promise.all([workStore.claim('thread-worker-a'), workStore.claim('thread-worker-b')])
   assert.deepEqual(independent.map(item => item.id).sort(), ['thread-a', 'thread-b'])
   assert.deepEqual((await pool.query('SELECT * FROM public.agent_work_items')).rows, [{ company_id: 'untouched' }])
-  console.log('Real PostgreSQL stores passed: schema 7→8→9→10, document CAS/restore races, reflection deduplication, atomic memory forgetting, competing claims, session exclusion, concurrent intent reservation/CAS, separate-process recovery, stale fencing, cancellation and product-table isolation.')
+  console.log('Real PostgreSQL stores passed: schema 7→8→9→10 + 011/012, cross-process LISTEN/NOTIFY and reconnect, document CAS/restore races, reflection deduplication, atomic memory forgetting, competing claims, session exclusion, concurrent intent reservation/CAS, separate-process recovery, stale fencing, cancellation and product-table isolation.')
 } finally { await pool?.end() }

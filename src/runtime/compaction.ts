@@ -79,6 +79,7 @@ export async function compactIfNeeded(
   options: CompactionOptions,
   signal?: AbortSignal,
   overheadTokens = 0,
+  background = false,
 ): Promise<CompactionOutcome> {
   const estimated = estimateTokens(session.history) + overheadTokens
   const softLimit = Math.floor(options.contextWindowTokens * options.softRatio)
@@ -117,7 +118,7 @@ export async function compactIfNeeded(
     summarize.unshift(summaryItem(priorSummary))
   }
   try {
-    const call = await model.compact({ instructions: COMPACTION_PROMPT.instructions, prompt: COMPACTION_PROMPT.manifest, items: summarize, signal })
+    const call = await model.compact({ instructions: COMPACTION_PROMPT.instructions, prompt: COMPACTION_PROMPT.manifest, items: summarize, signal, interruptible: background, admission: background ? 'background' : 'foreground' })
     const combined = boundSummary(call.value, options.maxSummaryChars)
     const usage = { model: call.model, ...call.usage }
     session.summary = combined
@@ -140,7 +141,7 @@ export function prepareCompaction(session: SessionRecord, model: ModelDriver, op
   const stop = new AbortController()
   let outcome: CompactionOutcome | undefined
   const settled = compactIfNeeded(copy, '', model, options,
-    AbortSignal.any([stop.signal, ...(signal ? [signal] : [])]), overheadTokens)
+    AbortSignal.any([stop.signal, ...(signal ? [signal] : [])]), overheadTokens, true)
     .then(result => { outcome = result }, () => { outcome = { compacted: false } })
   return {
     settled,

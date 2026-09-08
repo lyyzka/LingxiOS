@@ -1,3 +1,4 @@
+import { abortable } from '../deadline.js'
 import type { SqlQueryable } from '../control-plane/pg-store.js'
 import type { WorkItem } from '../protocol/types.js'
 import type { EmbeddingOptions } from '../model/embeddings.js'
@@ -9,12 +10,12 @@ import { workItemFromRow } from '../control-plane/pg-store.js'
 
 export interface MemoryOptions {
   /** Resolve destinations from the authenticated identity's current product permissions. */
-  resolveScopes(identity: MemoryIdentity, database: SqlQueryable): Promise<MemoryScope[]>
+  resolveScopes(identity: MemoryIdentity, database: SqlQueryable, signal?: AbortSignal): Promise<MemoryScope[]>
   writePolicy?: MemoryWritePolicy
   embeddings?: EmbeddingOptions
   evolution?: { benchmarkId: string }
   contextBudget?: { ratio?: number; maxTokens?: number; concurrency?: number; timeoutMs?: number;
-    /** Only supplemental recall may time out; core memory and authorization never degrade silently. */
+    /** Optional recall is on demand via memory.search; core and authorization stay mandatory. */
     optionalRecall?: boolean; recallTimeoutMs?: number }
   reflection?: { afterInteractions?: number; idleMs?: number }
 }
@@ -44,9 +45,11 @@ export function sourceIdentity(row: Record<string, unknown>): MemoryIdentity {
 export function sameScope(a: MemoryScope,b: MemoryScope): boolean {
   return a.tenantId === b.tenantId && a.scopeType === b.scopeType && a.scopeId === b.scopeId
 }
-export async function authorizedScopes(options: MemoryOptions, identity: MemoryIdentity, database: SqlQueryable): Promise<MemoryScope[]> {
+export async function authorizedScopes(options: MemoryOptions, identity: MemoryIdentity, database: SqlQueryable, external?: AbortSignal): Promise<MemoryScope[]> {
   if (![identity.tenantId,identity.agentId,identity.principalId,identity.sessionId].every(value => typeof value === 'string' && value.trim() && value.length<=1000)) throw new Error('invalid memory identity')
-  let scopes = await options.resolveScopes(identity,database)
+  const signal = AbortSignal.any([AbortSignal.timeout(10_000), ...external ? [external] : []])
+  signal.throwIfAborted()
+  let scopes = await abortable(options.resolveScopes(identity,database,signal),signal)
   if (!Array.isArray(scopes) || scopes.length > 12) throw new Error('too many memory scopes')
   for (const scope of scopes) validateScope(scope)
   if (identity.workId) {

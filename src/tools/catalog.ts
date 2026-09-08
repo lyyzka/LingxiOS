@@ -2,6 +2,8 @@ import { createTaskContract } from '../context/task-contract.js'
 import type { CapabilityGrant } from '../protocol/types.js'
 
 export interface ToolDefinition {
+  /** Trusted long-tool contract. CPU work must use an isolated process, not synchronous callbacks. */
+  execution?: { class: 'operation'; timeoutMs: number; maxConcurrency: number; cancellation: 'signal' | 'reconcile' }
   /** Expose this schema after authorized catalog discovery. Execution permissions are unchanged. */
   deferred?: boolean
   /** Increment for any implementation or authorization semantics change, including preview/verification. */

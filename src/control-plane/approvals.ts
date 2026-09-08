@@ -113,7 +113,7 @@ export async function resumeDecidedApprovals(pool: SqlPool) {
       AND jsonb_array_length(work.steer_inputs)+1=(intent.intent->>'requestVersion')::integer`)
 }
 
-export async function executeDecidedApprovals(pool: SqlPool, service: ControlPlaneService, work: WorkItem) {
+export async function executeDecidedApprovals(pool: SqlPool, service: ControlPlaneService, work: WorkItem, signal?: AbortSignal) {
   const session = await service.getSession(work, sessionKeyOf(work))
   if (session?.request?.workId !== work.id) return
   const { rows } = await pool.query(`SELECT intent.intent->'action' AS action
@@ -124,15 +124,17 @@ export async function executeDecidedApprovals(pool: SqlPool, service: ControlPla
   let changed = false
   for (const row of rows) {
     const action = row['action'] as HostAction
-    await service.executeAction(work, action)
+    signal?.throwIfAborted()
+    await service.executeAction(work, action, signal)
     const call = session.history.find(item => 'type' in item && item.type === 'function_call' && (item.stepId ?? item.callId) === action.cellId)
     if (!call || !('type' in call) || call.type !== 'function_call') continue
-    const receipts = await service.recoverCell(work, action.cellId)
+    const receipts = await service.recoverCell(work, action.cellId, signal)
     const output = boundedToolOutput({ recovered: true, localExecutionOutput: 'not_recovered', receipts,
       artifacts: receipts?.flatMap(receipt => receipt.result.ok ? receipt.result.artifacts ?? [] : []) ?? [] })
     const old = session.history.find(item => 'type' in item && item.type === 'function_call_output' && item.callId === call.callId)
     if (old && 'type' in old && old.type === 'function_call_output') { changed ||= old.output !== output; old.output = output }
     else { session.history.push({ type: 'function_call_output', callId: call.callId, output }); changed = true }
   }
+  signal?.throwIfAborted()
   if (changed) await service.saveSession(work, session)
 }

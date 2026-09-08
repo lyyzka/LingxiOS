@@ -153,7 +153,7 @@ export function createRealtime(database: SqlPool, changed: Wakeup, shutdown: Abo
             lastPreview = preview
           }
           if (rows.length === 100) continue
-          if (!['queued','leased'].includes(state.run.status)) return
+          if (!['queued','leased','waiting'].includes(state.run.status)) return
           const waiting = new AbortController()
           try {
             await Promise.race([changed.wait(durableVersion, 750, AbortSignal.any([signal, waiting.signal])),

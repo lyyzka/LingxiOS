@@ -1,3 +1,4 @@
+import { ResourceQuota } from '../resource-quota.js'
 import { abortable } from '../deadline.js'
 import { errorMessage } from '../errors.js'
 import { lockAction } from '../control-plane/action-transaction.js'
@@ -20,10 +21,17 @@ import { createSharedState, readSharedState, updateSharedState } from '../collab
 import { authorizeConversationWork } from '../collaboration/access.js'
 
 export function toolExecutor(database: SqlPool, definitions: readonly ToolDefinition[],
-  createArtifact?: (work: Omit<WorkItem, 'leaseToken'>, input: ArtifactInput) => Promise<KernelArtifact>, memory?: MemoryOptions): ActionExecutor {
+  createArtifact?: (work: Omit<WorkItem, 'leaseToken'>, input: ArtifactInput, signal?: AbortSignal) => Promise<KernelArtifact>, memory?: MemoryOptions): ActionExecutor {
   const tools = new Map(definitions.map(tool => [tool.action, tool]))
   if (tools.size !== definitions.length || new Set(definitions.map(tool => tool.name)).size !== definitions.length) throw new Error('duplicate tool definition')
+  const quotas = new Map<string, ResourceQuota>()
   for (const tool of definitions) {
+    if (tool.execution) {
+      const contract = tool.execution
+      if (tool.effect === 'transaction' || contract.class !== 'operation' || !Number.isSafeInteger(contract.timeoutMs) || contract.timeoutMs < 1 || contract.timeoutMs > 30_000
+        || !['signal', 'reconcile'].includes(contract.cancellation) || contract.cancellation === 'reconcile' && !tool.reconcile) throw new Error('invalid long-tool execution contract')
+      quotas.set(tool.action, new ResourceQuota(contract.maxConcurrency, 16))
+    }
     if (!/^[a-z][a-z0-9_]*\.[a-z][a-z0-9_]*$/.test(tool.action) || tool.name !== tool.action.replace('.', '__')) throw new Error('invalid tool identity')
     if (tool.approval && !tool.preview) throw new Error(`${tool.action} requires an approval preview`)
     if (tool.semanticVersion !== undefined && (typeof tool.semanticVersion !== 'string' || !tool.semanticVersion.trim() || tool.semanticVersion.length > 128)) throw new Error('invalid tool semantic version')
@@ -73,7 +81,7 @@ export function toolExecutor(database: SqlPool, definitions: readonly ToolDefini
       createArtifact: async input => {
       options.signal.throwIfAborted()
       if (!createArtifact) throw new NoEffectError('artifact storage is unavailable')
-      return createArtifact(work, input)
+      return createArtifact(work, input, options.signal)
     } }
   }
   return {
@@ -130,7 +138,10 @@ export function toolExecutor(database: SqlPool, definitions: readonly ToolDefini
           if (pending) return pending
         }
         let result: HostActionResult
-        try { result = await abortable(tool.execute(ctx, input).then(result => observeResult(tool, ctx, input, result)), options.signal) }
+        try {
+          const execute = () => tool.execute(ctx, input).then(result => observeResult(tool, ctx, input, result))
+          result = await abortable(quotas.get(tool.action)?.run(execute, options.signal) ?? execute(), options.signal)
+        }
         catch (error) {
           if (!(error instanceof NoEffectError)) throw error
           result = { ok: false, executionState: 'no_effect', code: error.code, error: error.message }

@@ -47,7 +47,7 @@ export interface KernelExecutor {
     signal?: AbortSignal, options?: KernelExecutionOptions,
   ): Promise<KernelExecution>
   /** Read a checked artifact for transfer to a separate control plane. */
-  readArtifact?(work: WorkItem, artifact: import('../protocol/types.js').KernelArtifact): Promise<Uint8Array>
+  readArtifact?(work: WorkItem, artifact: import('../protocol/types.js').KernelArtifact, signal?: AbortSignal): Promise<Uint8Array>
 }
 
 export interface ManagedKernelExecutor extends KernelExecutor {
@@ -409,7 +409,7 @@ export class KernelManager implements ManagedKernelExecutor {
   /** Identifiers are data, never path components: hash every segment. */
   private homeOf(work: WorkItem): string { return kernelHome(this.options.homesRoot, work) }
 
-  async readArtifact(work: WorkItem, artifact: import('../protocol/types.js').KernelArtifact): Promise<Uint8Array> {
+  async readArtifact(work: WorkItem, artifact: import('../protocol/types.js').KernelArtifact, signal?: AbortSignal): Promise<Uint8Array> {
     if (artifact.size > 16 * 1024 * 1024) throw new Error('artifact exceeds the 16 MiB transfer limit')
     const home = this.homeOf(work)
     const target = resolve(home, artifact.path)
@@ -420,7 +420,8 @@ export class KernelManager implements ManagedKernelExecutor {
     if ((await lstat(target)).isSymbolicLink()) throw new Error('artifact links cannot be transferred')
     const before = await stat(target)
     if (!before.isFile() || before.size !== artifact.size) throw new Error('artifact changed before transfer')
-    const bytes = await readFile(target)
+    signal?.throwIfAborted()
+    const bytes = await readFile(target, { signal })
     const after = await stat(target)
     if (after.size !== before.size || after.mtimeMs !== before.mtimeMs
       || createHash('sha256').update(bytes).digest('hex') !== artifact.sha256.toLowerCase()) {

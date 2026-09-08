@@ -1,5 +1,6 @@
 import { fileURLToPath } from 'node:url'
-import mammoth from 'mammoth'
+import { decodeHtml } from './html.js'
+import { decodeSourceText } from './text.js'
 
 // A separate process keeps parser failures out of the request-serving process.
 try {
@@ -13,6 +14,7 @@ try {
   const bytes = Buffer.concat(chunks)
   let text: string
   if (process.argv[2] === 'docx') {
+    const { default: mammoth } = await import('mammoth')
     const result = await mammoth.extractRawText({ buffer: bytes })
     if (result.value.length > 990_000) throw new Error('extracted text exceeds limit')
     const warnings = result.messages.slice(0, 10).map(message => message.message.slice(0, 300))
@@ -40,6 +42,12 @@ try {
         } finally { page.cleanup() }
       }
     } finally { await task.destroy() }
+  } else if (['html', 'source', 'text', 'json'].includes(process.argv[2]!)) {
+    const format = process.argv[2]
+    text = format === 'html' || format === 'source' ? decodeSourceText(bytes) : new TextDecoder('utf-8', { fatal: true }).decode(bytes)
+    if (format === 'json') JSON.parse(text) // Validate the entire file before publishing an excerpt.
+    if ((format === 'text' || format === 'json') && text.includes('\u0000')) throw new Error('Text file contains binary null bytes')
+    text = (format === 'html' ? decodeHtml(text) : text.trim()).slice(0, 60_001)
   } else throw new Error('unsupported document format')
   process.stdout.write(text)
 

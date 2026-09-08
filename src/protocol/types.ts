@@ -25,6 +25,12 @@ export const WORK_LANE_PRIORITY: Readonly<Record<WorkLane, number>> = Object.fre
   background: 1,
 })
 
+export type ExecutionClass = 'conversation' | 'operation'
+export function executionClassOf(work: Pick<WorkItem, 'lane' | 'meta'>): ExecutionClass {
+  return work.meta?.['executionClass'] === 'conversation' || work.meta?.['executionClass'] === 'operation'
+    ? work.meta['executionClass'] : ['interactive', 'approval'].includes(work.lane) ? 'conversation' : 'operation'
+}
+
 export type WorkStatus = 'queued' | 'leased' | 'waiting' | 'succeeded' | 'partial' | 'blocked' | 'failed' | 'cancelled'
 
 export function workStatusOf(completion: WorkCompletion): WorkStatus {

@@ -45,8 +45,9 @@ export function createWorker(options: WorkerOptions): AgentWorker {
   const connection = options.controlPlane
   const connectionHost = 'connectWorker' in connection ? connection.connectWorker({ workerId, workKinds })
     : new HttpHostClient({ baseUrl: connection.url, serviceToken: connection.serviceToken, workerId, workKinds })
+  const modelCapacity = options.resources?.model ?? concurrency
   const model = limitModel('run' in options.model ? options.model : new OpenAIChatDriver(options.model.id ?? DEFAULT_MODEL.id, options.model),
-    new ResourceQuota(options.resources?.model ?? concurrency))
+    new ResourceQuota(modelCapacity, 1024, modelCapacity > 1 ? 1 : 0, metrics, 'model'))
   const host = reviewedMemoryHost(connectionHost,model,options.modelBudget)
   const bridge: KernelHostBridge = { execute: (work, action, signal) => host.executeAction(work, action, signal) }
   const kernels = options.kernelFactory?.(bridge) ?? new KernelManager(bridge, { ...options.kernel, logger, maxKernels: options.resources?.python ?? concurrency,

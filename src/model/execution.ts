@@ -3,7 +3,7 @@ import { setTimeout as delay } from 'node:timers/promises'
 import { createHash } from 'node:crypto'
 import { ModelBudgetExceededError, ModelDriverError, errorMessage } from '../errors.js'
 import type { HostPort } from '../host/port.js'
-import type { RunEvent, WorkItem } from '../protocol/types.js'
+import { executionClassOf, type RunEvent, type WorkItem } from '../protocol/types.js'
 import type { ModelDriver, ModelUsage } from './driver.js'
 import { abortable } from '../deadline.js'
 import { fitsModel, inputTokens, modelProfile } from './profile.js'
@@ -113,7 +113,7 @@ export function modelExecution(host: Pick<HostPort, 'reserveModelCall' | 'record
       // A completed provider request must be settled even after cancellation or lease loss.
       await host.recordModelUsage(work, callId, { inputTokens, outputTokens, costMicros }, observation)
       // Usage remains durable if the old lease can no longer emit telemetry.
-      await emit?.({ kind: 'model.request.finished', stage: result ? 'completed' : 'failed', visibility: 'internal', data: { ...observation } })
+      if (!request.signal?.aborted) await emit?.({ kind: 'model.request.finished', stage: result ? 'completed' : 'failed', visibility: 'internal', data: { ...observation } })
       if (result) return { ...result, callId, logicalCallId, ...(Object.keys(diagnostics).length ? {
         diagnostics: { ...('diagnostics' in result ? result.diagnostics as Record<string, unknown> : {}), ...diagnostics },
       } : {}) }
@@ -130,6 +130,7 @@ export function executionModel(host: Pick<HostPort, 'reserveModelCall' | 'record
   limits: Required<RootModelBudgetOptions>,
   emit?: (event: Omit<RunEvent, 'runId' | 'seq'>) => Promise<unknown>): ModelDriver {
   const model = source.singleAttempt?.() ?? source
+  const admission = executionClassOf(work) === 'operation' ? 'background' as const : 'foreground' as const
   const { invoke, nextCallId } = modelExecution(host, model, work, limits, emit)
   const check = (request: unknown) => {
     if (!fitsModel(model, request)) throw new Error('model call exceeds its context budget; original input was not truncated')
@@ -155,7 +156,7 @@ export function executionModel(host: Pick<HostPort, 'reserveModelCall' | 'record
         const began = performance.now()
         let firstTextMs: number | undefined
         let active = true
-        const result = model.run({ ...request, signal, onTextDelta: delta => {
+        const result = model.run({ ...request, admission, signal, onTextDelta: delta => {
             if (!active || signal.aborted) return
             if (delta) firstTextMs ??= performance.now() - began
             request.onTextDelta?.(delta)
@@ -171,12 +172,13 @@ export function executionModel(host: Pick<HostPort, 'reserveModelCall' | 'record
     },
     structured: request => {
       check(request)
-      return invoke('structured', request, signal => model.structured({ ...request, signal }))
+      return invoke('structured', request, signal => model.structured({ ...request, admission, signal }))
     },
     compact: request => {
       const compiled = { ...request, instructions: COMPACTION_PROMPT.instructions, prompt: COMPACTION_PROMPT.manifest }
       check(compiled)
-      return invoke('compaction', compiled, signal => model.compact({ ...compiled, signal }))
+      return invoke('compaction', compiled, signal => model.compact({ ...compiled,
+        admission: request.admission === 'background' ? 'background' : admission, signal }))
     },
   }
 }

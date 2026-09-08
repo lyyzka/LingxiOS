@@ -4,7 +4,7 @@ import { createMemoryRuntime } from '../src/memory/runtime.js'
 import type { SqlPool } from '../src/control-plane/pg-store.js'
 import type { WorkItem } from '../src/protocol/types.js'
 
-it('bounds scope concurrency, degrades only optional recall timeouts and rejects revoked scopes', async () => {
+it('bounds core concurrency, defers optional recall and rejects revoked scopes or required recall failures', async () => {
   const work: WorkItem = { id: 'w', tenantId: 't', agentId: 'a', principalId: 'u', sessionId: 's', meta: { text: 'query' },
     fence: 1, homeEpoch: 1, kind: 'turn', lane: 'interactive', triggerRef: 'm', leaseToken: 'lease' }
   const scopes = [1, 2, 3].map(n => ({ tenantId: 't', scopeType: 'project', scopeId: String(n) }))
@@ -28,9 +28,11 @@ it('bounds scope concurrency, degrades only optional recall timeouts and rejects
   assert.equal((await runtime.context(work)).status, 'available')
   assert.equal(peak, 2)
   mode = 'recall_timeout'
-  assert.deepEqual((await runtime.context(work)).retrieval, ['optional_timeout','optional_timeout','optional_timeout'])
+  assert.deepEqual((await runtime.context(work)).retrieval, ['optional_deferred','optional_deferred','optional_deferred'])
   mode = 'error'
-  await assert.rejects(runtime.context(work), /storage failure/)
+  assert.equal((await runtime.context(work)).status, 'available') // No optional search is started.
+  const required = createMemoryRuntime(pool, { resolveScopes: async () => scopes })
+  await assert.rejects(required.context(work), /storage failure/)
   mode = 'revoked'; resolutions = 0
   await assert.rejects(runtime.context(work), /revoked/)
   mode = 'core_timeout'

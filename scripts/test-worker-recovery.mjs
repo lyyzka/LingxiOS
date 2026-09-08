@@ -62,9 +62,16 @@ const proxy = createServer(async (req, res) => {
 async function until(check) {
   const deadline = Date.now() + 20_000
   while (!(await check())) {
-    assert.ok(Date.now() < deadline, 'worker recovery condition timed out')
+    if (Date.now() >= deadline) assert.fail(JSON.stringify({ error: 'worker recovery condition timed out', modelCalls,
+      workers: children.map(entry => entry.stderr),
+      work: (await pool.query('SELECT id,status,error,goal_outcome FROM lingxios.agent_work_items ORDER BY created_at')).rows }))
     await delay(25)
   }
+}
+async function expireWorker(id) {
+  await pool.query("UPDATE lingxios.agent_work_items SET lease_expires_at=NOW()-INTERVAL '1 minute' WHERE leased_by=$1 AND status='leased'", [id])
+  await pool.query("UPDATE lingxios.agent_os_session_leases SET expires_at=NOW()-INTERVAL '1 minute' WHERE work_id IN (SELECT id FROM lingxios.agent_work_items WHERE leased_by=$1)", [id])
+  await pool.query("UPDATE lingxios.agent_os_workers SET last_seen_at=NOW()-INTERVAL '1 day' WHERE worker_id=$1", [id])
 }
 function worker(id) {
   const child = spawn(process.execPath, [fileURLToPath(new URL('../dist/src/worker/main.js', import.meta.url))], {
@@ -99,9 +106,7 @@ try {
   original.child.kill('SIGKILL')
   await original.exit
   holdCompletion = false
-  await pool.query("UPDATE lingxios.agent_work_items SET lease_expires_at=NOW()-INTERVAL '1 minute' WHERE id=$1", [identity.runId])
-  await pool.query("UPDATE lingxios.agent_os_session_leases SET expires_at=NOW()-INTERVAL '1 minute'")
-  await pool.query("UPDATE lingxios.agent_os_workers SET last_seen_at=NOW()-INTERVAL '1 day'")
+  await expireWorker('original')
   const replacement = worker('replacement')
   await until(async () => (await pool.query('SELECT 1 FROM lingxios.agent_os_workers WHERE worker_id=$1', ['replacement'])).rows.length === 1)
   assert.equal((await pool.query('SELECT status FROM lingxios.agent_work_items WHERE id=$1', [identity.runId])).rows[0].status, 'succeeded')
@@ -136,6 +141,8 @@ try {
   const before = await app.graphs.read(root, 'recover'), firstResult = before.nodes.find(node => node.id === 'a').resultId
   assert.ok(firstResult)
   branchWorker.child.kill('SIGKILL'); await branchWorker.exit
+  // Immediate control notifications can retire A and let this worker lease B before SIGKILL.
+  await expireWorker('graph-original')
   holdCompletion = false
   const graphReplacement = worker('graph-replacement')
   await until(async () => (await app.readRun(root)).status === 'succeeded' || graphReplacement.child.exitCode !== null)
