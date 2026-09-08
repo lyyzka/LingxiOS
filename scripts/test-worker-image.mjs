@@ -72,7 +72,7 @@ const host = createServer((req, res) => {
   requests.push([req.method, req.url, req.headers.authorization])
   claims++
   req.resume()
-  // Leave the next claim pending to exercise HTTP cancellation on SIGTERM.
+  // Leave the wake wait pending to exercise HTTP cancellation on SIGTERM.
   if (claims === 1) res.writeHead(200, { 'content-type': 'application/json' }).end('null')
 })
 host.listen(0, '127.0.0.1')
@@ -99,7 +99,10 @@ try {
     await delay(50)
   }
   assert.ok(ready, logs)
-  assert.ok(requests.every(request => JSON.stringify(request) === JSON.stringify(['POST', '/v5/work/claim', 'Bearer image-test'])))
+  assert.deepEqual(requests, [
+    ['POST', '/v5/work/claim', 'Bearer image-test'],
+    ['POST', '/v5/work/wait', 'Bearer image-test'],
+  ])
   assert.equal((await fetch('http://127.0.0.1:5190/healthz')).status, 200)
   assert.equal((await fetch('http://127.0.0.1:5190/metrics')).status, 200)
   worker.kill('SIGTERM')
@@ -111,7 +114,7 @@ try {
   host.closeAllConnections()
   await new Promise(resolve => host.close(resolve))
 }
-console.log('worker image passed: non-root, exports, required config, Python kernel, authenticated polling, health and SIGTERM')
+console.log('worker image passed: non-root, exports, required config, Python kernel, authenticated wake wait, health and SIGTERM')
 `,
 })
 process.stdout.write(result.stdout ?? '')
