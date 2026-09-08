@@ -53,7 +53,7 @@ export interface MemoryHistoryHit {
   observedAt: string
 }
 export interface MemorySearchResult extends MemoryPage<MemoryHit | MemoryHistoryHit> {
-  retrieval: 'browse' | 'keyword' | 'hybrid' | 'keyword_embedding_unavailable'
+  retrieval: 'browse' | 'keyword' | 'hybrid' | 'keyword_embedding_unavailable' | 'optional_timeout'
 }
 export interface MemoryContent {
   path: string

@@ -1,5 +1,6 @@
 import { candidateHash, type Candidate, type CandidateVerification } from '../outcome/verification.js'
 import { grantedTools, TASK_TOOLS, parseTaskArgs, type ToolDefinition } from '../tools/catalog.js'
+import { readRequestAttachment } from '../context/request.js'
 import { NoEffectError } from '../tools/definition.js'
 import { permitsTool, executionMode } from '../runtime/execution-policy.js'
 import { canonicalJson } from '../context/compiler.js'
@@ -32,7 +33,7 @@ import { businessActionDeliveryGap, requiresReview, validateCompletion } from '.
 import type { KernelArtifact } from '../protocol/types.js'
 import { errorMessage } from '../errors.js'
 import { nullLogger, type Logger } from '../logging.js'
-import type { MetricsRegistry } from '../metrics.js'
+import { LATENCY_BUCKETS, type MetricsRegistry } from '../metrics.js'
 import { RUN_SEQUENCE_SPAN } from '../protocol/constants.js'
 import type {
   AssistantMessage, HeartbeatResult, HostAction, HostActionResult,
@@ -47,6 +48,9 @@ import type {
 import { isModelItem } from './stores.js'
 
 export interface ControlPlaneDeps {
+  contextSnapshot?: (work: Omit<WorkItem, 'leaseToken'>) => Promise<{
+    session: SessionRecord | null; steps: import('./steps.js').ExecutionStep[]; requestVersion: number
+  }>
   authorizeWork?: (work: Omit<WorkItem, 'leaseToken'>) => Promise<void>
   memory?: {
     prepareReview(work: Omit<WorkItem,'leaseToken'>,action: HostAction): Promise<import('../memory/types.js').MemoryReviewRequest|null>
@@ -273,7 +277,7 @@ export class ControlPlaneService {
     return result
   }
 
-  async claim(workerId: string, requestId?: string, workKinds?: readonly string[]): Promise<WorkItem | null> {
+  async claim(workerId: string, requestId?: string, workKinds?: readonly string[], lanes?: readonly WorkItem['lane'][]): Promise<WorkItem | null> {
     if (typeof workerId !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(workerId)) {
       throw new ControlPlaneError(400, 'workerId must be 1-128 safe identifier characters')
     }
@@ -281,10 +285,12 @@ export class ControlPlaneService {
       throw new ControlPlaneError(400, 'requestId must be a 16-128 character identifier')
     }
     if (workKinds && (workKinds.length < 1 || workKinds.length > 64 || workKinds.some(kind => typeof kind !== 'string' || !/^[a-z][a-z0-9_]{0,63}$/.test(kind)))) throw new ControlPlaneError(400, 'invalid worker task types')
-    const work = await this.deps.work.claim(workerId, requestId, workKinds)
+    if (lanes && (!Array.isArray(lanes) || !lanes.length || lanes.length > 4
+      || lanes.some(lane => !['interactive','approval','collaboration','background'].includes(lane)))) throw new ControlPlaneError(400, 'invalid worker lanes')
+    const work = await this.deps.work.claim(workerId, requestId, workKinds, lanes)
     if (work) {
       this.deps.metrics?.counter('agentos_work_claimed_total', 'Work items claimed').inc({ lane: work.lane })
-      if (work.availableAt) this.deps.metrics?.histogram('agentos_queue_wait_seconds', 'Eligible queue wait at claim', [1,5,15,60,120,300,900])
+      if (work.availableAt) this.deps.metrics?.histogram('agentos_queue_wait_seconds', 'Eligible queue wait at claim', LATENCY_BUCKETS)
         .observe(Math.max(0,(Date.now()-Date.parse(work.availableAt))/1000), { lane: work.lane })
     }
     return work
@@ -392,16 +398,23 @@ export class ControlPlaneService {
   // Context
   // -------------------------------------------------------------------------
 
-  async loadContext(proof: LeaseProof): Promise<TurnContext> {
+  async loadContext(proof: LeaseProof, includeSession = false): Promise<TurnContext> {
     const work = await this.requireLease(proof)
     await this.deps.authorizeWork?.(work)
-    const context = await this.deps.contextProvider.loadContext(work)
+    const [context, snapshot, grants, dependencies] = await Promise.all([
+      this.deps.contextProvider.loadContext(work),
+      this.deps.contextSnapshot?.(work) ?? (async () => {
+        const [session, steps] = await Promise.all([this.deps.sessions.get(sessionKeyOf(work), work.id), this.deps.steps.list(work.id)])
+        return { session, steps, requestVersion: (session?.request?.revisions.length ?? 0) + 1 }
+      })(),
+      this.deps.capabilityResolver.resolve(work),
+      this.deps.work.children(work),
+    ])
     if (typeof work.meta?.['text'] === 'string') {
       context.capabilities = [...new Set([...context.capabilities, 'task'])]
       if (context.promptContextCandidate) context.promptContextCandidate = { ...context.promptContextCandidate, capabilities: context.capabilities }
     }
-    const steps = await this.deps.steps.list(work.id)
-    const requestVersion = ((await this.deps.sessions.get(sessionKeyOf(work), work.id))?.request?.revisions.length ?? 0) + 1
+    const { steps, requestVersion } = snapshot
     const checkpoint = steps.findLast(step => step.kind === 'runtime.checkpoint' && step.requestVersion === requestVersion)
     const priorArtifacts = new Map<string, KernelArtifact>()
     if (work.fence > 1) {
@@ -413,9 +426,12 @@ export class ControlPlaneService {
       }
       for (const artifact of snapshotArtifacts(await this.deps.actions.artifacts(work.id))) priorArtifacts.set(artifact.path, artifact)
     }
-    const grants = await this.deps.capabilityResolver.resolve(work)
     if (typeof work.meta?.['text'] === 'string' && !grants.some(grant => grant.name === 'task')) grants.push({ name: 'task', methods: TASK_TOOLS.map(tool => tool.action.split('.')[1]!) })
-    return { work: { ...work, leaseToken: proof.leaseToken }, ...context, executionSteps: steps, ...(checkpoint ? { executionCheckpoint: checkpoint.input as unknown as import('../runtime/corrections.js').ProgressCheckpoint } : {}), grants, dependencies: await this.deps.work.children(work), tools: grantedTools(this.deps.tools ?? TASK_TOOLS, grants).filter(tool => permitsTool(work, tool)), priorArtifacts: [...priorArtifacts.values()] }
+    await this.requireLease(proof)
+    return { work: { ...work, leaseToken: proof.leaseToken }, ...context,
+      snapshotVersion: { fence: work.fence, requestVersion, sessionRevision: snapshot.session?.revision ?? 0 },
+      ...(includeSession ? { session: snapshot.session } : {}),
+      executionSteps: steps, ...(checkpoint ? { executionCheckpoint: checkpoint.input as unknown as import('../runtime/corrections.js').ProgressCheckpoint } : {}), grants, dependencies, tools: grantedTools(this.deps.tools ?? TASK_TOOLS, grants).filter(tool => permitsTool(work, tool)), priorArtifacts: [...priorArtifacts.values()] }
   }
 
   // -------------------------------------------------------------------------
@@ -450,7 +466,8 @@ export class ControlPlaneService {
     // Authoritative capability check. The kernel-side allowlist only shapes
     // what the model can conveniently express; this is the boundary.
     const grants = await this.deps.capabilityResolver.resolve(work)
-    const grant = namespace === 'task' && typeof work.meta?.['text'] === 'string' ? grants.find(candidate => candidate.name === 'task') ?? { name: 'task', methods: ['contract', 'ask', 'check_receipt', 'check_resource', 'inspect'] } : grants.find((candidate) => candidate.name === namespace)
+    const grant = namespace === 'task' && typeof work.meta?.['text'] === 'string' ? grants.find(candidate => candidate.name === 'task')
+      ?? { name: 'task', methods: TASK_TOOLS.map(tool => tool.action.split('.')[1]!) } : grants.find((candidate) => candidate.name === namespace)
     if (!grant || (grant.methods && !grant.methods.includes(method))) {
       this.deps.metrics?.counter('agentos_actions_denied_total', 'Host actions denied by grant').inc({ namespace })
       return reject('forbidden', `capability denied: ${action.action} is not granted to this work item`)
@@ -541,6 +558,10 @@ export class ControlPlaneService {
         const sideEffects = (this.deps.tools ?? TASK_TOOLS).filter(candidate => !candidate.action.startsWith('task.') && !candidate.action.startsWith('graph.') && candidate.effect !== 'read').map(candidate => candidate.action)
         const completedBusinessAction = await this.deps.actions.hasSuccessfulAction(work.id, requestVersion, sideEffects)
         result = { ok: true, value: { requestVersion, pending: pending.slice(0, 64), truncated: pending.length > 64, completedBusinessAction } }
+      } else if (action.action === 'task.read_attachment') {
+        const request = (await this.getSession(proof, sessionKeyOf(work)))?.request
+        if (!request || request.workId !== work.id) throw new Error('attachment read requires the current request snapshot')
+        result = { ok: true, value: readRequestAttachment(request, action.args) }
       } else if (action.action === 'task.contract') {
         const request = (await this.getSession(proof, sessionKeyOf(work)))?.request
         if (!request || request.workId !== work.id) throw new Error('task contract requires the current request snapshot')
@@ -631,18 +652,19 @@ export class ControlPlaneService {
     return step?.output === undefined ? null : { output: step.output, artifacts: snapshotArtifacts(step.artifacts) }
   }
 
-  async stageArtifact(proof: LeaseProof, artifact: KernelArtifact, contentBase64: string): Promise<void> {
+  async stageArtifact(proof: LeaseProof, artifact: KernelArtifact, content: string | Uint8Array): Promise<void> {
     const work = await this.requireLease(proof, { rejectCancelled: true })
     if (!this.deps.artifactStager) throw new ControlPlaneError(501, 'artifact upload is unavailable')
     let checked: KernelArtifact
     try { checked = snapshotArtifacts([artifact])[0]! }
     catch { throw new ControlPlaneError(400, 'invalid artifact metadata') }
-    if (typeof contentBase64 !== 'string' || contentBase64.length > 22_369_624) {
+    if (!(typeof content === 'string' || content instanceof Uint8Array)
+      || content.length > (typeof content === 'string' ? 22_369_624 : 16 * 1024 * 1024)) {
       throw new ControlPlaneError(413, 'artifact upload exceeds 16 MiB')
     }
-    const bytes = Buffer.from(contentBase64, 'base64')
+    const bytes = typeof content === 'string' ? Buffer.from(content, 'base64') : Buffer.from(content)
     if (bytes.length !== checked.size || bytes.length > 16 * 1024 * 1024
-      || bytes.toString('base64') !== contentBase64
+      || typeof content === 'string' && bytes.toString('base64') !== content
       || createHash('sha256').update(bytes).digest('hex') !== checked.sha256.toLowerCase()) {
       throw new ControlPlaneError(409, 'artifact content does not match its metadata', 'artifact_mismatch')
     }

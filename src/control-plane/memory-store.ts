@@ -93,7 +93,7 @@ export class MemoryWorkStore implements WorkStore {
   private readonly routes = new Map<string, SessionRoute>()
   private readonly sessionLeases = new Map<string, SessionLease>()
   private readonly workerLastSeen = new Map<string, number>()
-  private readonly claims = new Map<string, { workerId: string; work: WorkItem | null; kinds: string[] | null }>()
+  private readonly claims = new Map<string, { workerId: string; work: WorkItem | null; kinds: string[] | null; lanes?: readonly string[] }>()
   private readonly leaseTtlMs: number
   private readonly workerTimeoutMs: number
 
@@ -155,13 +155,15 @@ export class MemoryWorkStore implements WorkStore {
     return seen !== undefined && now - seen < this.workerTimeoutMs
   }
 
-  async claim(workerId: string, requestId?: string, workKinds?: readonly string[]): Promise<WorkItem | null> {
+  async claim(workerId: string, requestId?: string, workKinds?: readonly string[], lanes?: readonly WorkItem['lane'][]): Promise<WorkItem | null> {
     const kinds = workKinds ? [...new Set(workKinds)].sort() : null
+    lanes = lanes ? [...new Set(lanes)].sort() : undefined
     if (requestId) {
       const prior = this.claims.get(requestId)
       if (prior) {
         if (prior.workerId !== workerId) throw new Error('claim request identity reused by another worker')
         if (!isDeepStrictEqual(prior.kinds, kinds)) throw new Error('claim request task types changed')
+        if (!isDeepStrictEqual(prior.lanes, lanes)) throw new Error('claim request lanes changed')
         return structuredClone(prior.work)
       }
       if (this.claims.size >= 10_000) this.claims.delete(this.claims.keys().next().value!)
@@ -174,6 +176,7 @@ export class MemoryWorkStore implements WorkStore {
     const candidates = [...this.rows.values()]
       .filter((row) => {
         if (kinds && !kinds.includes(row.kind)) return false
+        if (lanes && !lanes.includes(row.lane)) return false
         if (['memory_synthesis','memory_index','memory_evaluation'].includes(row.kind) && row.attempts >= 3) return false
         const claimable = row.status === 'queued'
           || (row.status === 'leased' && (row.leaseExpiresAt ?? 0) <= now)
@@ -196,7 +199,7 @@ export class MemoryWorkStore implements WorkStore {
         || (Date.parse(a.createdAt) - Date.parse(b.createdAt)))
     const row = candidates[0]
     if (!row) {
-      if (requestId) this.claims.set(requestId, { workerId, work: null, kinds })
+      if (requestId) this.claims.set(requestId, { workerId, work: null, kinds, ...(lanes ? { lanes } : {}) })
       return null
     }
 
@@ -225,7 +228,7 @@ export class MemoryWorkStore implements WorkStore {
     const work = this.toWorkItem(row, token, homeEpoch)
     const { leaseToken: _token, ...issued } = work
     this.attempts.set(JSON.stringify([work.id, work.fence, row.leaseTokenHash]), structuredClone(issued))
-    if (requestId) this.claims.set(requestId, { workerId, work: structuredClone(work), kinds })
+    if (requestId) this.claims.set(requestId, { workerId, work: structuredClone(work), kinds, ...(lanes ? { lanes } : {}) })
     return work
   }
 

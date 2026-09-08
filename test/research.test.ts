@@ -19,6 +19,26 @@ it('rejects local, mapped, transition and reserved research addresses', () => {
   assert.equal(researchUrl('https://example.com/page').href, 'https://example.com/page')
 })
 
+it('cancels stalled research and enforces its total deadline', async context => {
+  const signals: AbortSignal[] = []
+  context.mock.method(http, 'request', (_url: URL, options: http.RequestOptions) => {
+    signals.push(options.signal!)
+    return Object.assign(new EventEmitter(), { end() {} })
+  })
+  syncBuiltinESMExports()
+  try {
+    const controller = new AbortController()
+    const stages: string[] = []
+    const pending = fetchResearch('http://1.1.1.1/stalled', { signal: controller.signal,
+      onProgress: progress => { stages.push(progress.stage) } })
+    controller.abort(new Error('user cancelled'))
+    await assert.rejects(pending, /user cancelled/)
+    await assert.rejects(fetchResearch('http://1.1.1.1/stalled', { timeoutMs: 10 }), /timed out/)
+    assert.deepEqual(stages, ['connecting'])
+    assert.ok(signals.every(signal => signal.aborted))
+  } finally { context.mock.restoreAll(); syncBuiltinESMExports() }
+})
+
 it('bounds response bodies and revalidates redirects before making another request', async (context) => {
   let calls = 0
   let status = 200

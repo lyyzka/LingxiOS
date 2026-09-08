@@ -74,6 +74,8 @@ it('preserves goal outcomes and enforces session leases over real HTTP', async (
     await client.stageArtifact(work, { path: 'result.txt', size: artifactBytes.length, mime: 'text/plain',
       sha256: createHash('sha256').update(artifactBytes).digest('hex') }, artifactBytes)
     assert.equal(staged, 'artifact')
+    await assert.rejects(client.stageArtifact(work, { path: 'result.txt', size: artifactBytes.length, mime: 'text/plain',
+      sha256: '0'.repeat(64) }, artifactBytes), /metadata/)
     for (const fence of ['1', true, [1], 0, 1.5]) {
       const response = await fetch(`http://127.0.0.1:${port}/v5/work/${work.id}/heartbeat`, { method: 'POST',
         headers: { authorization: 'Bearer test-secret', 'content-type': 'application/json' }, body: JSON.stringify({ fence, leaseToken: work.leaseToken }) })
@@ -93,6 +95,12 @@ it('preserves goal outcomes and enforces session leases over real HTTP', async (
     }
     const staleCopy = structuredClone(session)
     await client.saveSession(work, session)
+    const attachmentRead = await client.executeAction(work, { runId: work.id, cellId: 'read-attachment', callIndex: 0,
+      idempotencyKey: JSON.stringify([work.id, 'read-attachment', 0]), action: 'task.read_attachment',
+      args: { id: 'source', sourceVersion: 'version-1', offset: 0, limit: 100 } })
+    assert.equal(attachmentRead.ok, true)
+    assert.deepEqual(attachmentRead.value, { id: 'source', sourceVersion: 'version-1', offset: 0,
+      text: 'Notes', textLength: 5, nextOffset: 5, truncated: false })
     await assert.rejects(client.saveSession(work, { ...staleCopy, history: [{ role: 'user', content: 'different' }] }),
       (error: unknown) => error instanceof HostRequestError && error.responseCode === 'session_conflict')
     let droppedSaveResponse = false

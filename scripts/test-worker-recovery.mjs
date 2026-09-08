@@ -45,7 +45,11 @@ const proxy = createServer(async (req, res) => {
   for await (const chunk of req) chunks.push(chunk)
   try {
     const response = await fetch(`http://127.0.0.1:${controlPort}${req.url}`, {
-      method: req.method, headers: { authorization: req.headers.authorization ?? '', 'content-type': 'application/json' },
+      method: req.method, headers: {
+        authorization: req.headers.authorization ?? '', 'content-type': req.headers['content-type'] ?? 'application/json',
+        ...Object.fromEntries(['x-lingxios-fence','x-lingxios-lease','x-lingxios-artifact']
+          .flatMap(name => typeof req.headers[name] === 'string' ? [[name, req.headers[name]]] : [])),
+      },
       ...(chunks.length ? { body: Buffer.concat(chunks) } : {}),
     })
     if (holdCompletion && req.url.endsWith('/result') && response.ok) {

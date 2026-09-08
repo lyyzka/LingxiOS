@@ -9,6 +9,8 @@
  */
 import { randomUUID } from 'node:crypto'
 import { abortable } from '../deadline.js'
+import { previewRequestBody } from './preview-stream.js'
+import type { PreviewFrame } from '../protocol/preview.js'
 import { AgentOSError, LeaseLostError, errorMessage } from '../errors.js'
 import type {
   AssistantMessage, HeartbeatResult, HostAction, HostActionResult,
@@ -68,7 +70,9 @@ export class HttpHostClient implements HostPort {
     this.sleep = options.sleep ?? ((ms) => new Promise((resolveSleep) => setTimeout(resolveSleep, ms)))
   }
 
-  private async request<T>(method: string, path: string, body?: unknown, signal?: AbortSignal): Promise<T> {
+  private async request<T>(method: string, path: string, body?: unknown, signal?: AbortSignal,
+    binary?: { bytes: Uint8Array; headers: Record<string, string> }): Promise<T> {
+    const encoded = binary ? Buffer.from(binary.bytes) : body === undefined ? undefined : JSON.stringify(body)
     signal = AbortSignal.any([AbortSignal.timeout(this.timeoutMs),...signal ? [signal] : []])
     let lastError: unknown
     for (let attempt = 1; attempt <= this.maxAttempts; attempt++) {
@@ -81,8 +85,9 @@ export class HttpHostClient implements HostPort {
           headers: {
             authorization: `Bearer ${this.options.serviceToken}`,
             ...(body === undefined ? {} : { 'content-type': 'application/json' }),
+            ...binary?.headers,
           },
-          ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+          ...(encoded === undefined ? {} : { body: encoded }),
           signal: combined,
         }), combined)
         const detail = await readBody(response, this.maxResponseBytes, combined)
@@ -119,10 +124,35 @@ export class HttpHostClient implements HostPort {
     return { fence: work.fence, leaseToken: work.leaseToken }
   }
 
-  async claimWork(signal?: AbortSignal): Promise<WorkItem | null> {
+  async claimWork(signal?: AbortSignal, lanes?: readonly WorkItem['lane'][]): Promise<WorkItem | null> {
     return this.request<WorkItem | null>('POST', '/v5/work/claim', {
       workerId: this.options.workerId, requestId: randomUUID(), workKinds: this.options.workKinds ?? ['turn', 'resume'],
+      ...(lanes ? { lanes } : {}),
     }, signal)
+  }
+
+  async waitForWork(cursor: string | undefined, timeoutMs: number, signal?: AbortSignal): Promise<string> {
+    try { return await this.request<string>('POST', '/v5/work/wait', { cursor, timeoutMs: Math.min(timeoutMs, 25_000) }, signal) }
+    catch (error) {
+      if (!(error instanceof HostRequestError) || error.status !== 404) throw error
+      // Older protocol-compatible servers still use polling.
+      const sleep = this.sleep(Math.min(timeoutMs, 25_000))
+      if (signal) await abortable(sleep, signal)
+      else await sleep
+      return cursor ?? ''
+    }
+  }
+
+  async streamPreview(work: WorkItem, frames: AsyncIterable<PreviewFrame>, signal: AbortSignal = new AbortController().signal): Promise<void> {
+    const init: RequestInit & { duplex: 'half' } = {
+      method: 'POST', duplex: 'half', signal, body: previewRequestBody(frames, signal),
+      headers: { authorization: `Bearer ${this.options.serviceToken}`, 'content-type': 'application/x-ndjson',
+        'x-lingxios-fence': String(work.fence), 'x-lingxios-lease': work.leaseToken },
+    }
+    // Ephemeral uploads are never replayed. The consumer recovers a snapshot/final result instead.
+    const response = await this.fetchImpl(`${this.options.baseUrl.replace(/\/$/, '')}/v5/work/${encodeURIComponent(work.id)}/preview`, init)
+    await response.body?.cancel()
+    if (!response.ok) throw new HostRequestError(response.status, 'preview channel unavailable')
   }
 
   async heartbeat(work: WorkItem, signal?: AbortSignal): Promise<HeartbeatResult> {
@@ -133,6 +163,13 @@ export class HttpHostClient implements HostPort {
     const query = new URLSearchParams({ fence: String(work.fence), leaseToken: work.leaseToken })
     const context = await this.request<TurnContext>('GET', `/v5/work/${encodeURIComponent(work.id)}/context?${query}`, undefined, signal)
     // The wire strips the lease token from the embedded work item; restore it.
+    context.work = { ...context.work, leaseToken: work.leaseToken, homeEpoch: work.homeEpoch }
+    return context
+  }
+
+  async loadInitialContext(work: WorkItem, signal?: AbortSignal): Promise<TurnContext> {
+    const query = new URLSearchParams({ fence: String(work.fence), leaseToken: work.leaseToken, includeSession: 'true' })
+    const context = await this.request<TurnContext>('GET', `/v5/work/${encodeURIComponent(work.id)}/context?${query}`, undefined, signal)
     context.work = { ...context.work, leaseToken: work.leaseToken, homeEpoch: work.homeEpoch }
     return context
   }
@@ -162,6 +199,15 @@ export class HttpHostClient implements HostPort {
   }
 
   async stageArtifact(work: WorkItem, artifact: import('../protocol/types.js').KernelArtifact, bytes: Uint8Array, signal?: AbortSignal): Promise<void> {
+    try {
+      await this.request('POST', `/v5/work/${encodeURIComponent(work.id)}/artifact-bytes`, undefined, signal, {
+        bytes, headers: { 'content-type': 'application/octet-stream', 'x-lingxios-fence': String(work.fence),
+          'x-lingxios-lease': work.leaseToken, 'x-lingxios-artifact': Buffer.from(JSON.stringify(artifact)).toString('base64url') },
+      })
+      return
+    } catch (error) {
+      if (!(error instanceof HostRequestError) || error.status !== 404) throw error
+    }
     await this.request('POST', `/v5/work/${encodeURIComponent(work.id)}/artifacts`, {
       ...this.proof(work), artifact, contentBase64: Buffer.from(bytes).toString('base64'),
     }, signal)

@@ -12,6 +12,8 @@ import { AgentRuntime, type AgentRuntimeOptions, type WorkProcessor } from '../r
 import { memorySynthesisProcessor, memoryIndexProcessor, memoryEvaluationProcessor, type EvolutionEvaluator } from '../memory/processor.js'
 import { AgentWorker } from './worker.js'
 import { reviewedMemoryHost } from '../memory/worker-review.js'
+import { limitModel } from '../model/quota.js'
+import { ResourceQuota } from '../resource-quota.js'
 
 export interface WorkerConnection {
   connectWorker(input: { workerId: string; workKinds: readonly string[] }): HostPort
@@ -21,12 +23,13 @@ export interface WorkerOptions extends Omit<AgentRuntimeOptions, 'rootModelBudge
   controlPlane: WorkerConnection | { url: string; serviceToken: string }
   model: ModelDriver | ModelConfiguration
   modelBudget?: AgentRuntimeOptions['rootModelBudget']
+  resources?: { model?: number; python?: number }
   processors?: Readonly<Record<string, WorkProcessor | 'conversation'>>
   evolutionEvaluator?: EvolutionEvaluator
   kernel?: Omit<KernelManagerOptions, 'runnerPath' | 'logger' | 'maxKernels'>
   kernelFactory?: (bridge: KernelHostBridge) => ManagedKernelExecutor
   trustProcessKernel?: boolean
-  worker?: { id?: string; concurrency?: number; shutdownGraceMs?: number; pollIdleMs?: number; healthPort?: number }
+  worker?: { id?: string; concurrency?: number; reservedInteractiveRuns?: number; shutdownGraceMs?: number; pollIdleMs?: number; healthPort?: number }
   logger?: Logger
   metrics?: MetricsRegistry
 }
@@ -42,12 +45,13 @@ export function createWorker(options: WorkerOptions): AgentWorker {
   const connection = options.controlPlane
   const connectionHost = 'connectWorker' in connection ? connection.connectWorker({ workerId, workKinds })
     : new HttpHostClient({ baseUrl: connection.url, serviceToken: connection.serviceToken, workerId, workKinds })
-  const model = 'run' in options.model ? options.model : new OpenAIChatDriver(options.model.id ?? DEFAULT_MODEL.id, options.model)
+  const model = limitModel('run' in options.model ? options.model : new OpenAIChatDriver(options.model.id ?? DEFAULT_MODEL.id, options.model),
+    new ResourceQuota(options.resources?.model ?? concurrency))
   const host = reviewedMemoryHost(connectionHost,model,options.modelBudget)
   const bridge: KernelHostBridge = { execute: (work, action, signal) => host.executeAction(work, action, signal) }
-  const kernels = options.kernelFactory?.(bridge) ?? new KernelManager(bridge, { ...options.kernel, logger, maxKernels: concurrency,
+  const kernels = options.kernelFactory?.(bridge) ?? new KernelManager(bridge, { ...options.kernel, logger, maxKernels: options.resources?.python ?? concurrency,
     isolation: kernelIsolation(options.kernel?.isolation ?? process.env['AGENT_OS_KERNEL_ISOLATION'], process.env['NODE_ENV'] === 'production', options.trustProcessKernel) })
-  const runtime = new AgentRuntime(host, model, kernels, { ...options, ...(options.modelBudget ? { rootModelBudget: options.modelBudget } : {}) })
+  const runtime = new AgentRuntime(host, model, kernels, { ...options, metrics, ...(options.modelBudget ? { rootModelBudget: options.modelBudget } : {}) })
   runtime.registerProcessor('memory_synthesis', memorySynthesisProcessor)
   runtime.registerProcessor('memory_index', memoryIndexProcessor)
   if (options.evolutionEvaluator) runtime.registerProcessor('memory_evaluation', memoryEvaluationProcessor(options.evolutionEvaluator))
@@ -56,6 +60,7 @@ export function createWorker(options: WorkerOptions): AgentWorker {
     runtime.registerProcessor(kind, processor)
   }
   return new AgentWorker({ host, runtime, kernels, workerId, logger, metrics, maxConcurrentRuns: concurrency,
+    reservedInteractiveRuns: options.worker?.reservedInteractiveRuns ?? (concurrency > 1 ? 1 : 0),
     shutdownGraceMs: options.worker?.shutdownGraceMs ?? 20_000,
     ...(options.worker?.pollIdleMs === undefined ? {} : { pollIdleMs: options.worker.pollIdleMs }),
     ...(options.worker?.healthPort === undefined ? {} : { healthPort: options.worker.healthPort }),

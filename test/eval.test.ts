@@ -168,7 +168,7 @@ it('records truncated-review diagnostics when rerunning one evaluation case', as
         runtimeBudget = request.max_tokens
         assert.equal(request.tool_choice, 'auto')
         assert.equal(request.response_format, undefined)
-        assert.deepEqual(request.tools.map((tool: { function: { name: string } }) => tool.function.name), ['ipython', 'task__contract', 'task__ask', 'task__check_receipt', 'task__check_resource', 'task__inspect'])
+        assert.deepEqual(request.tools.map((tool: { function: { name: string } }) => tool.function.name), ['ipython', 'task__read_attachment', 'task__contract', 'task__ask', 'task__check_receipt', 'task__check_resource', 'task__inspect'])
         res.writeHead(200, { 'content-type': 'text/event-stream' })
         const delta = { content: '385' }
         res.end(`data: ${JSON.stringify({ model: 'fixture', choices: [{ index: 0, delta, finish_reason: 'tool_calls' }] })}\n\ndata: [DONE]\n\n`)

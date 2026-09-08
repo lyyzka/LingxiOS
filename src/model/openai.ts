@@ -162,6 +162,7 @@ export async function* sseDataEvents(body: ReadableStream<Uint8Array>): AsyncGen
 }
 
 export class OpenAIChatDriver implements ModelDriver {
+  readonly previewFormat = 'candidate-json' as const
   readonly profile: ModelProfile
   countTokens(text: string): number { return this.options.countTokens?.(text) ?? Buffer.byteLength(text) }
   readonly maxThinkingTokens: number
@@ -205,6 +206,10 @@ export class OpenAIChatDriver implements ModelDriver {
   }
 
   private async request(body: Record<string, unknown>, signal?: AbortSignal): Promise<Response> {
+    const encoded = JSON.stringify({ max_tokens: this.maxOutputTokens,
+      ...(this.options.maxThinkingTokens !== undefined || this.options.reasoningEffort ? { enable_thinking: this.maxThinkingTokens > 0 } : {}),
+      ...(this.maxThinkingTokens ? { thinking_budget: this.maxThinkingTokens } : {}),
+      ...(this.options.reasoningEffort ? { reasoning_effort: this.options.reasoningEffort } : {}), ...body })
     let lastError: unknown
     for (let attempt = 1; attempt <= this.maxAttempts; attempt++) {
       signal?.throwIfAborted()
@@ -218,10 +223,7 @@ export class OpenAIChatDriver implements ModelDriver {
             'content-type': 'application/json',
             authorization: `Bearer ${this.options.apiKey}`,
           },
-          body: JSON.stringify({ max_tokens: this.maxOutputTokens,
-            ...(this.options.maxThinkingTokens !== undefined || this.options.reasoningEffort ? { enable_thinking: this.maxThinkingTokens > 0 } : {}),
-            ...(this.maxThinkingTokens ? { thinking_budget: this.maxThinkingTokens } : {}),
-            ...(this.options.reasoningEffort ? { reasoning_effort: this.options.reasoningEffort } : {}), ...body }),
+          body: encoded,
           signal: combined,
         })
       } catch (error) {

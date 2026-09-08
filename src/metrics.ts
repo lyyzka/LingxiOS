@@ -6,6 +6,9 @@
 
 type LabelValues = Record<string, string>
 
+/** Includes the sub-second delivery/claim SLOs as well as long model/tool calls. */
+export const LATENCY_BUCKETS = [0.01, 0.025, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 15, 60, 120, 300, 900] as const
+
 function labelKey(labels: LabelValues): string {
   const entries = Object.entries(labels).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
   return entries.map(([k, v]) => `${k}="${v.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '\\n')}"`).join(',')

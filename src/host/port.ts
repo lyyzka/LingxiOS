@@ -16,13 +16,19 @@ export interface HostPort {
   verifyCandidate(work: WorkItem, candidate: import('../outcome/verification.js').Candidate, signal?: AbortSignal): Promise<import('../outcome/verification.js').CandidateVerification>
   saveStep(work: WorkItem, step: import('../control-plane/steps.js').ExecutionStep, signal?: AbortSignal): Promise<void>
   /** Claim one queued work item, or null when none is available. */
-  claimWork(signal?: AbortSignal): Promise<WorkItem | null>
+  claimWork(signal?: AbortSignal, lanes?: readonly WorkItem['lane'][]): Promise<WorkItem | null>
+  /** Advisory wake cursor. Always scan durable work after wake/timeout/reconnect. */
+  waitForWork?(cursor: string | undefined, timeoutMs: number, signal?: AbortSignal): Promise<string>
+  /** One bounded, ephemeral stream per leased run; no token persistence or transport retries. */
+  streamPreview?(work: WorkItem, frames: AsyncIterable<import('../protocol/preview.js').PreviewFrame>, signal?: AbortSignal): Promise<void>
 
   /** Renew the lease; also transports cancel/preempt/steer signals back. */
   heartbeat(work: WorkItem, signal?: AbortSignal): Promise<HeartbeatResult>
 
   /** Load the full turn context for a claimed work item. */
   loadContext(work: WorkItem, signal?: AbortSignal): Promise<TurnContext>
+  /** Initial session and journal share a versioned snapshot, avoiding a second restore round trip. */
+  loadInitialContext?(work: WorkItem, signal?: AbortSignal): Promise<TurnContext>
 
   reserveModelCall(work: WorkItem, callId: string, limits: ModelBudgetLimits, signal?: AbortSignal): Promise<ModelBudgetReservation>
   recordModelUsage(work: WorkItem, callId: string, usage: { inputTokens: number; outputTokens: number; costMicros: number }, observation?: import('../model/execution.js').ModelCallObservation, signal?: AbortSignal): Promise<void>

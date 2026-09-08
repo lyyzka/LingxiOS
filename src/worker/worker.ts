@@ -16,11 +16,12 @@ import type { AgentRuntime } from '../runtime/runtime.js'
 import { abortable } from '../deadline.js'
 
 export interface AgentWorkerOptions {
-  host: Pick<HostPort, 'claimWork'>
+  host: Pick<HostPort, 'claimWork' | 'waitForWork'>
   runtime: Pick<AgentRuntime, 'runWork'>
   kernels?: ManagedKernelExecutor
   workerId: string
   maxConcurrentRuns: number
+  reservedInteractiveRuns?: number
   shutdownGraceMs: number
   pollIdleMs?: number
   healthPort?: number
@@ -31,6 +32,7 @@ export interface AgentWorkerOptions {
 
 export class AgentWorker {
   private readonly active = new Map<string, Promise<void>>()
+  private backgroundRuns = 0
   private readonly logger: Logger
   private readonly pollIdleMs: number
   private stopping = false
@@ -44,6 +46,8 @@ export class AgentWorker {
   private stopResult: Promise<{ timedOut: boolean }> | undefined
 
   constructor(private readonly options: AgentWorkerOptions) {
+    const reserved = options.reservedInteractiveRuns ?? 0
+    if (!Number.isSafeInteger(reserved) || reserved < 0 || reserved >= options.maxConcurrentRuns) throw new Error('reserved interactive runs must be below total concurrency')
     this.logger = (options.logger ?? nullLogger).child({ workerId: options.workerId })
     this.pollIdleMs = options.pollIdleMs ?? 750
   }
@@ -121,20 +125,27 @@ export class AgentWorker {
   }
 
   private async poll(): Promise<void> {
+    let wakeCursor: string | undefined
     while (!this.stopping) {
       try {
         if (this.active.size >= this.options.maxConcurrentRuns) {
           await Promise.race(this.active.values())
           continue
         }
-        const work = await abortable(this.options.host.claimWork(this.stopPolling.signal),this.stopPolling.signal)
+        const backgroundLimit = this.options.maxConcurrentRuns - (this.options.reservedInteractiveRuns ?? 0)
+        const work = await abortable(this.options.host.claimWork(this.stopPolling.signal,
+          this.backgroundRuns >= backgroundLimit ? ['interactive', 'approval'] : undefined),this.stopPolling.signal)
         this.lastClaimAt = Date.now()
         if (this.stopping) return
         if (!work) {
-          await this.sleep(this.pollIdleMs)
+          if (this.options.host.waitForWork) {
+            wakeCursor = await this.options.host.waitForWork(wakeCursor, this.pollIdleMs, this.stopPolling.signal)
+          } else await this.sleep(this.pollIdleMs)
           continue
         }
         if (this.active.has(work.id)) continue
+        const background = !['interactive', 'approval'].includes(work.lane)
+        if (background) this.backgroundRuns++
         this.options.metrics?.gauge('agentos_worker_active_runs', 'Runs in flight').set(this.active.size + 1)
         const done = this.options.runtime.runWork(work, this.shutdown.signal)
           .catch((error: unknown) => {
@@ -142,6 +153,7 @@ export class AgentWorker {
           })
           .finally(() => {
             this.active.delete(work.id)
+            if (background) this.backgroundRuns--
             this.options.metrics?.gauge('agentos_worker_active_runs', 'Runs in flight').set(this.active.size)
           })
         this.active.set(work.id, done)

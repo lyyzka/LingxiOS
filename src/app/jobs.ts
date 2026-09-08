@@ -70,6 +70,12 @@ export interface RunState { run: RunSnapshot; message: import('../protocol/types
 
 /** A single MVCC snapshot keeps the response, result identity and delivery status consistent. */
 export async function readRunState(database: SqlQueryable, identity: RunIdentity): Promise<RunState | null> {
+  const row = await readRunRecord(database, identity)
+  return row ? runStateFromRow(row) : null
+}
+
+/** Internal shared read for state and streaming policy; both use the very same work/result version. */
+export async function readRunRecord(database: SqlQueryable, identity: RunIdentity): Promise<Record<string, unknown> | null> {
   await authorizeRunRead(database, identity)
   const { rows } = await database.query(`SELECT work.*,jsonb_array_length(steer_inputs)+1 AS request_version,
     result.fence AS result_fence,result.message,CASE WHEN work.result_id IS NULL THEN NULL WHEN outbox.result_id IS NULL THEN 'not_observed'
@@ -77,8 +83,11 @@ export async function readRunState(database: SqlQueryable, identity: RunIdentity
     FROM (SELECT * FROM lingxios.agent_work_items WHERE ${scopeSql}) work
     LEFT JOIN lingxios.agent_results result ON result.id=work.result_id
     LEFT JOIN lingxios.agent_delivery_outbox outbox ON outbox.result_id=work.result_id`, params(identity))
-  const row = rows[0]
-  return row ? { run: runSnapshot(row), message: row['message'] as RunState['message'], delivery: row['delivery'] as RunState['delivery'] } : null
+  return rows[0] ?? null
+}
+
+export function runStateFromRow(row: Record<string, unknown>): RunState {
+  return { run: runSnapshot(row), message: row['message'] as RunState['message'], delivery: row['delivery'] as RunState['delivery'] }
 }
 
 export async function requestSnapshot(database: SqlQueryable, workId: string, requestVersion: number | null): Promise<RequestSnapshot> {

@@ -54,7 +54,7 @@ export class PgStepStore implements StepStore {
     return rows.map(fromRow)
   }
 }
-function fromRow(row: Record<string, unknown>): ExecutionStep {
+export function fromRow(row: Record<string, unknown>): ExecutionStep {
   return { id: String(row['step_id']), kind: String(row['kind']), requestVersion: Number(row['request_version']),
     input: row['input'] as Record<string, unknown>, ...(row['output'] === null ? {} : { output: String(row['output']) }),
     artifacts: row['artifacts'] as KernelArtifact[] }

@@ -56,7 +56,7 @@
 
 `RuntimePolicy.assembleSystemPrompt()` 已改为 `productRules()`。消费端应返回可信产品/角色规则，把 persona 和委派说明留在数据层，并使用新编译输出。业务工具迁移时保留实际 schema、授权方法与来源版本进入指纹，同时保留持久步骤、资源读回和复核绑定。
 
-包版本为 3.2.0，schema 为 10，控制面协议为 8。协议升级会拒绝不识别 IM 会话隔离与协作上下文的旧 Worker；Kernel 协议和已提交消息版本不变。升级和回滚步骤见 [packaged runtime](packaged-runtime.md)。schema 9 → 10 为非破坏性迁移，保留记忆及业务记录；本包启动只读检查，不自动改生产数据库或流量。
+包版本为 3.2.1，schema 为 10，控制面协议为 8。协议升级会拒绝不识别 IM 会话隔离与协作上下文的旧 Worker；Kernel 协议和已提交消息版本不变。升级和回滚步骤见 [packaged runtime](packaged-runtime.md)。schema 9 → 10 为非破坏性迁移，保留记忆及业务记录；本包启动只读检查，不自动改生产数据库或流量。
 
 ## 可信完成义务
 
