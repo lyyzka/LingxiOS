@@ -36,8 +36,10 @@ export interface ModelTurnRequest {
   prompt?: import('../context/compiler.js').PromptManifest
   items: readonly ModelItem[]
   signal?: AbortSignal | undefined
-  /** Called as assistant text streams; used for latency, not for delivery. */
+  /** Raw assistant content; never deliver without a declared format and trusted preview policy. */
   onTextDelta?: ((delta: string) => void) | undefined
+  /** Runtime-owned retry boundary; clears any draft from the preceding provider attempt. */
+  onAttempt?: ((callId: string) => void) | undefined
 }
 
 export interface StructuredCallRequest {
@@ -70,6 +72,8 @@ export interface CompactionResult {
 }
 
 export interface ModelDriver {
+  /** Only declare an independent user channel, or a JSON candidate with a top-level body string. */
+  readonly previewFormat?: 'candidate-json' | 'user-text'
   readonly profile?: ModelProfile
   /** A provider tokenizer or calibrated upper bound; never a fixed bytes/constant guess. */
   countTokens?(text: string): number

@@ -15,6 +15,9 @@ import type { SemanticMemory } from './semantic.js'
 
 export function createMemoryService(database: SqlPool,options: MemoryOptions,semantic?: SemanticMemory) {
   const settings = memorySettings(options)
+  // Internal context assembler authorizes the complete scope snapshot before AND after calling this.
+  const recall = (work: Omit<WorkItem, 'leaseToken'>, scope: MemoryScope, query: string, db: SqlQueryable, signal?: AbortSignal) =>
+    semantic ? semantic.recall(work, scope, query, 12, signal) : searchMemories(db, scope, query, 12)
   const access = (identity: MemoryIdentity,scope: MemoryScope,db: SqlQueryable=database) => authorizeScope(options,identity,db,scope)
   const sources = (identity: MemoryIdentity,input: { sourceRef: string; idempotencyKey: string }): MemorySource[] => {
     if (typeof input.sourceRef!=='string' || !input.sourceRef.trim() || input.sourceRef.length>1000
@@ -130,6 +133,6 @@ export function createMemoryService(database: SqlPool,options: MemoryOptions,sem
     if (write.explicit) await resolveConflicts(db,scope,changes)
     return result
   }
-  return {api,tools,search}
+  return {api,tools,search,recall}
 }
 export type MemoryAPI = ReturnType<typeof createMemoryService>['api']

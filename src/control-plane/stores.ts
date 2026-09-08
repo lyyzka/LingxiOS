@@ -80,7 +80,7 @@ export interface WorkStore {
    * session exclusivity and session→worker routing; returns null when
    * nothing is claimable.
    */
-  claim(workerId: string, requestId?: string, workKinds?: readonly string[]): Promise<WorkItem | null>
+  claim(workerId: string, requestId?: string, workKinds?: readonly string[], lanes?: readonly WorkLane[]): Promise<WorkItem | null>
 
   /** Renew the lease; null when the lease is no longer valid. */
   heartbeat(id: string, fence: number, leaseTokenHash: string): Promise<HeartbeatRow | null>

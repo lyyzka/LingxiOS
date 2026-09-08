@@ -13,16 +13,23 @@ export interface MemoryOptions {
   writePolicy?: MemoryWritePolicy
   embeddings?: EmbeddingOptions
   evolution?: { benchmarkId: string }
-  contextBudget?: { ratio?: number; maxTokens?: number }
+  contextBudget?: { ratio?: number; maxTokens?: number; concurrency?: number; timeoutMs?: number;
+    /** Only supplemental recall may time out; core memory and authorization never degrade silently. */
+    optionalRecall?: boolean; recallTimeoutMs?: number }
   reflection?: { afterInteractions?: number; idleMs?: number }
 }
 export function memorySettings(options: MemoryOptions) {
   const ratio = options.contextBudget?.ratio ?? 0.08, maxTokens = options.contextBudget?.maxTokens ?? 8000
+  const concurrency = options.contextBudget?.concurrency ?? 2, timeoutMs = options.contextBudget?.timeoutMs ?? 10_000
+  const recallTimeoutMs = options.contextBudget?.recallTimeoutMs ?? Math.min(3000, timeoutMs)
   const afterInteractions = options.reflection?.afterInteractions ?? 5, idleMs = options.reflection?.idleMs ?? 600_000
   if (!Number.isFinite(ratio) || ratio <= 0 || ratio > 0.25 || !Number.isSafeInteger(maxTokens) || maxTokens < 512 || maxTokens > 32_000
     || !Number.isSafeInteger(afterInteractions) || afterInteractions < 1 || afterInteractions > 20
-    || !Number.isSafeInteger(idleMs) || idleMs < 1000 || idleMs > 86_400_000) throw new Error('invalid memory budget or reflection configuration')
-  return { ratio,maxTokens,afterInteractions,idleMs }
+    || !Number.isSafeInteger(idleMs) || idleMs < 1000 || idleMs > 86_400_000
+    || !Number.isSafeInteger(concurrency) || concurrency < 1 || concurrency > 4
+    || !Number.isSafeInteger(timeoutMs) || timeoutMs < 100 || timeoutMs > 30_000
+    || !Number.isSafeInteger(recallTimeoutMs) || recallTimeoutMs < 10 || recallTimeoutMs > timeoutMs) throw new Error('invalid memory budget or reflection configuration')
+  return { ratio,maxTokens,afterInteractions,idleMs,concurrency,timeoutMs,recallTimeoutMs }
 }
 export function identityOf(work: Omit<WorkItem,'leaseToken'>): MemoryIdentity {
   if (!work.principalId) throw new Error('memory requires an authenticated principal')

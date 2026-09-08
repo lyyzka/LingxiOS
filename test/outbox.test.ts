@@ -4,6 +4,38 @@ import { it } from 'node:test'
 import { PGlite } from '@electric-sql/pglite'
 import { flushOutbox } from '../src/control-plane/outbox.js'
 
+it('drains ordered events and lets a fresh healthy lane run while an earlier flush is stalled', async () => {
+  const db = new PGlite()
+  await db.exec(await readFile(new URL('../../db/schema.sql', import.meta.url), 'utf8'))
+  const database = { async query(sql: string, params?: unknown[]) {
+    const result = await db.query<Record<string, unknown>>(sql, params)
+    return { rows: result.rows, rowCount: result.affectedRows ?? result.rows.length }
+  } }
+  let release!: () => void, began!: () => void
+  const blocked = new Promise<void>(resolve => { release = resolve })
+  const started = new Promise<void>(resolve => { began = resolve })
+  const delivered: string[] = []
+  const insert = (run: string, seq: number) => db.query(`INSERT INTO lingxios.agent_run_events
+    (run_id,seq,tenant_id,agent_id,kind,stage,visibility,delivery_work) VALUES($1,$2,'t','a','text','delta','user','{}')`, [run, seq])
+  const deliver = async (row: Record<string, unknown>) => {
+    if (row['run_id'] === 'slow') { began(); await blocked }
+    delivered.push(`${row['run_id']}:${row['seq']}`)
+  }
+  try {
+    await insert('slow', 1)
+    const first = flushOutbox(database, 'agent_run_events', deliver, { concurrency: 2, timeoutMs: 2000 })
+    await started
+    // Allow the other empty lane to return before admitting more durable work.
+    await new Promise<void>(resolve => setTimeout(resolve, 20))
+    for (let seq = 1; seq <= 5; seq++) await insert('healthy', seq)
+    await flushOutbox(database, 'agent_run_events', deliver, { concurrency: 2 })
+    assert.deepEqual(delivered, ['healthy:1', 'healthy:2', 'healthy:3', 'healthy:4', 'healthy:5'])
+    release()
+    await first
+    assert.equal(delivered.at(-1), 'slow:1')
+  } finally { release(); await db.close() }
+})
+
 it('aborts hung delivery, persists exhaustion, and continues other streams without reordering one stream', async () => {
   const db = new PGlite()
   await db.exec(await readFile(new URL('../../db/schema.sql', import.meta.url), 'utf8'))

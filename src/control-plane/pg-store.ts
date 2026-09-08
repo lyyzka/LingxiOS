@@ -8,6 +8,7 @@
  */
 import { createHash, randomBytes, randomUUID } from 'node:crypto'
 import { isDeepStrictEqual } from 'node:util'
+import { fromRow as stepFromRow, type ExecutionStep } from './steps.js'
 import { sessionKeyOf, workStatusOf } from '../protocol/types.js'
 import { cancelDescendants, cancelRun, enqueueWork } from '../app/jobs.js'
 import type {
@@ -128,8 +129,9 @@ export class PgWorkStore implements WorkStore {
 
   async enqueue(input: EnqueueWorkInput): Promise<EnqueueResult> { return enqueueWork(this.pool, input) }
 
-  async claim(workerId: string, requestId?: string, workKinds?: readonly string[]): Promise<WorkItem | null> {
+  async claim(workerId: string, requestId?: string, workKinds?: readonly string[], lanes?: readonly WorkItem['lane'][]): Promise<WorkItem | null> {
     const kinds = workKinds ? [...new Set(workKinds)].sort() : null
+    const filter = lanes ? { kinds, lanes: [...new Set(lanes)].sort() } : kinds
     return withTransaction(this.pool, async (client) => {
       if (requestId) {
         // ponytail: seven-day dedupe window bounds storage; use partitioned retention if claim volume demands it.
@@ -137,13 +139,13 @@ export class PgWorkStore implements WorkStore {
           WHERE completed=TRUE AND created_at<NOW()-INTERVAL '7 days'`)
         const inserted = await client.query(
           `INSERT INTO lingxios.agent_claim_requests (request_id, worker_id, work_kinds)
-           VALUES ($1,$2,$3::jsonb) ON CONFLICT (request_id) DO NOTHING RETURNING request_id`, [requestId, workerId, JSON.stringify(kinds)])
+           VALUES ($1,$2,$3::jsonb) ON CONFLICT (request_id) DO NOTHING RETURNING request_id`, [requestId, workerId, JSON.stringify(filter)])
         if (!inserted.rows[0]) {
           const prior = await client.query(
             `SELECT worker_id, work_kinds, completed, response FROM lingxios.agent_claim_requests
               WHERE request_id=$1 FOR UPDATE`, [requestId])
           if (prior.rows[0]?.['worker_id'] !== workerId) throw new Error('claim request identity reused by another worker')
-          if (!isDeepStrictEqual(prior.rows[0]?.['work_kinds'], kinds)) throw new Error('claim request task types changed')
+          if (!isDeepStrictEqual(prior.rows[0]?.['work_kinds'], filter)) throw new Error('claim request task types changed or lanes changed')
           if (prior.rows[0]?.['completed']) return prior.rows[0]['response'] as WorkItem | null
         }
       }
@@ -166,6 +168,7 @@ export class PgWorkStore implements WorkStore {
              ON route.session_key = ${WORK_SESSION_KEY_SQL}
           WHERE (work.status = 'queued' OR (work.status = 'leased' AND work.lease_expires_at <= NOW()))
             AND ($2::text[] IS NULL OR work.kind=ANY($2::text[]))
+            AND ($3::text[] IS NULL OR work.lane=ANY($3::text[]))
             AND (work.kind NOT IN ('memory_synthesis','memory_index','memory_evaluation') OR work.attempts < 3)
             AND work.cancel_requested_at IS NULL
             AND work.available_at <= NOW()
@@ -190,7 +193,7 @@ export class PgWorkStore implements WorkStore {
                    work.priority DESC, (route.worker_id=$1) DESC NULLS LAST, work.created_at ASC
           FOR UPDATE OF work SKIP LOCKED
           LIMIT 1`,
-        [workerId, kinds],
+        [workerId, kinds, lanes ?? null],
       )
       const row = rows[0]
       if (!row) return finish(null)
@@ -372,22 +375,25 @@ export class PgSessionStore implements SessionStore {
        LEFT JOIN lingxios.agent_request_snapshots request ON request.work_id=$2
        WHERE session.session_key=$1`, [key, workId ?? null],
     )
+    return rows[0] ? sessionFromRow(rows[0]) : null
+  }
+
+  /** Session, request version and execution journal are from one MVCC snapshot. */
+  async context(work: Omit<WorkItem, 'leaseToken'>): Promise<{ session: SessionRecord | null; steps: ExecutionStep[]; requestVersion: number }> {
+    const { rows } = await this.pool.query(`SELECT jsonb_array_length(work.steer_inputs)+1 AS request_version,
+      CASE WHEN session.session_key IS NULL THEN NULL ELSE to_jsonb(session)||jsonb_build_object(
+        'effective_request_snapshot',COALESCE(request.request_snapshot,session.request_snapshot)) END AS session,
+      COALESCE((SELECT jsonb_agg(step ORDER BY step_seq) FROM
+        (SELECT * FROM lingxios.agent_steps WHERE work_id=work.id ORDER BY step_seq LIMIT 2049) step),'[]'::jsonb) AS steps
+      FROM lingxios.agent_work_items work LEFT JOIN lingxios.agent_os_sessions session ON session.session_key=$2
+      LEFT JOIN lingxios.agent_request_snapshots request ON request.work_id=work.id
+      WHERE work.id=$1 AND work.fence=$3 AND work.status='leased' AND work.lease_expires_at>NOW()`, [work.id, sessionKeyOf(work), work.fence])
     const row = rows[0]
-    if (!row) return null
-    return {
-      key: String(row['session_key']),
-      tenantId: String(row['tenant_id']),
-      agentId: String(row['agent_id']),
-      sessionId: String(row['session_id']),
-      ...(row['thread_id'] !== null ? { threadId: String(row['thread_id']) } : {}),
-      ...(row['summary'] !== null ? { summary: String(row['summary']) } : {}),
-      ...(row['effective_request_snapshot'] ? { request: row['effective_request_snapshot'] as NonNullable<SessionRecord['request']> } : {}),
-      history: row['history'] as SessionRecord['history'],
-      appliedWorkIds: (row['applied_work_ids'] ?? []) as string[],
-      revision: Number(row['revision']),
-      compactionEpoch: Number(row['compaction_epoch'] ?? 0),
-      ...(row['prompt_context'] ? { promptContext: row['prompt_context'] as NonNullable<SessionRecord['promptContext']> } : {}),
-    }
+    if (!row) throw new Error('context attempt is no longer current')
+    const steps = row['steps'] as Record<string, unknown>[]
+    if (steps.length > 2048) throw new Error('step history exceeds the bounded recovery limit')
+    return { session: row['session'] ? sessionFromRow(row['session'] as Record<string, unknown>) : null,
+      steps: steps.map(stepFromRow), requestVersion: Number(row['request_version']) }
   }
 
   async save(session: SessionRecord, proof?: import('./stores.js').StoreLeaseProof): Promise<SaveSessionResult> {
@@ -427,13 +433,26 @@ export class PgSessionStore implements SessionStore {
         session.promptContext ? JSON.stringify(session.promptContext) : null,
         session.request ? JSON.stringify(session.request) : null]))
       if (!rows[0]) return { ok: false, conflict: true }
-      if (session.request) await client.query(`INSERT INTO lingxios.agent_request_snapshots(work_id,session_key,request_snapshot)
-        VALUES($1,$2,$3::jsonb) ON CONFLICT(work_id) DO UPDATE
-        SET request_snapshot=EXCLUDED.request_snapshot,updated_at=NOW()
-        WHERE lingxios.agent_request_snapshots.session_key=EXCLUDED.session_key`,
-      [session.request.workId, session.key, JSON.stringify(session.request)])
+      // The required agent_session_request_snapshot trigger writes the request in this transaction.
       return { ok: true, revision: Number(rows[0]['revision']) }
     })
+  }
+}
+
+function sessionFromRow(row: Record<string, unknown>): SessionRecord {
+  return {
+    key: String(row['session_key']),
+    tenantId: String(row['tenant_id']),
+    agentId: String(row['agent_id']),
+    sessionId: String(row['session_id']),
+    ...(row['thread_id'] !== null ? { threadId: String(row['thread_id']) } : {}),
+    ...(row['summary'] !== null ? { summary: String(row['summary']) } : {}),
+    ...(row['effective_request_snapshot'] ? { request: row['effective_request_snapshot'] as NonNullable<SessionRecord['request']> } : {}),
+    history: row['history'] as SessionRecord['history'],
+    appliedWorkIds: (row['applied_work_ids'] ?? []) as string[],
+    revision: Number(row['revision']),
+    compactionEpoch: Number(row['compaction_epoch'] ?? 0),
+    ...(row['prompt_context'] ? { promptContext: row['prompt_context'] as NonNullable<SessionRecord['promptContext']> } : {}),
   }
 }
 

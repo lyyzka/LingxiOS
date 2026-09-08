@@ -2,7 +2,7 @@ import { decodeSourceText } from '../context/text.js'
 import { extractDocumentText } from '../context/document-text.js'
 import { createHash } from 'node:crypto'
 import { researchUrl } from './address.js'
-import { fetchResearch } from './fetch.js'
+import { fetchResearch, type ResearchOptions } from './fetch.js'
 
 const MAX_TEXT_CHARS = 60_000
 
@@ -29,12 +29,12 @@ function abstractFromIndex(index: unknown): string | undefined {
   return text ? text.slice(0, 4_000) : undefined
 }
 
-export async function searchResearch(query: string, limit = 8): Promise<{ provider: 'OpenAlex'; query: string; results: ResearchSearchResult[] }> {
+export async function searchResearch(query: string, limit = 8, options: ResearchOptions = {}): Promise<{ provider: 'OpenAlex'; query: string; results: ResearchSearchResult[] }> {
   if (typeof query !== 'string' || !query.trim() || query.length > 2000) throw new Error('research query must contain 1..2000 characters')
   if (!Number.isInteger(limit) || limit < 1 || limit > 20) throw new Error('research limit must be an integer from 1 to 20')
   const count = limit
   const endpoint = `https://api.openalex.org/works?search=${encodeURIComponent(query)}&per-page=${count}&select=display_name,doi,publication_year,authorships,abstract_inverted_index,cited_by_count,primary_location,id`
-  const { body } = await fetchResearch(endpoint)
+  const { body } = await fetchResearch(endpoint, options)
   const results = parseOpenAlex(JSON.parse(decodeSourceText(body)), count)
   return { provider: 'OpenAlex', query, results }
 }
@@ -91,14 +91,15 @@ export function decodeHtml(value: string): string {
     .trim()
 }
 
-export async function readResearch(rawUrl: string): Promise<{
+export async function readResearch(rawUrl: string, options: ResearchOptions = {}): Promise<{
   url: string; finalUrl: string; contentType: string; text: string; bytes: number; sha256: string; truncated: boolean
 }> {
-  const { url: finalUrl, contentType, body } = await fetchResearch(rawUrl)
+  const { url: finalUrl, contentType, body } = await fetchResearch(rawUrl, options)
   if (contentType !== 'application/pdf' && !contentType.startsWith('text/') && contentType !== 'application/json' && contentType !== 'application/xhtml+xml') {
     throw new Error(`unsupported research content type: ${contentType}`)
   }
   const raw = contentType === 'application/pdf' ? await extractDocumentText(body, 'pdf') : decodeSourceText(body)
+  options.signal?.throwIfAborted()
   const text = contentType.includes('html') || contentType.includes('xhtml') ? decodeHtml(raw) : raw.trim()
   return {
     url: rawUrl,

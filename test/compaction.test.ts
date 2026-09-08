@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
 import {
-  DEFAULT_COMPACTION, HardLimitExceededError, boundSummary, compactIfNeeded, estimateTokens, summaryItem,
+  DEFAULT_COMPACTION, HardLimitExceededError, boundSummary, compactIfNeeded, prepareCompaction, estimateTokens, summaryItem,
 } from '../src/runtime/compaction.js'
 import type {
   CompactionRequest, CompactionResult, ModelDriver, ModelTurnRequest, ModelTurnResult,
@@ -43,6 +43,34 @@ function longHistory(count: number): ModelItem[] {
     content: `message ${i} `.repeat(200), // long enough to cross the soft threshold
   }))
 }
+
+it('installs async compaction only on unchanged history and requirements, preserving appended tool outputs', async () => {
+  const options = { ...DEFAULT_COMPACTION, contextWindowTokens: 1000, keepTailItems: 2 }
+  const original = session([...longHistory(8), { type: 'function_call', callId: 'pending', name: 'tool', arguments: '{}' }, ...longHistory(4)])
+  let finish!: () => void
+  const gate = new Promise<void>(resolve => { finish = resolve })
+  const model = fakeDriver({ compact: async request => { await gate; return fakeDriver().compact(request) } })
+  const candidate = prepareCompaction(original, model, options)
+  const expected = structuredClone(original.history)
+  assert.deepEqual(original.history, expected)
+  original.history.push({ type: 'function_call_output', callId: 'pending', output: 'completed' })
+  finish(); await candidate.settled
+  assert.equal(candidate.install(original).compacted, true)
+  assert.ok(original.history.some(item => 'type' in item && item.type === 'function_call' && item.callId === 'pending'))
+  assert.deepEqual(original.history.at(-1), { type: 'function_call_output', callId: 'pending', output: 'completed' })
+  assert.equal(candidate.install(original).compacted, false)
+
+  for (const change of ['history', 'request'] as const) {
+    const current = session(longHistory(10))
+    const stale = prepareCompaction(current, fakeDriver(), options)
+    if (change === 'history') current.history[0] = { role: 'user', content: 'new version' }
+    else current.request = { revisions: [{ id: 'revision' }] } as never
+    const revised = structuredClone(current)
+    await stale.settled
+    assert.equal(stale.install(current).compacted, false)
+    assert.deepEqual(current, revised)
+  }
+})
 
 describe('estimateTokens', () => {
   it('uses a conservative byte bound', () => {

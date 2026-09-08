@@ -1,7 +1,9 @@
 import { DEFAULT_MODEL_BUDGET } from '../model/execution.js'
 import { abortable } from '../deadline.js'
 import type { VerificationRecord } from '../outcome/verification.js'
-import { flushOutbox } from '../control-plane/outbox.js'
+import { flushOutbox, drainOutboxes } from '../control-plane/outbox.js'
+import { Wakeup, listenWakeups } from '../control-plane/wakeup.js'
+import { createRealtime, type RealtimeOptions } from './realtime.js'
 import { resumeDependents } from '../control-plane/dependencies.js'
 import { candidateHash } from '../outcome/verification.js'
 import { candidateActions, inspectActions } from '../outcome/action-check.js'
@@ -63,6 +65,8 @@ import { verifyGraphResults } from '../collaboration/graphs.js'
 import { enqueueChild, requestSnapshot } from './jobs.js'
 
 export interface LingxiOSOptions {
+  performance?: { notifications?: boolean; outboxConcurrency?: number; contextSnapshot?: boolean }
+  realtime?: RealtimeOptions
   harness?: HarnessProfile
   skills?: readonly SkillDefinition[]
   presentations?: readonly PresentationDefinition[]
@@ -153,11 +157,23 @@ function requestPolicyMeta(input: Pick<RequestInput, 'codeExecution' | 'delivery
 /** Trusted server entry point. Product ingress authenticates the principal; workers execute separately. */
 export async function createLingxiOS(options: LingxiOSOptions) {
   if (!options.database?.query || !options.database.connect) throw new ConfigError('a PostgreSQL pool is required')
+  const outboxConcurrency = options.performance?.outboxConcurrency ?? 4
+  if (!Number.isSafeInteger(outboxConcurrency) || outboxConcurrency < 1 || outboxConcurrency > 32) throw new ConfigError('outbox concurrency must be 1-32')
   const shutdown = new AbortController()
-  options = { ...options, database: deadlinePool(options.database,shutdown.signal) }
-  await checkStorage(options.database)
-  const logger = options.logger ?? createLogger()
+  const notificationPool = options.database
+  const workWakeup = new Wakeup(), wakeEpoch = randomUUID()
+  const runWakeup = new Wakeup()
+  const waitForWork: NonNullable<HostPort['waitForWork']> = async (cursor, timeoutMs, signal) => {
+    const version = workWakeup.version
+    if (cursor === `${wakeEpoch}:${version}`) await workWakeup.wait(version, Math.min(timeoutMs, 25_000),
+      AbortSignal.any([shutdown.signal, ...signal ? [signal] : []]))
+    return `${wakeEpoch}:${workWakeup.version}`
+  }
   const metrics = options.metrics ?? new MetricsRegistry()
+  options = { ...options, database: deadlinePool(options.database,shutdown.signal,30_000,metrics) }
+  await checkStorage(options.database)
+  const realtime = createRealtime(options.database, runWakeup, shutdown.signal, options.realtime)
+  const logger = options.logger ?? createLogger()
   const homesRoot = resolve(options.homesRoot ?? process.env['AGENT_OS_HOMES_ROOT'] ?? '.agent-os/homes')
   const modelBudget = { ...DEFAULT_MODEL_BUDGET, ...loadModelBudget(), ...options.modelBudget }
   if ((process.env['NODE_ENV'] === 'production' || options.modelBudget?.maxCostMicros !== undefined || process.env['AGENT_OS_MAX_COST_MICROS'] !== undefined)
@@ -256,7 +272,9 @@ export async function createLingxiOS(options: LingxiOSOptions) {
         if (discovered.rows.length > 1024) throw new Error('too many materialized tool schemas')
         discoveredTools = discovered.rows.map(row => String(row['name']))
       }
-      return { ...context, ...(discoveredTools ? { discoveredTools } : {}),
+      const previewVersion = options.realtime?.allowDraft ? Number((await options.database.query(
+        'SELECT jsonb_array_length(steer_inputs)+1 AS version FROM lingxios.agent_work_items WHERE id=$1', [work.id])).rows[0]?.['version']) : 1
+      return { ...context, previewAllowed: await realtime.allowed(work, previewVersion), ...(discoveredTools ? { discoveredTools } : {}),
         ...(memory && !['memory_synthesis','memory_index','memory_evaluation'].includes(work.kind) ? { memory: await memory.context(work) } : {}) }
     } },
     ...(options.delivery ? { delivery: options.delivery } : {}),
@@ -276,7 +294,7 @@ export async function createLingxiOS(options: LingxiOSOptions) {
         [resultId, row['claim_token'], JSON.stringify({ ...receipt, messageKey: im.messageKey, replyKey: im.replyKey })])
         if (!recorded.rows.length) throw new Error('IM delivery receipt changed or delivery lease was lost')
       }
-    }, { signal: shutdown.signal })
+    }, { signal: shutdown.signal, metrics, concurrency: outboxConcurrency })
   }
   async function flushEvents() {
     if (!integration?.delivery) return
@@ -292,12 +310,12 @@ export async function createLingxiOS(options: LingxiOSOptions) {
       await integration.delivery!.onEvent(work, { runId: String(row['run_id']), seq: Number(row['seq']),
         kind: String(row['kind']), stage: row['stage'] as RunEvent['stage'], visibility: row['visibility'] as RunEvent['visibility'],
         data: row['data'] as RunEvent['data'] }, context)
-    }, { signal: shutdown.signal })
+    }, { signal: shutdown.signal, metrics, concurrency: outboxConcurrency })
   }
   async function flushModelUsage() {
     if (!options.onModelCall) return
     await flushOutbox(options.database, 'agent_model_budget_calls', (row, context) => options.onModelCall!(
-      row['observation'] as import('../model/execution.js').ModelCallObservation, context), { signal: shutdown.signal })
+      row['observation'] as import('../model/execution.js').ModelCallObservation, context), { signal: shutdown.signal, metrics, concurrency: outboxConcurrency })
   }
 
   async function verifyNative(work: Omit<WorkItem, 'leaseToken'>, candidate: import('../outcome/verification.js').Candidate, database: SqlQueryable) {
@@ -348,6 +366,7 @@ export async function createLingxiOS(options: LingxiOSOptions) {
     artifactStager: { stage: (work, artifact, bytes) => stageArtifact(
       resolve(options.homesRoot ?? process.env['AGENT_OS_HOMES_ROOT'] ?? '.agent-os/homes'), work, artifact, bytes) },
     contextProvider: integration.contextProvider,
+    ...options.performance?.contextSnapshot === false ? {} : { contextSnapshot: (work: Omit<WorkItem, 'leaseToken'>) => sessions.context(work) },
     capabilityResolver: integration.capabilityResolver,
     actionExecutor: integration.actionExecutor,
     delivery: {
@@ -357,7 +376,7 @@ export async function createLingxiOS(options: LingxiOSOptions) {
           [work.id, work.tenantId, work.agentId, work.sessionId])
         return (result.rows[0]?.['message'] as AssistantMessage | undefined) ?? null
       },
-      onEvent: async () => { background('events', flushEvents) },
+      onEvent: async () => { if (options.performance?.notifications !== false) runWakeup.notify(); background('events', flushEvents) },
       deliverMessage: async (work, message) => {
         const recordMemory = options.memory && !work.conversation?.internal && !['memory_synthesis','memory_index','memory_evaluation'].includes(work.kind)
         await persistArtifacts(resolve(options.homesRoot ?? process.env['AGENT_OS_HOMES_ROOT'] ?? '.agent-os/homes'), work, message)
@@ -432,13 +451,18 @@ export async function createLingxiOS(options: LingxiOSOptions) {
             SELECT $1,COALESCE(MAX(seq),$2::bigint)+1,$3,$4,'response.committed','completed','user',$5::jsonb,$6::jsonb
             FROM lingxios.agent_run_events WHERE run_id=$1`,
           [work.id,(work.fence-1)*RUN_SEQUENCE_SPAN,work.tenantId,work.agentId,
-            JSON.stringify({ resultId,requestVersion: message.envelope.requestVersion }), integration.delivery ? JSON.stringify(work) : null])
+            JSON.stringify({ resultId,requestVersion: message.envelope.requestVersion,
+              candidateHash: candidateHash({ body: message.body, requestVersion: message.envelope.requestVersion, artifacts: message.envelope.artifacts }) }),
+            integration.delivery ? JSON.stringify(work) : null])
         })
+        if (options.performance?.notifications !== false) { runWakeup.notify(); workWakeup.notify() }
+        background('deliveries', flushDeliveries)
+        background('events', flushEvents)
       },
     },
   })
-  async function claimWork(claimingWorkerId: string, requestId?: string, workKinds?: readonly string[]) {
-    const work = await service.claim(claimingWorkerId, requestId, workKinds)
+  async function claimWork(claimingWorkerId: string, requestId?: string, workKinds?: readonly string[], lanes?: readonly WorkItem['lane'][]) {
+    const work = await service.claim(claimingWorkerId, requestId, workKinds, lanes)
     if (!work) return null
     await service.reconcilePending(work)
     await executeDecidedApprovals(options.database, service, work)
@@ -446,6 +470,8 @@ export async function createLingxiOS(options: LingxiOSOptions) {
     return work
   }
   const host: HostPort = {
+    waitForWork,
+    streamPreview: (work, frames, signal) => realtime.receive(work, frames, signal ?? shutdown.signal),
     prepareMemoryReview: (work,action) => service.prepareMemoryReview(work,action),
     recordMemoryReview: (work,action,hash,review) => service.recordMemoryReview(work,action,hash,review),
     verifyCandidate: (work, candidate) => service.verifyCandidate(work, candidate),
@@ -453,6 +479,7 @@ export async function createLingxiOS(options: LingxiOSOptions) {
     claimWork: async () => { throw new Error('connect a worker before claiming work') },
     heartbeat: work => service.heartbeat(work),
     loadContext: (work) => service.loadContext(work), executeAction: (work, action, signal) => service.executeAction(work, action, signal),
+    loadInitialContext: work => service.loadContext(work, true),
     reserveModelCall: (work, callId, limits) => service.reserveModelCall(work, callId, limits),
     recordModelUsage: (work, callId, usage, observation) => service.recordModelUsage(work, callId, usage, observation),
     recoverCell: (work, cellId) => service.recoverCell(work, cellId),
@@ -472,10 +499,15 @@ export async function createLingxiOS(options: LingxiOSOptions) {
       .finally(() => { jobs.delete(name) })
     jobs.set(name, running)
   }
+  const flushDeliveryChannels = () => {
+    if (stopped) return
+    // Each outbox owns its bounded active lanes. Healthy lanes can restart while another transport is slow.
+    for (const flush of [flushDeliveries, flushEvents, flushModelUsage]) {
+      void flush().catch(error => logger.warn('outbox flush failed', { error: String(error) }))
+    }
+  }
   const deliveryTimer = setInterval(() => {
-    background('delivery', () => flushDeliveries())
-    background('events', flushEvents)
-    background('billing', () => flushModelUsage())
+    flushDeliveryChannels()
     background('dependencies', () => resumeDependents(options.database))
     background('approvals', () => resumeDecidedApprovals(options.database))
     background('queue fairness', () => sweepQueuedWork(options.database))
@@ -490,6 +522,11 @@ export async function createLingxiOS(options: LingxiOSOptions) {
   }, 60_000)
   deliveryTimer.unref(); maintenanceTimer.unref()
   let stopped = false
+  const notificationListener = options.performance?.notifications === false ? Promise.resolve() : listenWakeups(notificationPool, channel => {
+    if (channel === 'work') workWakeup.notify()
+    runWakeup.notify()
+    flushDeliveryChannels()
+  }, shutdown.signal, logger)
   let stopPromise: Promise<void> | undefined
   let listening: Promise<number> | undefined
   let controlPlane: ControlPlaneServer | undefined
@@ -498,10 +535,10 @@ export async function createLingxiOS(options: LingxiOSOptions) {
     connectWorker(input: { workerId: string; workKinds: readonly string[] }): HostPort {
       if (stopped) throw new Error('application has stopped')
       if (!input.workerId.trim()) throw new Error('workerId is required')
-      return { ...host, claimWork: async signal => {
+      return { ...host, claimWork: async (signal, lanes) => {
         signal?.throwIfAborted()
         if (stopped) throw new Error('application has stopped')
-        return claimWork(input.workerId, undefined, input.workKinds)
+        return claimWork(input.workerId, undefined, input.workKinds, lanes)
       } }
     },
     memory: memory?.api,
@@ -517,6 +554,8 @@ export async function createLingxiOS(options: LingxiOSOptions) {
     readDiagnostics: (identity: RunIdentity) => readDiagnostics(options.database, identity),
     readRun: (identity: RunIdentity, transaction: SqlQueryable = options.database) => readRun(transaction, identity),
     readRunState: (identity: RunIdentity) => readRunState(options.database,identity),
+    /** Mount behind product authentication; derive identity from the session, never from model/request JSON. */
+    streamRun: realtime.response,
     freezeEvolutionBenchmark: (tenantId: string, benchmark: EvolutionBenchmark) => freezeEvolutionBenchmark(options.database,tenantId,benchmark),
     /** Trusted administration APIs; the product authorizes the opaque scope before calling. */
     rollbackEvolution: (scope: MemoryScope, activeId: string, expectedVersion: number, targetId: string | null) =>
@@ -536,7 +575,10 @@ export async function createLingxiOS(options: LingxiOSOptions) {
       const { mode: _reservedMode, obligations: _reservedObligations, codeExecution: _reservedCodeExecution, deliveryMode: _reservedDeliveryMode, ...jobMeta } = input.meta ?? {}
       const work = { ...input, triggerRef: input.sourceRef ?? input.id ?? randomUUID(),
         meta: { ...jobMeta, ...policyMeta(input), text: input.text, authorName: input.authorName ?? 'User', attachments: snapshotAttachments(input.attachments ?? []) } }
-      return transaction ? enqueueWork(transaction, work) : service.enqueue(work)
+      if (transaction) return enqueueWork(transaction, work)
+      const result = await service.enqueue(work)
+      if (options.performance?.notifications !== false) { workWakeup.notify(); runWakeup.notify() }
+      return result
     },
     readApproval: (identity: ApprovalLookup) => readApproval(options.database, identity),
     decideApproval: (decision: ApprovalDecision) => decideApproval(options.database, decision),
@@ -607,9 +649,11 @@ export async function createLingxiOS(options: LingxiOSOptions) {
       if (typeof input.text !== 'string' || !input.text.trim() || typeof input.principalId !== 'string' || !input.principalId.trim()) {
         throw new Error('non-empty request text and authenticated principalId are required')
       }
-      return service.enqueue({ ...input, kind: 'turn', lane: 'interactive', triggerRef: input.sourceRef ?? input.id ?? randomUUID(),
+      const result = await service.enqueue({ ...input, kind: 'turn', lane: 'interactive', triggerRef: input.sourceRef ?? input.id ?? randomUUID(),
         meta: { ...policyMeta(input), text: input.text, authorName: input.authorName ?? 'User', attachments: snapshotAttachments(input.attachments ?? []) },
       })
+      if (options.performance?.notifications !== false) { workWakeup.notify(); runWakeup.notify() }
+      return result
     },
     async enqueueDelegated(input: DelegatedRequestInput) {
       const delegation = input.delegation
@@ -687,7 +731,7 @@ export async function createLingxiOS(options: LingxiOSOptions) {
       if (controlPlane) throw new Error('control plane is already listening or starting')
       if (!input.serviceToken?.trim()) throw new ConfigError('control plane service token is required')
       if (!Number.isSafeInteger(input.port) || input.port < 0 || input.port > 65535) throw new ConfigError('control plane port must be 0-65535')
-      const server = new ControlPlaneServer({ service, claimWork, serviceToken: input.serviceToken, logger, metrics,
+      const server = new ControlPlaneServer({ service, claimWork, waitForWork, streamPreview: realtime.receive, serviceToken: input.serviceToken, logger, metrics,
         ready: async () => {
           if (stopped) return false
           await checkStorage(options.database)
@@ -713,6 +757,8 @@ export async function createLingxiOS(options: LingxiOSOptions) {
       shutdown.abort(new Error('control plane stopped'))
       clearInterval(deliveryTimer); clearInterval(maintenanceTimer)
       stopPromise ??= (async () => {
+        await notificationListener
+        await drainOutboxes(options.database)
         await Promise.race([Promise.allSettled([...jobs.values()]), new Promise(resolve => { const timer = setTimeout(resolve, 5_000); timer.unref() })])
         // The listen caller receives startup errors; shutdown still releases any listener.
         await listening?.catch(() => {})

@@ -1,6 +1,6 @@
 {
   "name": "@lyyzka/lingxios",
-  "version": "3.2.0",
+  "version": "3.2.1",
   "description": "Durable agent execution for PostgreSQL with fenced workers, native tools, verified outcomes, and sandboxed Python.",
   "type": "module",
   "license": "MIT",
@@ -53,6 +53,7 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "npm run build && node --test --test-concurrency=1 \"dist/test/**/*.test.js\"",
     "test:only": "node --test --test-concurrency=1 \"dist/test/**/*.test.js\"",
+    "bench:performance": "npm run build && node scripts/benchmark-performance.mjs docs/performance-benchmark.json",
     "eval:live": "npm run build && node scripts/eval-live.mjs",
     "eval:memory": "npm run build && node scripts/eval-memory.mjs",
     "test:postgres-stores": "npm run build && node scripts/test-postgres-stores.mjs",

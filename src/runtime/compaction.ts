@@ -7,6 +7,7 @@
 import type { ModelDriver } from '../model/driver.js'
 import type { ModelItem, SessionRecord } from '../protocol/types.js'
 import { COMPACTION_PROMPT } from '../context/compiler.js'
+import { isDeepStrictEqual } from 'node:util'
 
 export function boundSummary(raw: string, maxChars: number): string {
   const value = JSON.parse(raw) as Record<string, unknown>
@@ -87,6 +88,13 @@ export async function compactIfNeeded(
   if (session.history.length <= options.keepTailItems) return { compacted: false }
 
   let boundary = session.history.length - options.keepTailItems
+  const completedCalls = new Set(session.history.flatMap(item =>
+    'type' in item && item.type === 'function_call_output' ? [item.callId] : []))
+  // A candidate may be built while tools run; their future outputs must retain the original calls.
+  for (let index = 0; index < boundary; index++) {
+    const item = session.history[index]!
+    if ('type' in item && item.type === 'function_call' && !completedCalls.has(item.callId)) boundary = index
+  }
   // Close the kept suffix over tool pairs. Moving the boundary can expose
   // another output, so scan again until the boundary stops moving.
   for (let index = boundary; index < session.history.length; index++) {
@@ -120,5 +128,34 @@ export async function compactIfNeeded(
     const hardLimit = Math.floor(options.contextWindowTokens * options.hardRatio)
     if (estimated < hardLimit) return { compacted: false }
     throw new HardLimitExceededError(error)
+  }
+}
+
+/** Compute off the live history. Installation permits appends, but never replacement or revised requirements. */
+export function prepareCompaction(session: SessionRecord, model: ModelDriver, options: CompactionOptions,
+  signal?: AbortSignal, overheadTokens = 0) {
+  const base = { history: structuredClone(session.history), summary: session.summary,
+    epoch: session.compactionEpoch, request: structuredClone(session.request) }
+  const copy = { ...session, history: structuredClone(base.history) }
+  const stop = new AbortController()
+  let outcome: CompactionOutcome | undefined
+  const settled = compactIfNeeded(copy, '', model, options,
+    AbortSignal.any([stop.signal, ...(signal ? [signal] : [])]), overheadTokens)
+    .then(result => { outcome = result }, () => { outcome = { compacted: false } })
+  return {
+    settled,
+    get ready() { return outcome !== undefined },
+    cancel() { stop.abort(new Error('compaction candidate no longer needed')) },
+    install(current: SessionRecord): CompactionOutcome {
+      if (!outcome?.compacted || current.compactionEpoch !== base.epoch || current.summary !== base.summary
+        || !isDeepStrictEqual(current.request, base.request)
+        || !isDeepStrictEqual(current.history.slice(0, base.history.length), base.history)) return { compacted: false }
+      current.history = [...copy.history, ...current.history.slice(base.history.length)]
+      current.summary = copy.summary!
+      current.compactionEpoch = copy.compactionEpoch
+      const result = outcome
+      outcome = { compacted: false }
+      return result
+    },
   }
 }

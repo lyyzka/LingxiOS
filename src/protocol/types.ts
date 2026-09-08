@@ -281,6 +281,10 @@ export interface ContextMessage {
  * into the session.
  */
 export interface TurnContext {
+  session?: SessionRecord | null
+  snapshotVersion?: { fence: number; requestVersion: number; sessionRevision: number }
+  /** Trusted host opt-in; worker still requires a separable user-body format. */
+  previewAllowed?: boolean
   discoveredTools?: string[]
   harness?: import('../harness/profile.js').HarnessContext
   executionSteps?: import('../control-plane/steps.js').ExecutionStep[]

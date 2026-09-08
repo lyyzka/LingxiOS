@@ -7,6 +7,7 @@ import { appendResourceCheck } from '../context/resource-checks.js'
 import { createTaskContract } from '../context/task-contract.js'
 import { abortable } from '../deadline.js'
 import { deadlineHost } from '../host/deadline-host.js'
+import { checkpointHost } from '../host/checkpoint-host.js'
 import { fitMemorySnapshot } from '../memory/context.js'
 import type { MemorySnapshot } from '../memory/types.js'
 /**
@@ -47,7 +48,7 @@ import {
   type AssistantMessage, type ModelItem, type RunEvent,
   type SessionRecord, type SteerInput, type TurnContext, type WorkItem,
 } from '../protocol/types.js'
-import { compactIfNeeded, DEFAULT_COMPACTION, estimateTokens, HardLimitExceededError, type CompactionOptions, type CompactionOutcome } from './compaction.js'
+import { compactIfNeeded, prepareCompaction, DEFAULT_COMPACTION, estimateTokens, HardLimitExceededError, type CompactionOptions, type CompactionOutcome } from './compaction.js'
 import { CorrectionBudget, progressFacts } from './corrections.js'
 import { refreshResourceChecks } from './resource-refresh.js'
 import { DefaultRuntimePolicy, type RuntimePolicy } from './policy.js'
@@ -59,6 +60,9 @@ import { exposedTools } from '../tools/discovery.js'
 import { promptProgram } from '../prompts/program.js'
 import { canonicalJson } from '../context/compiler.js'
 import { releaseVersions } from '../versions.js'
+import { LATENCY_BUCKETS, type MetricsRegistry } from '../metrics.js'
+import { CandidateBodyParser } from '../model/preview.js'
+import { PreviewBuffer } from './preview.js'
 
 export interface WorkProcessorContext {
   host: HostPort
@@ -73,6 +77,8 @@ export interface WorkProcessor {
 }
 
 export interface AgentRuntimeOptions {
+  performance?: { checkpointDedup?: boolean; promptCache?: boolean; asyncCompaction?: boolean; onDemandAttachments?: boolean }
+  metrics?: MetricsRegistry
   policy?: RuntimePolicy
   heartbeatMs?: number
   compaction?: Partial<CompactionOptions>
@@ -106,6 +112,11 @@ interface AttemptSignals {
 }
 
 export class AgentRuntime {
+  private readonly checkpointDedup: boolean
+  private readonly promptCache: boolean
+  private readonly asyncCompaction: boolean
+  private readonly onDemandAttachments: boolean
+  private readonly metrics: MetricsRegistry | undefined
   private readonly policy: RuntimePolicy
   private readonly heartbeatMs: number
   private readonly compaction: CompactionOptions
@@ -116,9 +127,29 @@ export class AgentRuntime {
   private readonly rootModelBudget: Required<RootModelBudgetOptions>
   private readonly processors = new Map<string, WorkProcessor | 'conversation'>()
   private readonly eventSeqByRun = new Map<string, number>()
+  private readonly eventTails = new Map<string, Promise<void>>()
   private readonly hostsByRun = new Map<string, HostPort>()
+  private readonly previews = new Map<string, { buffer: PreviewBuffer; stop: AbortController; task: Promise<void> }>()
 
   private hostFor(work: WorkItem): HostPort { return this.hostsByRun.get(work.id) ?? this.host }
+
+  private previewFor(work: WorkItem, signal: AbortSignal): PreviewBuffer | undefined {
+    if (!this.host.streamPreview) return undefined
+    let preview = this.previews.get(work.id)
+    if (!preview) {
+      preview = { buffer: new PreviewBuffer(), stop: new AbortController(), task: Promise.resolve() }
+      this.previews.set(work.id, preview)
+      const { buffer, stop } = preview
+      preview.task = this.host.streamPreview(work, buffer, AbortSignal.any([signal, stop.signal])).catch(error => {
+        buffer.close()
+        if (!signal.aborted && !stop.signal.aborted) {
+          this.logger.warn('preview channel unavailable; final result remains durable', { workId: work.id, error: errorMessage(error) })
+          this.metrics?.counter('agentos_preview_resets_total', 'Preview lost; durable final result is unaffected').inc({ reason: 'transport' })
+        }
+      })
+    }
+    return preview.buffer
+  }
 
   constructor(
     private readonly host: HostPort,
@@ -126,6 +157,11 @@ export class AgentRuntime {
     private readonly kernels: KernelExecutor,
     options: AgentRuntimeOptions = {},
   ) {
+    this.metrics = options.metrics
+    this.checkpointDedup = options.performance?.checkpointDedup ?? true
+    this.promptCache = options.performance?.promptCache ?? true
+    this.asyncCompaction = options.performance?.asyncCompaction ?? true
+    this.onDemandAttachments = options.performance?.onDemandAttachments ?? true
     this.policy = options.policy ?? new DefaultRuntimePolicy()
     this.heartbeatMs = options.heartbeatMs ?? 5_000
     const contextWindowTokens = model.contextWindowTokens ?? DEFAULT_COMPACTION.contextWindowTokens
@@ -153,9 +189,13 @@ export class AgentRuntime {
   }
 
   private async event(work: WorkItem, runId: string, event: Omit<RunEvent, 'runId' | 'seq'>): Promise<number> {
+    if (['response.withheld', 'run.failed', 'run.cancelled'].includes(event.kind)) this.previews.get(runId)?.buffer.discard()
     const seq = (this.eventSeqByRun.get(runId) ?? 0) + 1
     this.eventSeqByRun.set(runId, seq)
-    await this.hostFor(work).emitEvent(work, { runId, seq, ...event })
+    const pending = (this.eventTails.get(runId) ?? Promise.resolve()).then(() =>
+      this.hostFor(work).emitEvent(work, { runId, seq, ...event }))
+    this.eventTails.set(runId, pending.catch(() => {}))
+    await pending
     return seq
   }
 
@@ -213,10 +253,12 @@ export class AgentRuntime {
   }
 
   async runWork(work: WorkItem, signal?: AbortSignal): Promise<void> {
+    const began = performance.now()
     const runId = work.id
     this.eventSeqByRun.set(runId, Math.max(0, work.fence - 1) * RUN_SEQUENCE_SPAN)
     const signals = this.startSignals(work, signal)
-    this.hostsByRun.set(runId,deadlineHost(this.host,signals.lifecycle.signal))
+    this.hostsByRun.set(runId,deadlineHost(this.checkpointDedup ? checkpointHost(this.host, this.metrics) : this.host,
+      signals.lifecycle.signal,30_000,this.metrics))
     let activeSession: SessionRecord | null = null
     const log = this.logger.child({ runId, workId: work.id, agentId: work.agentId, fence: work.fence })
     const model = executionModel(this.hostFor(work), this.model, work, this.rootModelBudget, event => this.event(work, runId, event))
@@ -244,14 +286,16 @@ export class AgentRuntime {
         return
       }
 
-      const sessionRef: { session: SessionRecord | null } = { session: null }
+      const sessionRef: { session: SessionRecord | null; compaction?: ReturnType<typeof prepareCompaction> } = { session: null }
       try {
         await this.runTurn(work, runId, signals, log, sessionRef, model)
       } finally {
+        sessionRef.compaction?.cancel()
+        await sessionRef.compaction?.settled
         activeSession = sessionRef.session
       }
     } catch (error) {
-      this.hostsByRun.set(runId,deadlineHost(this.host,undefined,5000))
+      this.hostsByRun.set(runId,deadlineHost(this.host,undefined,5000,this.metrics))
       if (signal?.aborted && !signals.leaseLost()) {
         if (activeSession) await this.hostFor(work).saveSession(work, activeSession).catch(() => {})
         await this.hostFor(work).yieldWork(work).catch(() => {})
@@ -260,8 +304,19 @@ export class AgentRuntime {
       await this.finishWithError(work, runId, signals, activeSession, error)
       return
     } finally {
+      const preview = this.previews.get(runId)
+      preview?.buffer.close()
+      if (preview) {
+        const timer = setTimeout(() => preview.stop.abort(), 1000)
+        timer.unref()
+        void preview.task.finally(() => clearTimeout(timer))
+      }
+      this.previews.delete(runId)
+      this.metrics?.histogram('agentos_run_seconds', 'Execution attempt duration excluding parked waits', LATENCY_BUCKETS)
+        .observe((performance.now() - began) / 1000, { lane: work.lane })
       signals.stop()
       this.eventSeqByRun.delete(runId)
+      this.eventTails.delete(runId)
       this.hostsByRun.delete(runId)
     }
   }
@@ -272,10 +327,11 @@ export class AgentRuntime {
 
   private async runTurn(
     work: WorkItem, runId: string, signals: AttemptSignals, log: Logger,
-    sessionRef: { session: SessionRecord | null },
+    sessionRef: { session: SessionRecord | null; compaction?: ReturnType<typeof prepareCompaction> },
     model: ModelDriver,
   ): Promise<void> {
-    const context = await this.hostFor(work).loadContext(work)
+    const host = this.hostFor(work)
+    const context = await (host.loadInitialContext?.(work) ?? host.loadContext(work))
     await this.event(work, runId, {
       kind: 'input.loaded', stage: 'completed', visibility: 'internal',
       data: { triggerRef: work.triggerRef },
@@ -306,10 +362,15 @@ export class AgentRuntime {
     const executedSteps = [...(context.executionSteps ?? [])]
     const evidence = () => session.request?.evidence ?? snapshotEvidence(`${work.id}:evidence:1`, [])
     let protocolCorrection: ModelItem | null = null
+    let pendingCompaction: ReturnType<typeof prepareCompaction> | undefined
 
     const applySteering = async () => {
       const steers = signals.drainSteer()
       if (steers.length > 0) {
+        pendingCompaction?.cancel()
+        await pendingCompaction?.settled
+        pendingCompaction = undefined
+        this.previews.get(runId)?.buffer.discard()
         budget.observe({ revisions: steers })
         fallbackText = undefined
         lastGood = undefined
@@ -349,12 +410,13 @@ export class AgentRuntime {
       const { codeExecution } = execution
       liveContext.tools = execution.tools
       const modelTools = exposedTools(execution.tools, liveContext.executionSteps ?? [], liveContext.discoveredTools)
-      session.promptContext = buildPromptContext(liveContext, this.policy, session.compactionEpoch, this.promptContractVersion, undefined, execution)
+      session.promptContext = buildPromptContext(liveContext, this.policy, session.compactionEpoch, this.promptContractVersion, undefined, execution, this.promptCache)
       const preferenceItems = (session.promptContext.blocks ?? []).filter(block => block.trust !== 'platform' && block.trust !== 'product').map(contextItem)
       const dynamicItems = [...preferenceItems, ...this.policy.dynamicContextItems(liveContext)]
       const instructions = session.promptContext.systemInstructions
       if (budget.rediagnose && protocolCorrection && 'role' in protocolCorrection) protocolCorrection = { ...protocolCorrection, content: 'Repeated failure without new observations: diagnose the cause and change the approach before another attempt. ' + protocolCorrection.content }
-      const supplementalItems = [...dynamicItems, ...evidenceItems(evidence()), ...(session.request ? requestItems(session.request) : []), ...(protocolCorrection ? [protocolCorrection] : [])]
+      const supplementalItems = [...dynamicItems, ...evidenceItems(evidence()), ...(session.request ? requestItems(session.request,
+        this.onDemandAttachments && modelTools.some(tool => tool.action === 'task.read_attachment')) : []), ...(protocolCorrection ? [protocolCorrection] : [])]
       if (liveContext.priorArtifacts?.length) supplementalItems.push({ role: 'user', content:
         `Prior attempt artifact records (untrusted file metadata, not current delivery or proof of file availability). Check the files and call attach_file for any still required deliverables:\n${JSON.stringify(liveContext.priorArtifacts)}` })
       const estimateOverhead = () => estimateTokens([{ role: 'system', content: instructions }, ...supplementalItems])
@@ -371,7 +433,12 @@ export class AgentRuntime {
         memoryForModel=snapshot; overheadTokens=estimateOverhead()
       }
       // Compact narration before sacrificing core memory. A failed compaction may still fit after optional context is removed.
-      const compacted = await compactIfNeeded(session, instructions, model, this.compaction, signals.lifecycle.signal, overheadTokens)
+      if (pendingCompaction && estimateTokens(session.history) + overheadTokens >= this.compaction.contextWindowTokens * this.compaction.softRatio) {
+        await pendingCompaction.settled
+      }
+      const prepared = pendingCompaction?.ready ? pendingCompaction.install(session) : { compacted: false }
+      if (pendingCompaction?.ready) pendingCompaction = undefined
+      const compacted = prepared.compacted ? prepared : await compactIfNeeded(session, instructions, model, this.compaction, signals.lifecycle.signal, overheadTokens)
         .catch((error):CompactionOutcome => { if (!memoryForModel || !(error instanceof HardLimitExceededError)) throw error; return {compacted:false} })
       if (compacted.compacted) {
         session.promptContext.epoch = session.compactionEpoch
@@ -410,6 +477,10 @@ export class AgentRuntime {
         promptContractVersion: this.promptContractVersion, toolProtocol: 'ipython-v1', decision: protocolCorrection ? 'correction' : hop === 0 ? 'initial' : 'continue',
       } })
       let turn
+      let parser = new CandidateBodyParser()
+      const preview = liveContext.previewAllowed && model.previewFormat ? this.previewFor(work, signals.lifecycle.signal) : undefined
+      let providerBegan = performance.now()
+      let firstBody = false
       try {
         protocolCorrection = null
         turn = await model.run({
@@ -419,8 +490,27 @@ export class AgentRuntime {
           tools: modelTools,
           codeExecution,
           signal: signals.lifecycle.signal,
+          onAttempt: callId => {
+            providerBegan = performance.now()
+            parser = new CandidateBodyParser()
+            firstBody = false
+            if (preview) preview.reset(callId, (session.request?.revisions.length ?? 0) + 1)
+            else this.previews.get(runId)?.buffer.discard()
+          },
+          onTextDelta: delta => {
+            if (!preview || signals.hasSteer() || signals.lifecycle.signal.aborted) return
+            const body = model.previewFormat === 'user-text' ? delta : parser.push(delta)
+            if (parser.invalid) { preview.discard(); return }
+            if (body && !firstBody) {
+              firstBody = true
+              this.metrics?.histogram('agentos_model_first_public_body_seconds', 'Model start to first safely parsed preview body', LATENCY_BUCKETS)
+                .observe((performance.now() - providerBegan) / 1000)
+            }
+            preview.push(body)
+          },
         })
       } catch (error) {
+        preview?.discard()
         await this.event(work, runId, {
           kind: 'model.failed', stage: 'failed', visibility: 'internal',
           data: { hop: hop + 1, model: model.modelId ?? 'unknown', error: errorMessage(error) },
@@ -453,6 +543,10 @@ export class AgentRuntime {
             ...(turn.finalCandidate === undefined ? {} : { finalCandidate: tracePayload(turn.finalCandidate) }) } : {}),
         },
       })
+      for (const [field, name] of [['providerDurationMs', 'agentos_model_provider_seconds'], ['providerFirstContentMs', 'agentos_model_first_content_seconds']] as const) {
+        const value = turn.diagnostics?.[field]
+        if (typeof value === 'number') this.metrics?.histogram(name, 'Provider latency; content may include protocol fields', LATENCY_BUCKETS).observe(value / 1000)
+      }
       await signals.refresh()
       if (signals.leaseLost()) throw signals.leaseLost()!
       if (signals.lifecycle.signal.aborted) throw new RunCancelledError('lifecycle')
@@ -461,6 +555,9 @@ export class AgentRuntime {
       const calls = turn.output.filter(
         (item): item is Extract<ModelItem, { type: 'function_call' }> => 'type' in item && item.type === 'function_call',
       )
+      if (calls.length) preview?.discard()
+      if (!preview && model.previewFormat === 'candidate-json') parser.push(turn.text)
+      if (!calls.length && model.previewFormat === 'candidate-json' && parser.complete && turn.finalCandidate === undefined) turn = { ...turn, finalCandidate: turn.text }
 
       let assessment: GoalAssessment | undefined
       if (calls.length === 0 && turn.finalCandidate !== undefined) {
@@ -635,7 +732,7 @@ export class AgentRuntime {
           const partIndex = nextStreamPartIndex++
           await this.event(work, runId, {
             kind: 'model.delta', stage: 'delta', visibility: 'user',
-            data: { delta: finalText, partType: 'text', partIndex, partStart: true },
+            data: { delta: finalText, partType: 'text', partIndex, partStart: true, requestVersion: (session.request?.revisions.length ?? 0) + 1 },
           })
           streamedText += finalText
         }
@@ -646,6 +743,11 @@ export class AgentRuntime {
       executedSteps.push(...calls.map(call => ({ id: call.stepId!, kind: call.name, requestVersion: session.request!.revisions.length + 1, input: {}, artifacts: [] })))
       session.history.push(...turn.output)
       await this.hostFor(work).saveSession(work, session)
+      if (this.asyncCompaction && !pendingCompaction && session.history.length > this.compaction.keepTailItems
+        && estimateTokens(session.history) + overheadTokens >= this.compaction.contextWindowTokens * this.compaction.softRatio * 0.8) {
+        sessionRef.compaction = pendingCompaction = prepareCompaction(session, model, { ...this.compaction, softRatio: this.compaction.softRatio * 0.8 },
+          signals.lifecycle.signal, overheadTokens)
+      }
       const onlyReads = calls.every(call => liveContext.tools?.some(tool => tool.name === call.name && tool.effect === 'read'))
       let terminal = false
       for (let index = 0; index < calls.length; index += onlyReads ? 4 : 1) {
@@ -659,12 +761,17 @@ export class AgentRuntime {
         }
         const batch = calls.slice(index, index + (onlyReads ? 4 : 1))
         let outcomes
-        try { outcomes = await Promise.all(batch.map(async call => {
-          const part = nextStreamPartIndex
-          nextStreamPartIndex += onlyReads ? 2 : 0
-          return this.executeCall(work, runId, session, call, signals, budget, part,
-            execution.grants, artifacts, codeExecution)
-        })) } catch (error) {
+        try {
+          const settled = await Promise.allSettled(batch.map(async call => {
+            const part = nextStreamPartIndex
+            nextStreamPartIndex += onlyReads ? 2 : 0
+            return this.executeCall(work, runId, session, call, signals, budget, part,
+              execution.grants, artifacts, codeExecution)
+          }))
+          const failure = settled.find(result => result.status === 'rejected')
+          if (failure?.status === 'rejected') throw failure.reason
+          outcomes = settled.map(result => (result as PromiseFulfilledResult<Awaited<ReturnType<AgentRuntime['executeCall']>>>).value)
+        } catch (error) {
           if (!(error instanceof ModelBudgetExceededError)) throw error
           acceptanceGaps.push(error.message)
           fallbackText = lastGood?.text
@@ -686,7 +793,7 @@ export class AgentRuntime {
       session.history.push({ role: 'assistant', content: finalText })
       await this.hostFor(work).saveSession(work, session)
       await this.event(work, runId, { kind: 'model.delta', stage: 'delta', visibility: 'user',
-        data: { delta: finalText, partType: 'text', partIndex: nextStreamPartIndex++, partStart: true } })
+        data: { delta: finalText, partType: 'text', partIndex: nextStreamPartIndex++, partStart: true, requestVersion: (session.request?.revisions.length ?? 0) + 1 } })
       streamedText = finalText
     }
     if (!finalText) {
@@ -706,7 +813,7 @@ export class AgentRuntime {
       await this.hostFor(work).saveSession(work, session)
       await this.event(work, runId, {
         kind: 'model.delta', stage: 'delta', visibility: 'user',
-        data: { delta: finalText, partType: 'text', partIndex: nextStreamPartIndex++, partStart: true },
+        data: { delta: finalText, partType: 'text', partIndex: nextStreamPartIndex++, partStart: true, requestVersion: (session.request?.revisions.length ?? 0) + 1 },
       })
       streamedText += finalText
     }
@@ -720,6 +827,10 @@ export class AgentRuntime {
       body: durableText,
       envelope: finalEnvelope,
     }
+    this.previews.get(runId)?.buffer.close()
+    pendingCompaction?.cancel()
+    await pendingCompaction?.settled
+    pendingCompaction = undefined
     await this.hostFor(work).saveSession(work, session)
     await this.hostFor(work).commitResult(work, message)
     log.info('run completed')
@@ -987,7 +1098,7 @@ export class AgentRuntime {
 
   private async restoreSession(work: WorkItem, context: TurnContext, execution: ExecutionSnapshot): Promise<SessionRecord> {
     const key = sessionKeyOf(work)
-    const stored = await this.hostFor(work).loadSession(work, key)
+    const stored = context.session === undefined ? await this.hostFor(work).loadSession(work, key) : context.session
     if (stored && (stored.key !== key || stored.tenantId !== work.tenantId || stored.agentId !== work.agentId
       || stored.sessionId !== work.sessionId || stored.threadId !== work.threadId)) {
       throw new Error('stored session identity does not match the work')
@@ -1060,7 +1171,7 @@ export class AgentRuntime {
       session.request = snapshotRequest(context)
     }
 
-    session.promptContext = buildPromptContext(context, this.policy, session.compactionEpoch, this.promptContractVersion, undefined, execution)
+    session.promptContext = buildPromptContext(context, this.policy, session.compactionEpoch, this.promptContractVersion, undefined, execution, this.promptCache)
 
     if (!session.appliedWorkIds.includes(work.id)) {
       session.history.push(...this.policy.turnInputItems(context, session.history.length > 0))

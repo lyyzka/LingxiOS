@@ -5,12 +5,16 @@ import { isGoalOutcome, type GoalOutcome } from '../protocol/outcome.js'
 import type { CitationAnnotation, ResponseEnvelope } from '../outcome/envelope.js'
 import { RUN_SEQUENCE_SPAN } from '../protocol/constants.js'
 import type { RunState, DeliveryState } from '../app/jobs.js'
+import type { RunStreamEvent, PreviewUpdate } from '../app/realtime.js'
+export type { RunStreamEvent, PreviewUpdate } from '../app/realtime.js'
 export type { RunState, RunSnapshot, DeliveryState } from '../app/jobs.js'
 export type { AssistantMessage, RunEvent } from '../protocol/types.js'
 export type { ResponseEnvelope } from '../outcome/envelope.js'
 export type { TrustedPresentation } from '../presentation/definition.js'
 
 export interface RunView {
+  preview?: { attemptId: string; seq: number; fence: number; requestVersion: number } | null
+  previewClosedFence?: number
   runId: string
   lastSeq: number
   draft: string
@@ -38,19 +42,27 @@ export function consumeRunEvent(view: RunView, event: RunEvent): RunView {
   next.fence = fence
   if (event.kind === 'run.started' && fence > view.messageFence) {
     next.draft = ''
+    next.preview = null
     next.goalOutcome = null
     next.lifecycle = 'leased'
   }
-  if (event.kind === 'model.delta' && event.data['partType'] === 'text' && typeof event.data['delta'] === 'string' && fence > view.messageFence) {
-    next.draft = (next.draft + event.data['delta']).slice(-200_000)
+  if (event.kind === 'model.delta' && event.data['partType'] === 'text' && typeof event.data['delta'] === 'string' && fence > view.messageFence
+    && (typeof event.data['requestVersion'] === 'number' && event.data['requestVersion'] >= view.requestVersion
+      || event.data['requestVersion'] === undefined && view.requestVersion <= 1)) {
+    next.draft = ((next.preview ? '' : next.draft) + event.data['delta']).slice(-200_000)
+    if (typeof event.data['requestVersion'] === 'number') next.requestVersion = event.data['requestVersion']
+    next.preview = null
   }
+  if (event.kind === 'response.committed') { next.draft = ''; next.preview = null; next.previewClosedFence = fence }
   if (fence > view.messageFence && isGoalOutcome(event.data['goalOutcome']) && event.data['goalOutcome'].requestVersion >= view.requestVersion) {
     next.goalOutcome = structuredClone(event.data['goalOutcome'])
     next.requestVersion = next.goalOutcome.requestVersion
     if (['awaiting_input','awaiting_approval','delegated'].includes(next.goalOutcome.status)) { next.draft = ''; next.lifecycle = 'waiting' }
   }
-  if (event.kind === 'run.failed') next.lifecycle = 'failed'
-  if (event.kind === 'run.cancelled') next.lifecycle = 'cancelled'
+  if (event.kind === 'run.failed' || event.kind === 'run.cancelled') {
+    next.lifecycle = event.kind === 'run.failed' ? 'failed' : 'cancelled'
+    next.draft = ''; next.preview = null; next.previewClosedFence = fence
+  }
   return next
 }
 
@@ -71,7 +83,7 @@ export function consumeAssistantMessage(view: RunView, message: AssistantMessage
   const current = commit.fence >= view.fence
   return { ...view, message: structuredClone(message), messageFence: commit.fence, resultId: commit.resultId,
     requestVersion: Math.max(view.requestVersion,message.envelope.requestVersion),
-    ...current ? { draft: '', fence: commit.fence, goalOutcome: structuredClone(message.envelope.goalOutcome),
+    ...current ? { draft: '', preview: null, previewClosedFence: commit.fence, fence: commit.fence, goalOutcome: structuredClone(message.envelope.goalOutcome),
       lifecycle: message.envelope.goalOutcome.status === 'satisfied' ? 'succeeded' : ['partial','blocked'].includes(message.envelope.goalOutcome.status)
         ? message.envelope.goalOutcome.status as 'partial' | 'blocked' : 'waiting' } : {} }
 }
@@ -85,7 +97,33 @@ export function consumeRunState(view: RunView, state: RunState): RunView {
   if (state.message && run.resultId && run.resultFence) next = consumeAssistantMessage(next,state.message,{ resultId: run.resultId, fence: run.resultFence })
   return { ...next, fence: run.fence, requestVersion: run.requestVersion, lifecycle: run.status,
     goalOutcome: run.goalOutcome, delivery: state.delivery,
-    ...['queued','leased'].includes(run.status) ? {} : { draft: '' } }
+    ...!['queued','leased'].includes(run.status) ? { previewClosedFence: run.fence } : {},
+    ...['queued','leased'].includes(run.status) && run.fence === view.fence && run.requestVersion === view.requestVersion
+      ? {} : { draft: '', preview: null } }
+}
+
+/** Gaps discard the draft; reconnect the SSE source to obtain a complete snapshot. */
+export function consumePreview(view: RunView, update: PreviewUpdate): RunView {
+  if (update.runId !== view.runId || update.fence < view.fence || update.fence <= view.messageFence
+    || update.fence <= (view.previewClosedFence ?? 0) || update.requestVersion < view.requestVersion
+    || !Number.isSafeInteger(update.seq) || update.seq < 1) return view
+  const prior = view.preview
+  if (prior?.fence === update.fence && update.seq <= prior.seq) return view
+  const draft = update.kind === 'snapshot' ? update.draft
+    : prior?.attemptId === update.attemptId && prior.fence === update.fence
+      && prior.requestVersion === update.requestVersion && prior.seq === update.fromSeq ? view.draft + update.delta : null
+  if (draft === null || draft.length > 100_000) return { ...view, draft: '', preview: null }
+  return { ...view, draft, fence: update.fence, requestVersion: update.requestVersion,
+    preview: { attemptId: update.attemptId, seq: update.seq, fence: update.fence, requestVersion: update.requestVersion } }
+}
+
+export function consumeRunStreamEvent(view: RunView, item: RunStreamEvent): RunView {
+  switch (item.type) {
+    case 'event': return consumeRunEvent(view, item.event)
+    case 'state': return consumeRunState(view, item.state)
+    case 'preview': return consumePreview(view, item.preview)
+    case 'reset': return item.runId === view.runId ? { ...view, draft: '', preview: null } : view
+  }
 }
 
 export type { GoalOutcome } from '../protocol/outcome.js'

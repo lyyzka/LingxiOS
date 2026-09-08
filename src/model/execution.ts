@@ -61,7 +61,7 @@ export function modelExecution(host: Pick<HostPort, 'reserveModelCall' | 'record
   let sequence = 0, calls = 0, tokens = 0, cost = 0
   const started = Date.now()
   const invoke = async <T extends { model?: string; usage: ModelUsage }>(purpose: ModelCallObservation['purpose'],
-    request: { signal?: AbortSignal | undefined; input?: unknown; instructions?: string; prompt?: PromptManifest }, operation: (signal: AbortSignal) => Promise<T>, callModel = model): Promise<T> => {
+    request: { signal?: AbortSignal | undefined; input?: unknown; instructions?: string; prompt?: PromptManifest }, operation: (signal: AbortSignal, callId: string, diagnostics: Record<string, unknown>) => Promise<T>, callModel = model): Promise<T> => {
     const instructionsSha256 = request.instructions === undefined ? undefined : textSha256(request.instructions)
     if (request.prompt && request.prompt.instructionsSha256 !== instructionsSha256) throw new Error('prompt manifest does not match model instructions')
     const logicalCallId = `${work.id}:${work.fence}:${namespace}:${++sequence}`
@@ -93,7 +93,8 @@ export function modelExecution(host: Pick<HostPort, 'reserveModelCall' | 'record
         data: { callId, logicalCallId, purpose, model: callModel.modelId ?? 'unknown',
           ...(request.prompt ? { prompt: request.prompt } : {}), ...(instructionsSha256 ? { instructionsSha256 } : {}) } })
       let result: T | undefined, failure: unknown
-      try { result = await abortable(operation(signal), signal) } catch (error) { failure = error }
+      const diagnostics: Record<string, unknown> = {}
+      try { result = await abortable(operation(signal, callId, diagnostics), signal) } catch (error) { failure = error }
       const usage = result?.usage
       const inputTokens = usage?.available ? usage.inputTokens : input
       const outputTokens = usage?.available ? usage.outputTokens : output
@@ -113,7 +114,9 @@ export function modelExecution(host: Pick<HostPort, 'reserveModelCall' | 'record
       await host.recordModelUsage(work, callId, { inputTokens, outputTokens, costMicros }, observation)
       // Usage remains durable if the old lease can no longer emit telemetry.
       await emit?.({ kind: 'model.request.finished', stage: result ? 'completed' : 'failed', visibility: 'internal', data: { ...observation } })
-      if (result) return { ...result, callId, logicalCallId }
+      if (result) return { ...result, callId, logicalCallId, ...(Object.keys(diagnostics).length ? {
+        diagnostics: { ...('diagnostics' in result ? result.diagnostics as Record<string, unknown> : {}), ...diagnostics },
+      } : {}) }
       if (!(failure instanceof ModelDriverError) || attempt >= 3 || signal.aborted
         || failure.diagnostics.kind === 'protocol'
         || failure.diagnostics.status !== undefined && failure.diagnostics.status !== 429 && failure.diagnostics.status < 500) throw failure
@@ -132,6 +135,7 @@ export function executionModel(host: Pick<HostPort, 'reserveModelCall' | 'record
     if (!fitsModel(model, request)) throw new Error('model call exceeds its context budget; original input was not truncated')
   }
   return {
+    ...(model.previewFormat ? { previewFormat: model.previewFormat } : {}),
     nextCallId,
     ...(model.modelId === undefined ? {} : { modelId: model.modelId }),
     ...(model.configurationFingerprint === undefined ? {} : { configurationFingerprint: model.configurationFingerprint }),
@@ -146,7 +150,24 @@ export function executionModel(host: Pick<HostPort, 'reserveModelCall' | 'record
         throw new Error('approval explanations cannot execute tools')
       }
       check(request)
-      return invoke('agent-turn', request, signal => model.run({ ...request, signal }))
+      return invoke('agent-turn', request, (signal, callId, diagnostics) => {
+        request.onAttempt?.(callId)
+        const began = performance.now()
+        let firstTextMs: number | undefined
+        let active = true
+        const result = model.run({ ...request, signal, onTextDelta: delta => {
+            if (!active || signal.aborted) return
+            if (delta) firstTextMs ??= performance.now() - began
+            request.onTextDelta?.(delta)
+          } })
+        const finished = () => {
+          active = false
+          diagnostics['providerDurationMs'] = performance.now() - began
+          if (firstTextMs !== undefined) diagnostics['providerFirstContentMs'] = firstTextMs
+        }
+        void result.then(finished, finished)
+        return result
+      })
     },
     structured: request => {
       check(request)

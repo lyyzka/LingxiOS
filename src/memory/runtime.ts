@@ -13,6 +13,9 @@ import { snapshotMemories, fitMemorySnapshot, roundRobin } from './context.js'
 import { prepareMemoryReview, recordMemoryReview } from './review.js'
 import type { HostAction } from '../protocol/types.js'
 import type { MemoryDocument, MemoryEntry, MemoryHit, MemoryReview } from './types.js'
+import { abortable } from '../deadline.js'
+import { deadlinePool } from '../control-plane/deadline-pool.js'
+import { sameScope } from './access.js'
 export type { MemoryOptions } from './access.js'
 
 export function createMemoryRuntime(database: SqlPool, options: MemoryOptions, budget?: RootModelBudgetOptions) {
@@ -106,26 +109,43 @@ export function createMemoryRuntime(database: SqlPool, options: MemoryOptions, b
   return { tools:[...service.tools,...tools],api:service.api,
     prepareReview: (work: Omit<WorkItem,'leaseToken'>,action:HostAction) => withTransaction(database,db => prepareMemoryReview(db,options,work,action)),
     recordReview: (work: Omit<WorkItem,'leaseToken'>,action:HostAction,hash:string,review:MemoryReview) => withTransaction(database,db => recordMemoryReview(db,options,work,action,hash,review)),
-    async context(work: Omit<WorkItem, 'leaseToken'>) {
-      const identity=identityOf(work),scopes=await authorizedScopes(options,identity,database)
-      const request = (await database.query(`SELECT request_snapshot FROM lingxios.agent_request_snapshots WHERE work_id=$1`,[work.id])).rows[0]?.['request_snapshot'] as
+    async context(work: Omit<WorkItem, 'leaseToken'>, external?: AbortSignal) {
+      const signal = AbortSignal.any([AbortSignal.timeout(settings.timeoutMs), ...external ? [external] : []])
+      const db = deadlinePool(database, signal, settings.timeoutMs)
+      const identity=identityOf(work),scopes=await abortable(authorizedScopes(options,identity,db),signal)
+      const request = (await db.query(`SELECT request_snapshot FROM lingxios.agent_request_snapshots WHERE work_id=$1`,[work.id])).rows[0]?.['request_snapshot'] as
         {originalText:string;revisions:Array<{text:string}>;inheritedRevisions?:Array<{text:string}>}|undefined
       const query = [request?.originalText ?? String(work.meta?.['text'] ?? ''),...request?.inheritedRevisions?.map(item => item.text) ?? [],
         ...request?.revisions.map(item => item.text) ?? []].join('\n').slice(-2000)
       const core:MemoryDocument[][]=[],directory:MemoryEntry[][]=[],recalled:MemoryHit[][]=[],retrieval:import('./types.js').MemorySearchResult['retrieval'][]=[]
       let omittedCore=0,omittedDirectory=0
-      for (const scope of scopes) {
-        const rows=(await database.query(`SELECT *,COUNT(*) OVER() AS total FROM lingxios.agent_memories WHERE tenant_id=$1 AND scope_type=$2 AND scope_id=$3
-          AND origin<>'evolved' AND layer='core' AND status='active' AND (valid_until IS NULL OR valid_until>NOW())
-          ORDER BY pinned DESC,origin='explicit' DESC,path LIMIT 64`,scopeParams(scope))).rows
-        core.push(rows.map(memoryDocument)); omittedCore+=Number(rows[0]?.['total']??0)-rows.length
-        const entries=(await database.query(`SELECT *,COUNT(*) OVER() AS total FROM lingxios.agent_memories WHERE tenant_id=$1 AND scope_type=$2 AND scope_id=$3
-          AND origin<>'evolved' AND status='active' AND (valid_until IS NULL OR valid_until>NOW()) ORDER BY path LIMIT 64`,scopeParams(scope))).rows
-        directory.push(entries.map(row => memoryEntry(memoryDocument(row)))); omittedDirectory+=Number(entries[0]?.['total']??0)-entries.length
-        const result=await service.search(identity,scope,{query,limit:12},database,work)
-        recalled.push((result.items as MemoryHit[]).filter(item => item.layer!=='core')); retrieval.push(result.retrieval)
+      for (let index = 0; index < scopes.length; index += settings.concurrency) {
+        const batch = await Promise.all(scopes.slice(index, index + settings.concurrency).map(async scope => {
+          const inventory = (await db.query(`SELECT
+            COALESCE((SELECT jsonb_agg(core) FROM (SELECT *,COUNT(*) OVER() AS total FROM lingxios.agent_memories
+              WHERE tenant_id=$1 AND scope_type=$2 AND scope_id=$3 AND origin<>'evolved' AND layer='core'
+                AND status='active' AND (valid_until IS NULL OR valid_until>NOW()) ORDER BY pinned DESC,origin='explicit' DESC,path LIMIT 64) core),'[]') AS core,
+            COALESCE((SELECT jsonb_agg(directory) FROM (SELECT *,COUNT(*) OVER() AS total FROM lingxios.agent_memories
+              WHERE tenant_id=$1 AND scope_type=$2 AND scope_id=$3 AND origin<>'evolved'
+                AND status='active' AND (valid_until IS NULL OR valid_until>NOW()) ORDER BY path LIMIT 64) directory),'[]') AS directory`, scopeParams(scope))).rows[0]!
+          const recallSignal = options.contextBudget?.optionalRecall
+            ? AbortSignal.any([signal, AbortSignal.timeout(settings.recallTimeoutMs)]) : signal
+          const recallDb = deadlinePool(database, recallSignal, settings.timeoutMs)
+          const result = await abortable(service.recall(work, scope, query, recallDb, recallSignal), recallSignal).catch(error => {
+            if (!options.contextBudget?.optionalRecall || signal.aborted || !recallSignal.aborted) throw error
+            return { items: [], nextCursor: null, retrieval: 'optional_timeout' as const }
+          })
+          return { rows: inventory['core'] as Record<string, unknown>[], entries: inventory['directory'] as Record<string, unknown>[], result }
+        }))
+        for (const { rows, entries, result } of batch) {
+          core.push(rows.map(memoryDocument)); omittedCore+=Number(rows[0]?.['total']??0)-rows.length
+          directory.push(entries.map(row => memoryEntry(memoryDocument(row)))); omittedDirectory+=Number(entries[0]?.['total']??0)-entries.length
+          recalled.push((result.items as MemoryHit[]).filter(item => item.layer!=='core')); retrieval.push(result.retrieval)
+        }
       }
-      const strategies=options.evolution?await withTransaction(database,client=>pinnedEvolution(client,work,scopes)):[]
+      const strategies=options.evolution?await withTransaction(db,client=>pinnedEvolution(client,work,scopes)):[]
+      const current = await abortable(authorizedScopes(options,identity,db),signal)
+      if (scopes.some(scope => !current.some(candidate => sameScope(scope,candidate)))) throw new Error('memory scope was revoked during retrieval')
       return fitMemorySnapshot(snapshotMemories({status:'available',core:roundRobin(core),directory:roundRobin(directory),recalled:roundRobin(recalled),strategies,
         omitted:{core:omittedCore,directory:omittedDirectory,recalled:0,strategies:0},budget:{ratio:settings.ratio,maxTokens:settings.maxTokens},retrieval}),Infinity)
     },

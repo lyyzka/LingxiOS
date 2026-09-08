@@ -3,8 +3,11 @@ import { request as httpRequest } from 'node:http'
 import { request as httpsRequest, type RequestOptions } from 'node:https'
 import { isIP } from 'node:net'
 import { isPublicAddress, researchUrl } from './address.js'
+import { abortable } from '../deadline.js'
+import { ResourceQuota } from '../resource-quota.js'
 
 const MAX_BYTES = 2 * 1024 * 1024
+const fetchQuota = new ResourceQuota(4)
 
 export function pinnedRequestOptions(url: URL, address: string): RequestOptions {
   if (!isPublicAddress(address)) throw new Error('research address is blocked')
@@ -15,23 +18,33 @@ export function pinnedRequestOptions(url: URL, address: string): RequestOptions 
   }
 }
 
-export async function fetchResearch(raw: string): Promise<{ url: string; contentType: string; body: Buffer }> {
+export interface ResearchOptions {
+  signal?: AbortSignal
+  timeoutMs?: number
+  onProgress?: (progress: { stage: 'connecting' | 'receiving'; bytes: number }) => void
+  quota?: ResourceQuota
+}
+
+export async function fetchResearch(raw: string, options: ResearchOptions = {}): Promise<{ url: string; contentType: string; body: Buffer }> {
+  const timeoutMs = options.timeoutMs ?? 15_000
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 120_000) throw new Error('invalid research timeout')
+  options.signal?.throwIfAborted()
   const controller = new AbortController()
-  let timeout: ReturnType<typeof setTimeout> | undefined
-  const expired = new Promise<never>((_resolve, reject) => {
-    timeout = setTimeout(() => { controller.abort(); reject(new Error('research request timed out')) }, 15_000)
-  })
+  const signal = options.signal ? AbortSignal.any([controller.signal, options.signal]) : controller.signal
+  const timeout = setTimeout(() => controller.abort(new Error('research request timed out')), timeoutMs)
   try {
-    return await Promise.race([expired, (async () => {
+    return await abortable((options.quota ?? fetchQuota).run(async () => {
       let url = researchUrl(raw)
       for (let redirects = 0; redirects <= 5; redirects++) {
+        signal.throwIfAborted()
+        options.onProgress?.({ stage: 'connecting', bytes: 0 })
         const host = url.hostname.replace(/^\[|\]$/g, '')
         const addresses = isIP(host) ? [{ address: host }] : await lookup(host, { all: true, verbatim: true })
         if (!addresses.length || addresses.some(item => !isPublicAddress(item.address))) throw new Error('research DNS resolved to a blocked address')
-        controller.signal.throwIfAborted()
+        signal.throwIfAborted()
         const result = await new Promise<{ redirect: string } | { url: string; contentType: string; body: Buffer }>((resolve, reject) => {
           const request = (url.protocol === 'https:' ? httpsRequest : httpRequest)(url, {
-            ...pinnedRequestOptions(url, addresses[0]!.address), signal: controller.signal,
+            ...pinnedRequestOptions(url, addresses[0]!.address), signal,
           }, response => {
             const status = response.statusCode ?? 0
             if (status >= 300 && status < 400) {
@@ -53,10 +66,18 @@ export async function fetchResearch(raw: string): Promise<{ url: string; content
             }
             const chunks: Buffer[] = []
             let size = 0
+            let reportedAt = 0
             response.on('data', (chunk: Buffer) => {
               size += chunk.length
               if (size > MAX_BYTES) response.destroy(new Error('research source exceeds 2 MiB'))
-              else chunks.push(chunk)
+              else {
+                chunks.push(chunk)
+                if (Date.now() - reportedAt >= 100) {
+                  reportedAt = Date.now()
+                  try { options.onProgress?.({ stage: 'receiving', bytes: size }) }
+                  catch (error) { response.destroy(error instanceof Error ? error : new Error(String(error))) }
+                }
+              }
             })
             response.on('error', reject)
             response.on('end', () => resolve({ url: url.href, contentType: String(response.headers['content-type'] ?? 'application/octet-stream').split(';')[0]!.toLowerCase(), body: Buffer.concat(chunks) }))
@@ -69,7 +90,7 @@ export async function fetchResearch(raw: string): Promise<{ url: string; content
         url = researchUrl(new URL(result.redirect, url).href)
       }
       throw new Error('research redirect limit exceeded')
-    })()])
+    }, signal), signal)
   } finally {
     clearTimeout(timeout)
   }

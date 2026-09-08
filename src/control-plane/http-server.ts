@@ -11,10 +11,13 @@ import type { MetricsRegistry } from '../metrics.js'
 import type { AssistantMessage, RunEvent, SessionRecord, WorkCompletion } from '../protocol/types.js'
 import type { EnqueueWorkInput } from './stores.js'
 import { ControlPlaneError, ControlPlaneService, type LeaseProof } from './service.js'
+import { readPreviewFrames } from '../host/preview-stream.js'
 
 export interface ControlPlaneServerOptions {
   service: ControlPlaneService
-  claimWork: (workerId: string, requestId?: string, workKinds?: readonly string[]) => Promise<import('../protocol/types.js').WorkItem | null>
+  claimWork: (workerId: string, requestId?: string, workKinds?: readonly string[], lanes?: readonly import('../protocol/types.js').WorkLane[]) => Promise<import('../protocol/types.js').WorkItem | null>
+  waitForWork?: NonNullable<import('../host/port.js').HostPort['waitForWork']>
+  streamPreview?: (proof: LeaseProof, frames: AsyncIterable<import('../protocol/preview.js').PreviewFrame>, signal: AbortSignal) => Promise<void>
   serviceToken: string
   logger?: Logger
   metrics?: MetricsRegistry
@@ -98,6 +101,10 @@ export class ControlPlaneServer {
     const url = new URL(req.url ?? '/', 'http://internal')
     const path = url.pathname
     const method = req.method ?? 'GET'
+    this.options.metrics?.counter('agentos_control_http_requests_total', 'Control-plane HTTP requests including retries').inc({
+      operation: path.endsWith('/preview') ? 'preview' : path.endsWith('/claim') ? 'claim' : path.endsWith('/wait') ? 'wait'
+        : path === '/v5/sessions' ? 'checkpoint' : path.endsWith('/context') ? 'context' : 'other',
+    })
     const service = this.options.service
     const disconnected = new AbortController()
     res.once('close', () => { if (!res.writableFinished) disconnected.abort(new Error('worker connection closed')) })
@@ -123,12 +130,52 @@ export class ControlPlaneServer {
       return
     }
 
+    const preview = /^\/v5\/work\/([^/]+)\/preview$/.exec(path)
+    if (method === 'POST' && preview && this.options.streamPreview) {
+      const proof = leaseProofOf(decodeURIComponent(preview[1]!), {
+        fence: Number(req.headers['x-lingxios-fence']), leaseToken: req.headers['x-lingxios-lease'],
+      })
+      await this.options.streamPreview(proof, readPreviewFrames(req, disconnected.signal), disconnected.signal)
+      json(res, 200, { ok: true })
+      return
+    }
+
+    const binary = /^\/v5\/work\/([^/]+)\/artifact-bytes$/.exec(path)
+    if (method === 'POST' && binary) {
+      const proof = leaseProofOf(decodeURIComponent(binary[1]!), {
+        fence: Number(req.headers['x-lingxios-fence']), leaseToken: req.headers['x-lingxios-lease'],
+      })
+      const metadata = req.headers['x-lingxios-artifact']
+      if (typeof metadata !== 'string' || metadata.length > 8192) throw new ControlPlaneError(400, 'invalid artifact metadata')
+      let artifact: unknown
+      try { artifact = JSON.parse(Buffer.from(metadata, 'base64url').toString('utf8')) }
+      catch { throw new ControlPlaneError(400, 'invalid artifact metadata') }
+      const chunks: Buffer[] = []
+      let size = 0
+      for await (const chunk of req) {
+        size += chunk.length
+        if (size > 16 * 1024 * 1024) throw new ControlPlaneError(413, 'artifact upload exceeds 16 MiB')
+        chunks.push(Buffer.from(chunk))
+      }
+      await service.stageArtifact(proof, artifact as never, Buffer.concat(chunks))
+      json(res, 200, { ok: true }); return
+    }
+
     const maxBody = path.endsWith('/artifacts') ? 24 * 1024 * 1024 : this.options.maxBodyBytes ?? 8 * 1024 * 1024
     const parsed = method === 'GET' ? {} : await readBody(req, maxBody)
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new ControlPlaneError(400, 'request body must be a JSON object')
     const body = parsed as Record<string, unknown>
 
     // Route table -----------------------------------------------------------
+    if (method === 'POST' && path === '/v5/work/wait' && this.options.waitForWork) {
+      if (body['cursor'] !== undefined && typeof body['cursor'] !== 'string'
+        || !Number.isSafeInteger(body['timeoutMs']) || Number(body['timeoutMs']) < 1 || Number(body['timeoutMs']) > 25_000) {
+        throw new ControlPlaneError(400, 'invalid work wait')
+      }
+      json(res, 200, await this.options.waitForWork(body['cursor'] as string | undefined, Number(body['timeoutMs']), disconnected.signal))
+      return
+    }
+
     if (method === 'POST' && path === '/v5/work') {
       json(res, 200, await service.enqueue(body as unknown as EnqueueWorkInput))
       return
@@ -140,7 +187,7 @@ export class ControlPlaneServer {
       if (!Array.isArray(body['workKinds']) || body['workKinds'].length < 1 || body['workKinds'].length > 64
         || body['workKinds'].some(kind => typeof kind !== 'string' || !/^[a-z][a-z0-9_]{0,63}$/.test(kind))) throw new ControlPlaneError(400, 'workKinds are required')
       json(res, 200, await this.options.claimWork(stringField(body, 'workerId'),
-        typeof body['requestId'] === 'string' ? body['requestId'] : undefined, body['workKinds']))
+        typeof body['requestId'] === 'string' ? body['requestId'] : undefined, body['workKinds'], body['lanes'] as never))
       return
     }
 
@@ -154,7 +201,7 @@ export class ControlPlaneServer {
           fence: Number(url.searchParams.get('fence')),
           leaseToken: url.searchParams.get('leaseToken') ?? '',
         }
-        json(res, 200, await service.loadContext(proof))
+        json(res, 200, await service.loadContext(proof, url.searchParams.get('includeSession') === 'true'))
         return
       }
       if (method === 'POST') {
