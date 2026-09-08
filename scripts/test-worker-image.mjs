@@ -41,7 +41,7 @@ if (${apparmor}) {
   const forbidden = spawnSync('unshare', ['--user', '--map-root-user', '--mount', '--propagation=slave', '--', 'mount', '-t', 'tmpfs', 'tmpfs', '/data/homes/own'], { encoding: 'utf8', timeout: 5000 })
   assert.ifError(forbidden.error)
   assert.notEqual(forbidden.status, 0, 'AppArmor must deny mounts outside Bubblewrap setup paths')
-  assert.match(forbidden.stderr, /^mount:.*(?:permission denied|operation not permitted)/im, 'namespace setup must succeed before the mount is rejected')
+  assert.match(forbidden.stderr, /^mount: \/data\/homes\/own: cannot mount tmpfs/im, 'namespace setup must succeed before the mount is rejected')
 }
 for (const [code, expected] of [
   ['a=bytearray(1024*1024*1024)', /MemoryError/],

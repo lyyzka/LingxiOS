@@ -19,6 +19,7 @@ jobs:
       - run: npm run check:release
       - name: Report sandbox denials
         if: failure()
+        continue-on-error: true
         run: sudo journalctl --dmesg --no-pager --grep='apparmor="DENIED"' --lines=30
 
   windows-package:
