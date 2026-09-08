@@ -17,6 +17,11 @@ jobs:
       - name: Load confined Worker AppArmor policy
         run: sudo apparmor_parser --replace --skip-cache deploy/worker-apparmor
       - run: npm run check:release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-qualification-${{ github.sha }}
+          path: release-results/qualifications/*.json
+          if-no-files-found: error
       - name: Report sandbox denials
         if: failure()
         continue-on-error: true

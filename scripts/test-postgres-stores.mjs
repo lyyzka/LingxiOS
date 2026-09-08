@@ -10,6 +10,8 @@ import { writeMemory } from '../dist/src/memory/store.js'
 import { createMemoryService } from '../dist/src/memory/service.js'
 import { captureMemoryEvidence,scheduleMemoryReflection } from '../dist/src/memory/evidence.js'
 import { sessionKeyOf } from '../dist/src/protocol/types.js'
+import { syncConversation, ingestMessage } from '../dist/src/collaboration/conversations.js'
+import { createSharedState, readSharedState, updateSharedState } from '../dist/src/collaboration/state.js'
 
 const connectionString = process.env.LINGXIOS_TEST_DATABASE_URL
 if (!connectionString) throw new Error('LINGXIOS_TEST_DATABASE_URL must name an empty disposable PostgreSQL database')
@@ -29,7 +31,50 @@ try {
   assert.equal((await pool.query("SELECT trigger_ref FROM lingxios.agent_work_items WHERE id='preserved'")).rows[0].trigger_ref,'original')
   await assert.rejects(pool.query(await readFile(new URL('../db/migrations/009-cognitive-memory-reset.sql', import.meta.url),'utf8')),/schema version 8/)
   await pool.query('ROLLBACK')
+  await pool.query(await readFile(new URL('../db/migrations/010-im-collaboration.sql', import.meta.url), 'utf8'))
   await checkStorage(pool)
+  const conversation = { tenantId: 'im-concurrency', conversationId: 'room', version: 1, kind: 'group',
+    owner: { kind: 'participant', id: 'human' }, defaultAgentId: 'agent', participants: [
+      { id: 'human', kind: 'human', capabilities: ['read', 'execute'] },
+      { id: 'agent', kind: 'agent', capabilities: ['read', 'execute', 'speak'] }] }
+  await syncConversation(pool, conversation)
+  const stateScope = { tenantId: conversation.tenantId, conversationId: conversation.conversationId, stateId: 'canvas' }
+  const actor = { principalId: 'human' }
+  await withTransaction(pool, db => createSharedState(db, stateScope, actor))
+  const left = await pool.connect(), right = await pool.connect()
+  const mutate = async (client, operationId, field, expectedVersion, value, deleted = false) => {
+    await client.query('BEGIN')
+    try {
+      const result = await updateSharedState(client, stateScope, actor, { operationId,
+        changes: [{ field, expectedVersion, ...(deleted ? { delete: true } : { value }) }] })
+      await client.query('COMMIT')
+      return result
+    } catch (error) { await client.query('ROLLBACK'); throw error }
+  }
+  try {
+    assert.notEqual((await left.query('SELECT pg_backend_pid() AS pid')).rows[0].pid,
+      (await right.query('SELECT pg_backend_pid() AS pid')).rows[0].pid)
+    const independent = await Promise.all([mutate(left, 'left', 'left', 0, 'A'), mutate(right, 'right', 'right', 0, 'B')])
+    assert.ok(independent.every(result => result.ok))
+    const racing = await Promise.all([mutate(left, 'race-left', 'title', 0, 'A'), mutate(right, 'race-right', 'title', 0, 'B')])
+    assert.deepEqual(racing.map(result => result.ok).sort(), [false, true])
+    const duplicate = await Promise.all([mutate(left, 'same', 'title', 1, 'C'), mutate(right, 'same', 'title', 1, 'C')])
+    assert.deepEqual(duplicate.map(result => result.deduplicated).sort(), [false, true])
+    await mutate(left, 'delete', 'title', 2, null, true)
+    assert.equal((await mutate(right, 'stale-recreate', 'title', 0, 'D')).ok, false)
+    assert.equal((await mutate(right, 'recreate', 'title', 3, 'D')).ok, true)
+    await left.query('BEGIN')
+    await updateSharedState(left, stateScope, actor, { operationId: 'rollback', changes: [{ field: 'title', expectedVersion: 4, value: 'lost' }] })
+    await left.query('ROLLBACK')
+    assert.equal((await readSharedState(right, stateScope, actor)).fields.title.value, 'D')
+    assert.equal((await right.query("SELECT 1 FROM lingxios.agent_shared_operations WHERE operation_id='rollback'")).rows.length, 0)
+  } finally { left.release(); right.release() }
+  const incoming = { tenantId: conversation.tenantId, conversationId: conversation.conversationId, policyVersion: 1,
+    messageId: 'message', version: 1, author: { id: 'human', kind: 'human' }, text: 'Collaborate.' }
+  const ingress = await Promise.all([ingestMessage(pool, incoming, {}), ingestMessage(pool, incoming, {})])
+  assert.deepEqual(ingress.map(result => result.deduplicated).sort(), [false, true])
+  assert.deepEqual(ingress[0].runs, ingress[1].runs)
+  await pool.query("UPDATE lingxios.agent_work_items SET status='cancelled' WHERE tenant_id=$1", [conversation.tenantId])
   const memoryScope={tenantId:'concurrency',scopeType:'user',scopeId:'human'}
   const memoryIdentity={tenantId:'concurrency',agentId:'agent',principalId:'human',sessionId:'admin'}
   const memoryOptions={resolveScopes:async()=>[memoryScope]}
@@ -146,5 +191,5 @@ try {
   const independent = await Promise.all([workStore.claim('thread-worker-a'), workStore.claim('thread-worker-b')])
   assert.deepEqual(independent.map(item => item.id).sort(), ['thread-a', 'thread-b'])
   assert.deepEqual((await pool.query('SELECT * FROM public.agent_work_items')).rows, [{ company_id: 'untouched' }])
-  console.log('Real PostgreSQL stores passed: schema 7→8→9 reset, document CAS/restore races, reflection deduplication, atomic memory forgetting, competing claims, session exclusion, concurrent intent reservation/CAS, separate-process recovery, stale fencing, cancellation and product-table isolation.')
+  console.log('Real PostgreSQL stores passed: schema 7→8→9→10, document CAS/restore races, reflection deduplication, atomic memory forgetting, competing claims, session exclusion, concurrent intent reservation/CAS, separate-process recovery, stale fencing, cancellation and product-table isolation.')
 } finally { await pool?.end() }

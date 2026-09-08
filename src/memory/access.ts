@@ -4,6 +4,8 @@ import type { EmbeddingOptions } from '../model/embeddings.js'
 import type { MemoryWritePolicy } from './policy.js'
 import type { MemoryIdentity, MemoryScope } from './types.js'
 import { validateScope } from './store.js'
+import { authorizeConversationWork, digest } from '../collaboration/access.js'
+import { workItemFromRow } from '../control-plane/pg-store.js'
 
 export interface MemoryOptions {
   /** Resolve destinations from the authenticated identity's current product permissions. */
@@ -37,8 +39,21 @@ export function sameScope(a: MemoryScope,b: MemoryScope): boolean {
 }
 export async function authorizedScopes(options: MemoryOptions, identity: MemoryIdentity, database: SqlQueryable): Promise<MemoryScope[]> {
   if (![identity.tenantId,identity.agentId,identity.principalId,identity.sessionId].every(value => typeof value === 'string' && value.trim() && value.length<=1000)) throw new Error('invalid memory identity')
-  const scopes = await options.resolveScopes(identity,database)
+  let scopes = await options.resolveScopes(identity,database)
   if (!Array.isArray(scopes) || scopes.length > 12) throw new Error('too many memory scopes')
+  for (const scope of scopes) validateScope(scope)
+  if (identity.workId) {
+    const row = (await database.query('SELECT * FROM lingxios.agent_work_items WHERE id=$1', [identity.workId])).rows[0]
+    if (row?.['conversation']) {
+      const work = workItemFromRow(row, '', 1)
+      if (work.tenantId !== identity.tenantId || work.principalId !== identity.principalId || work.agentId !== identity.agentId
+        || work.sessionId !== identity.sessionId || work.threadId !== identity.threadId) throw new Error('IM memory identity differs from its run')
+      await authorizeConversationWork(database, work, 'read')
+      const scope = work.conversation!
+      scopes = scopes.map(memory => ({ ...memory, scopeId: 'im-memory:' + digest([memory.scopeType, memory.scopeId, scope.conversationId,
+        work.threadId ?? null, identity.agentId, identity.principalId, scope.audience, scope.policyVersion]) }))
+    }
+  }
   const keys = new Set<string>()
   for (const scope of scopes) {
     validateScope(scope)

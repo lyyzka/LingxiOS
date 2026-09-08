@@ -68,6 +68,7 @@ export function workItemFromRow(row: Record<string, unknown>, leaseToken: string
     lane: row['lane'] as WorkItem['lane'],
     triggerRef: String(row['trigger_ref']),
     ...(row['principal_id'] ? { principalId: String(row['principal_id']) } : {}),
+    ...(row['conversation'] ? { conversation: row['conversation'] as NonNullable<WorkItem['conversation']> } : {}),
     createdAt: new Date(row['created_at'] as string | Date).toISOString(),
     availableAt: new Date(row['available_at'] as string | Date).toISOString(),
     attempts: Number(row['attempts'] ?? 0),
@@ -81,7 +82,10 @@ export class PgWorkStore implements WorkStore {
   async children(parent: Omit<WorkItem, 'leaseToken'>) {
     const { rows } = await this.pool.query(`SELECT work.id,work.status,result.message->>'body' AS result_text,work.goal_outcome FROM lingxios.agent_work_items work
       LEFT JOIN lingxios.agent_results result ON result.id=work.result_id
-      WHERE work.meta->>'parentWorkId'=$1 AND work.tenant_id=$2 AND work.principal_id IS NOT DISTINCT FROM $3
+      WHERE work.tenant_id=$2 AND work.principal_id IS NOT DISTINCT FROM $3 AND (
+        (work.meta->>'parentWorkId'=$1 AND COALESCE((work.meta->>'parentRequestVersion')::integer,1)=
+          (SELECT jsonb_array_length(steer_inputs)+1 FROM lingxios.agent_work_items WHERE id=$1))
+        OR work.id IN(SELECT dependency_id FROM lingxios.agent_work_dependencies WHERE work_id=$1))
       ORDER BY work.created_at,work.id LIMIT 64`, [parent.id,parent.tenantId,parent.principalId ?? null])
     return rows.map(row => ({ id: String(row['id']), status: String(row['status']), resultText: row['result_text'] as string | null,
       goalOutcome: row['goal_outcome'] as WorkCompletion['goalOutcome'] | null }))
@@ -165,6 +169,12 @@ export class PgWorkStore implements WorkStore {
             AND (work.kind NOT IN ('memory_synthesis','memory_index','memory_evaluation') OR work.attempts < 3)
             AND work.cancel_requested_at IS NULL
             AND work.available_at <= NOW()
+            AND NOT EXISTS (SELECT 1 FROM lingxios.agent_work_dependencies dependency
+              JOIN lingxios.agent_work_items prerequisite ON prerequisite.id=dependency.dependency_id
+              LEFT JOIN lingxios.agent_results result ON result.id=prerequisite.result_id
+              WHERE dependency.work_id=work.id AND (prerequisite.status<>'succeeded' OR prerequisite.cancel_requested_at IS NOT NULL
+                OR result.id IS NULL OR result.request_version<>jsonb_array_length(prerequisite.steer_inputs)+1
+                OR result.message->'envelope'->'goalOutcome'->>'status' IS DISTINCT FROM 'satisfied'))
             AND NOT EXISTS (SELECT 1 FROM jsonb_array_elements_text(COALESCE(work.meta->'dependsOn','[]'::jsonb)) dependency(id)
               LEFT JOIN lingxios.agent_work_items prerequisite ON prerequisite.id=dependency.id AND prerequisite.tenant_id=work.tenant_id
                 AND prerequisite.principal_id IS NOT DISTINCT FROM work.principal_id

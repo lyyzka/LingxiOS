@@ -1,5 +1,6 @@
 import type { AssistantMessage, RunEvent } from '../protocol/types.js'
 export { releaseVersions } from '../versions.js'
+export type { ConversationIdentity, ThreadIdentity, Audience, Visibility, IMDeliveryContext, IMDeliveryReceipt } from '../collaboration/types.js'
 import { isGoalOutcome, type GoalOutcome } from '../protocol/outcome.js'
 import type { CitationAnnotation, ResponseEnvelope } from '../outcome/envelope.js'
 import { RUN_SEQUENCE_SPAN } from '../protocol/constants.js'

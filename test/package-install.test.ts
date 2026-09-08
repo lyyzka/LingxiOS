@@ -20,6 +20,7 @@ it('installs a standalone tarball and executes packaged Python and document pars
     assert.ok(tarball.files.some((file) => file.path === 'kernel/runner.py'))
     assert.ok(tarball.files.some((file) => file.path === 'dist/src/context/document-worker.js'))
     assert.ok(tarball.files.some((file) => file.path === 'db/schema.sql'))
+    assert.ok(tarball.files.some((file) => file.path === 'db/migrations/010-im-collaboration.sql'))
     assert.ok(tarball.files.some((file) => file.path === 'dist/src/cli/eval.js'))
     assert.ok(!tarball.files.some((file) => file.path.startsWith('test/') || file.path.includes('pglite')))
     const pkg = JSON.parse(await readFile(join(root, 'package.json'), 'utf8')) as { name: string; version: string }
@@ -103,6 +104,8 @@ const modelServer = http.createServer((request, response) => {
 })
 await new Promise(resolve => modelServer.listen(0, '127.0.0.1', resolve))
 const application = await createLingxiOS({ database: pool, homesRoot: join(process.cwd(), 'app-homes') })
+for (const operation of [application.conversations.ingest, application.conversations.sync, application.graphs.enqueue,
+  application.sharedState.apply, application.readConversationTrace]) assert.equal(typeof operation, 'function')
 const localWorker = createWorker({ controlPlane: application, model: { id: 'fixture', apiKey: 'fixture', baseUrl: 'http://127.0.0.1:' + modelServer.address().port },
   kernel: { homesRoot: join(process.cwd(), 'app-homes') } })
 try {

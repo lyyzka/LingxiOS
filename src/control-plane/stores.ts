@@ -30,6 +30,7 @@ export interface EnqueueWorkInput {
   lane: WorkLane
   triggerRef: string
   principalId?: string
+  conversation?: import('../collaboration/types.js').WorkConversation
   /** Not before this instant. */
   availableAt?: string
   /** Tie-break inside a lane; higher first. */
@@ -223,6 +224,8 @@ export interface ActionLedgerStore {
 /** Assembles everything but `work` in a TurnContext. */
 export interface ContextProvider {
   loadContext(work: Omit<WorkItem, 'leaseToken'>): Promise<{
+    /** IM providers must authorize this audience before returning evidence, memory or dynamic resource data. */
+    audience?: import('../collaboration/types.js').Audience
     productRules?: string
     memory?: import('../memory/store.js').MemorySnapshot
     evidence?: import('../context/evidence.js').EvidenceItem[]
@@ -274,7 +277,7 @@ export interface DeliveryPort {
   getMessage?(work: Omit<WorkItem, 'leaseToken'>): Promise<import('../protocol/types.js').AssistantMessage | null>
   onEvent(work: Omit<WorkItem, 'leaseToken'>, event: RunEvent, context?: import('./outbox.js').DeliveryContext): Promise<void>
   deliverMessage(work: Omit<WorkItem, 'leaseToken'>, message: import('../protocol/types.js').AssistantMessage,
-    context?: import('./outbox.js').DeliveryContext): Promise<void>
+    context?: import('./outbox.js').DeliveryContext): Promise<void | import('../collaboration/types.js').IMDeliveryReceipt>
 }
 
 export interface ArtifactStager {

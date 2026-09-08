@@ -1,5 +1,8 @@
 /** First-release public API: assembled runtime and stable data contracts. */
 export { releaseVersions } from './versions.js'
+export type { ConversationIdentity, ThreadIdentity, ConversationPolicy, ConversationCapability, Participant, Visibility, Audience, AudienceInput,
+  MessageReference, WorkConversation, IMMessageInput, IMIngressResult, IMDeliveryContext, IMDeliveryReceipt,
+  GraphInput, GraphNode, SharedStateIdentity, SharedStateSnapshot, SharedStateUpdate, SharedStateChange, SharedStateResult } from './collaboration/types.js'
 export { assembleHarness, type HarnessProfile, type CapabilityDefinition, type HarnessContext } from './harness/profile.js'
 export { skillIndex, type SkillDefinition, type SkillIndex } from './skills/definition.js'
 export type { PresentationDefinition, TrustedPresentation } from './presentation/definition.js'
