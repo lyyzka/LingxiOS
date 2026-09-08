@@ -10,11 +10,11 @@ The consuming product owns authentication, authorization policy, native services
 
 ## Installation and versions
 
-`packageResources()` returns the fresh-install schema, the `migration008` upgrade from schema 7, and the Python runner. Apply exactly the appropriate SQL in an explicit product migration while holding that product's migration lock. Application startup must call its own migration-readiness check before `createLingxiOS()` and must not execute package DDL.
+`packageResources()` returns the schema-9 fresh-install schema, `migration008` for schema 7→8, `memoryReset009` for the explicit schema 8→9 memory reset, and the Python runner. Apply the appropriate SQL in a product migration while holding that product's migration lock. Fresh installations use only `schema`; existing schema-8 installations use only `memoryReset009`. Application startup performs read-only readiness checks and never executes package DDL.
 
-Every public entry uses runtime version `3.0.0`, schema `8`, control-plane protocol `6`, Kernel protocol `2`, and assistant message `2`. Protocol 6 rejects older workers that cannot enforce execution modes. Consumers should pin the exact npm version and verify the installed schema marker. The major release removes `smallModel` and `AGENT_OS_SMALL_MODEL*`; every generation, review, synthesis and compaction call uses the configured primary `model`. Optional embeddings remain a separate vector protocol.
+Every public entry uses runtime version `3.1.0`, schema `9`, control-plane protocol `7`, Kernel protocol `2`, and assistant message `2`. Protocol 7 rejects workers without cognitive-memory snapshots and the private review transport. Pin the exact npm version and verify the schema marker. Every generation, review, synthesis and compaction call uses the configured primary `model`. Optional embeddings remain a separate vector protocol.
 
-Before upgrading, stop ingress and workers, drain running tasks and explicitly resolve unknown effects and pending approvals. Never backfill an old approval with a new tool hash: the migration leaves the new column NULL. Approval resumption requires a new preview/action identity after the old intent has been settled. A configured `HarnessProfile` pins new runs to its behavior hash; changed profile, authored workflow, tool semantics or worker model configuration blocks recovery under a different deployment. Roll back new-run routing to a retained matching deployment; do not downgrade schema 8 underneath active workers or replay unknown effects. Restoring a schema-7 backup also requires restoring the matching application and accounting for externally committed effects.
+Before upgrading, stop ingress and old Workers, drain running tasks, and resolve unknown effects and pending approvals. Back up the database and retain the matching old application. Under the product migration lock, run `memoryReset009` against schema 8 (older schema 7 first requires `migration008`). The script refuses live leases and resets memory documents, versions, indexes, evidence, evaluations and old memory jobs; it preserves business work, committed results, product tables and frozen benchmarks. It does not import old notes or backfill conversation history. Deploy matching v3.1 hosts and Workers, run readiness checks, optionally initialize seed documents, then resume ingress. Do not run the fresh schema over the reset database. Rollback requires the old application and its database backup; no reverse memory conversion exists. Account for externally committed effects before restoring any backup. Existing Harness profile and approval bindings still apply; never fabricate a new hash for an old approval or replay an unknown effect.
 
 The package exports only:
 
@@ -46,6 +46,50 @@ Result, event, and model-ledger outboxes use expiring claims, bounded retries, e
 Artifacts are limited to 16 MiB. The control plane snapshots them by content hash before committing the message. `readArtifact()` checks the authenticated run identity, manifest entry, path containment, size, and SHA-256 digest before returning bytes.
 
 The browser consumes committed messages and ordered events through `@lyyzka/lingxios/ui`. Reconnects page through `readEvents()` and then apply `readRunState()`; reducers reject stale fences and request versions. Waiting, partial completion, verification gaps, delivery failure, citations, and artifact provenance stay explicit.
+
+## Cognitive memory
+
+Memory is optional. The product resolves scopes from authenticated identities, including original source identities during history search and maintenance. Administrative calls require no Worker lease; authenticate the caller before constructing `MemoryIdentity`. Scope names remain product-defined. Initialization saves only the supplied content.
+
+```ts
+const control = await createLingxiOS({
+  database,
+  memory: {
+    resolveScopes: async (identity, db) => {
+      // Use the product's current ACL here. Never trust a client-supplied scope.
+      return productMemoryScopes(identity, db)
+    },
+    contextBudget: { ratio: 0.08, maxTokens: 8000 },
+    reflection: { afterInteractions: 5, idleMs: 600_000 },
+    // writePolicy, embeddings and evolution remain optional.
+  },
+})
+const identity = { tenantId, agentId, principalId, sessionId }
+const scope = { tenantId, scopeType: 'workspace', scopeId: workspaceId }
+const saved = await control.memory!.initialize(identity, {
+  scope, sourceRef: 'authenticated-settings', idempotencyKey: requestId,
+  documents: [{ path: 'preferences/learning.md', title: 'Learning preference',
+    description: 'Preferred explanation format', body: 'Use diagrams and concrete examples.',
+    layer: 'core', locked: true }],
+})
+const page = await control.memory!.list(identity, scope, { prefix: 'preferences/', limit: 8 })
+const found = await control.memory!.search(identity, scope, { query: 'diagrams' })
+const evidence = await control.memory!.search(identity, scope, { target: 'history', query: 'diagrams' })
+const document = await control.memory!.read(identity, scope, saved.documents[0]!.id)
+const versions = await control.memory!.history(identity, scope, document!.id)
+const diagnostic = await control.memory!.doctor(identity, scope)
+const { jobIds } = await control.memory!.reflect(identity, scope)
+```
+
+`apply(identity, {scope, changes, sourceRef, idempotencyKey})` atomically creates, updates, moves, merges, expires or deletes up to 12 documents. Update/move/merge/delete/expire require `id` and `expectedVersion`; merge donors also carry versions. `restore(identity, {scope, id, expectedVersion, version, sourceRef, idempotencyKey})` creates a new version. Use `read(identity, scope, id, version)` to inspect historical content. Reuse an idempotency key only for the identical operation. A stale version requires rereading and a fresh operation. `forget(identity, scope)` clears documents, versions, indexes and searchable evidence and increments the scope epoch. Single-document deletion conservatively invalidates all prior source evidence in that scope while retaining other documents. It does not delete product conversations or audit/model records; apply the product's retention policy separately.
+
+Documents have stable IDs, unique relative `.md` paths, titles, descriptions, a 16 KiB UTF-8 body, `core/reference` layers, provenance, versions, locks and expiry. Paths generate the directory; relative Markdown links are discovery hints, not filesystem access. Core memory is loaded independently of query matches. Current original input plus human revisions drive keyword recall through native Chinese/English segmentation, PostgreSQL full-text search and GIN. Optional embeddings merge reciprocal ranks; unavailability reports `keyword_embedding_unavailable`. Empty queries browse; nonempty misses return no unrelated fallback. History remains separate from compacted conversation state, includes roles/timestamps/source IDs, and is restricted to the same tenant, principal and Agent with original-source authorization.
+
+The model receives native `memory.list/read/search/apply/history/restore/forget/reflect/doctor` tools. `read` supports `offset`, byte-bounded `length` and optional `version`; lists/search/history return `nextCursor`. Large ordinary tool results also support existing `observations.read` references. Chat mode exposes none, read mode exposes queries, and execute mode permits reviewed edits. Both direct and Python calls pass through the same private Worker reviewer. Models cannot supply `explicit` or `approved`; the reviewer binds the actual human request, action, document versions, lease, and epoch. Explicit or locked records require a current matching human request; contradictions become diagnostics. This model review is a content judgment, while identity, grants, versions, credentials and epoch checks are enforced by the server. Trusted administrative ingress and host-authored `ActionContext.writeMemory` integrations must validate the user's intent themselves.
+
+Only newly committed, non-delegated interactions enter searchable evidence. Shared `writePolicy` and baseline credential checks apply before history capture and to document body, title, description, path, conflicts, restoration and synthesis. A policy rejection skips memory evidence without failing the committed response; malformed policies and storage errors remain errors. Reflection persists per tenant/Agent/principal/scope/epoch, schedules after five interactions or ten minutes idle, reads at most twenty interactions, and runs proposal plus independent review within ninety seconds. Manual reflection returns the same durable job IDs, not a completion claim. Failed jobs back off and stop after three attempts; stale versions regenerate from a fresh snapshot. Explicit/locked memories are protected, assistant statements cannot independently establish user facts, and expired facts require genuinely new observations and a future expiry. Memory stays untrusted data. Its default budget is 8% of the model window, capped at 8,000 conservative estimated tokens; session narration is compacted before further memory trimming, with whole core records first and omitted counts recorded.
+
+`doctor` reports core size, duplicate content, broken local links, expiry, unresolved conflicts and failed reflections; repairs use `apply`. `eval/memory-cases.json` fixes six multi-session cases for continuity, correction, exact detail, conflict, forgetting and principal isolation. Run `npm run eval:memory -- --output eval/results/NEW_NAME` for scripted storage/recall contract metrics. This performs no model learning and marks conflict/model quality as unassessed. Add `--live` with the same model environment variables as `eval:live` to run actual foreground learning and background review. Reports record recall checks, calls, input/output tokens, pending/estimated usage and latency; they retain dataset/runner hashes. Inspect each case's rubric and responses before making a model-quality claim.
 
 ## Memory evolution
 

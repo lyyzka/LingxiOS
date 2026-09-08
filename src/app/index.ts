@@ -8,7 +8,7 @@ import { candidateActions, inspectActions } from '../outcome/action-check.js'
 import { workStatusOf } from '../protocol/types.js'
 import { ControlPlaneServer } from '../control-plane/http-server.js'
 import { checkStorage } from './storage.js'
-import { captureMemoryEvidence, retryMemorySynthesis } from '../memory/evidence.js'
+import { captureMemoryEvidence, retryMemorySynthesis, scheduleMemoryReflection } from '../memory/evidence.js'
 import { readArtifact, persistArtifacts, stageArtifact, inspectArtifacts, createNativeArtifact } from './artifacts.js'
 import { resolve } from 'node:path'
 import { snapshotAttachments, type RequestAttachment } from '../context/attachments.js'
@@ -40,7 +40,7 @@ import { readApproval, decideApproval, resumeDecidedApprovals, executeDecidedApp
 import { readRun, readRunState, reviseRun, cancelRun, cancelDescendants, enqueueWork, type RunIdentity, type JobInput } from './jobs.js'
 import { createMemoryRuntime, type MemoryOptions } from '../memory/runtime.js'
 import type { MemoryScope } from '../memory/store.js'
-import { forgetMemoryScope } from '../memory/forget.js'
+import { authorizedScopes, identityOf } from '../memory/access.js'
 import { inspectObligations, snapshotObligations, type DeliveryObligation } from '../outcome/obligations.js'
 import { sweepQueuedWork } from '../control-plane/scheduler.js'
 import { readDiagnostics, refreshMetrics, listRuns, readOperations, retryDelivery, type RunListQuery } from './diagnostics.js'
@@ -201,7 +201,8 @@ export async function createLingxiOS(options: LingxiOSOptions) {
     capabilityResolver: { async resolve(work: Omit<WorkItem, 'leaseToken'>) {
       if (memory && ['memory_synthesis','memory_index','memory_evaluation'].includes(work.kind)) return [{ name: work.kind,
         methods: memory.tools.filter(tool => tool.action.startsWith(work.kind + '.')).map(tool => tool.action.split('.')[1]!) }]
-      return [...await capabilities.resolve(work), ...helperTools.map(tool => ({ name: tool.action.split('.')[0]!, methods: [tool.action.split('.')[1]!] }))]
+      return [...await capabilities.resolve(work), ...helperTools.map(tool => ({ name: tool.action.split('.')[0]!, methods: [tool.action.split('.')[1]!] })),
+        ...memory?[{name:'memory',methods:memory.tools.filter(tool=>tool.action.startsWith('memory.')).map(tool=>tool.action.split('.')[1]!)}]:[]]
     } },
     contextProvider: { async loadContext(work: Omit<WorkItem, 'leaseToken'>) {
       if (behavior && !['memory_synthesis','memory_index','memory_evaluation'].includes(work.kind) && work.meta?.['harnessHash'] !== behavior.hash) throw new Error('harness version mismatch; resume with the pinned deployment or drain the old run')
@@ -261,6 +262,7 @@ export async function createLingxiOS(options: LingxiOSOptions) {
   }
 
   const service = new ControlPlaneService({
+    ...memory ? { memory } : {},
     ...(integration?.tools ? { tools: integration.tools } : {}),
     steps: new PgStepStore(options.database),
     verifyCandidate: async (work, candidate) => {
@@ -359,7 +361,7 @@ export async function createLingxiOS(options: LingxiOSOptions) {
             if (unresolved.rows.length) throw new Error('unresolved effects prevent successful completion')
           }
           if (recordMemory && !['awaiting_input','awaiting_approval','delegated'].includes(message.envelope.goalOutcome.status)) await captureMemoryEvidence(client, work, message,
-            await options.memory!.resolveScopes(work,client))
+            await authorizedScopes(options.memory!,identityOf(work),client),options.memory!.writePolicy)
           const status = workStatusOf({ status: 'completed', goalOutcome: message.envelope.goalOutcome })
           await client.query(`UPDATE lingxios.agent_work_items SET status=$3,result_id=$4,goal_outcome=$5::jsonb,
             lease_token_hash=NULL,lease_expires_at=NULL,finished_at=CASE WHEN $3='waiting' THEN NULL ELSE NOW() END,
@@ -386,6 +388,8 @@ export async function createLingxiOS(options: LingxiOSOptions) {
     return work
   }
   const host: HostPort = {
+    prepareMemoryReview: (work,action) => service.prepareMemoryReview(work,action),
+    recordMemoryReview: (work,action,hash,review) => service.recordMemoryReview(work,action,hash,review),
     verifyCandidate: (work, candidate) => service.verifyCandidate(work, candidate),
     saveStep: (work, step) => service.saveStep(work, step),
     claimWork: async () => { throw new Error('connect a worker before claiming work') },
@@ -417,7 +421,10 @@ export async function createLingxiOS(options: LingxiOSOptions) {
     background('dependencies', () => resumeDependents(options.database))
     background('approvals', () => resumeDecidedApprovals(options.database))
     background('queue fairness', () => sweepQueuedWork(options.database))
-    if (memory) background('memory synthesis', () => retryMemorySynthesis(options.database))
+    if (memory) background('memory synthesis', async () => {
+      await retryMemorySynthesis(options.database)
+      await scheduleMemoryReflection(options.database,options.memory!)
+    })
   }, 1_000)
   const maintenanceTimer = setInterval(() => {
     background('storage maintenance', () => maintainStorage(options.database, homesRoot))
@@ -439,20 +446,7 @@ export async function createLingxiOS(options: LingxiOSOptions) {
         return claimWork(input.workerId, undefined, input.workKinds)
       } }
     },
-    async recallMemory(work: Omit<WorkItem, 'leaseToken'>, scope: MemoryScope, query: string, limit = 12, signal?: AbortSignal) {
-      if (scope.tenantId !== work.tenantId) throw new Error('memory tenant does not match work')
-      signal?.throwIfAborted()
-      return memory ? memory.recall(work, scope, query, limit, signal) : []
-    },
-    /** Trusted product ingress supplies the authenticated identity used by resolveScopes. */
-    async forgetMemory(work: Omit<WorkItem, 'leaseToken'>, scope: MemoryScope) {
-      if (!options.memory || work.tenantId !== scope.tenantId || !work.principalId) throw new Error('memory scope is unavailable')
-      return withTransaction(options.database, async db => {
-        const scopes = await options.memory!.resolveScopes(work, db)
-        if (!scopes.some(item => item.tenantId === scope.tenantId && item.scopeType === scope.scopeType && item.scopeId === scope.scopeId)) throw new Error('memory scope was revoked')
-        return forgetMemoryScope(db, scope)
-      })
-    },
+    memory: memory?.api,
     metrics: () => metrics.expose(),
     listRuns: (query?: RunListQuery) => listRuns(options.database,query),
     readOperations: () => readOperations(options.database),

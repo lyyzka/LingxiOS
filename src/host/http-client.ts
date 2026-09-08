@@ -37,6 +37,12 @@ export class HostRequestError extends AgentOSError {
 }
 
 export class HttpHostClient implements HostPort {
+  async prepareMemoryReview(work: WorkItem,action: HostAction,signal?: AbortSignal) {
+    return this.request<import('../memory/types.js').MemoryReviewRequest|null>('POST',`/v5/work/${encodeURIComponent(work.id)}/memory-review`,{...this.proof(work),action},signal)
+  }
+  async recordMemoryReview(work: WorkItem,action: HostAction,hash: string,review: import('../memory/types.js').MemoryReview,signal?: AbortSignal) {
+    await this.request('POST',`/v5/work/${encodeURIComponent(work.id)}/memory-review-result`,{...this.proof(work),action,hash,review},signal)
+  }
   async verifyCandidate(work: WorkItem, candidate: import('../outcome/verification.js').Candidate, signal?: AbortSignal): Promise<import('../outcome/verification.js').CandidateVerification> {
     return this.request('POST', `/v5/work/${encodeURIComponent(work.id)}/verify`, { ...this.proof(work), candidate }, signal)
   }

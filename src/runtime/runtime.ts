@@ -7,6 +7,8 @@ import { appendResourceCheck } from '../context/resource-checks.js'
 import { createTaskContract } from '../context/task-contract.js'
 import { abortable } from '../deadline.js'
 import { deadlineHost } from '../host/deadline-host.js'
+import { fitMemorySnapshot } from '../memory/context.js'
+import type { MemorySnapshot } from '../memory/types.js'
 /**
  * AgentRuntime — the product-agnostic agent loop.
  *
@@ -45,7 +47,7 @@ import {
   type AssistantMessage, type ModelItem, type RunEvent,
   type SessionRecord, type SteerInput, type TurnContext, type WorkItem,
 } from '../protocol/types.js'
-import { compactIfNeeded, DEFAULT_COMPACTION, estimateTokens, HardLimitExceededError, type CompactionOptions } from './compaction.js'
+import { compactIfNeeded, DEFAULT_COMPACTION, estimateTokens, HardLimitExceededError, type CompactionOptions, type CompactionOutcome } from './compaction.js'
 import { CorrectionBudget, progressFacts } from './corrections.js'
 import { refreshResourceChecks } from './resource-refresh.js'
 import { DefaultRuntimePolicy, type RuntimePolicy } from './policy.js'
@@ -342,6 +344,7 @@ export class AgentRuntime {
       // Dynamic context stays outside conversational history; memory snapshots
       // are recorded separately with the model call for traceability.
       const liveContext = hop === 0 ? context : await this.hostFor(work).loadContext(work)
+      if (liveContext.memory) liveContext.memory=fitMemorySnapshot(liveContext.memory,this.compaction.contextWindowTokens)
       const execution = hop === 0 ? initialExecution : executionSnapshot(liveContext, this.policy)
       const { codeExecution } = execution
       liveContext.tools = execution.tools
@@ -359,13 +362,17 @@ export class AgentRuntime {
         + Buffer.byteLength(JSON.stringify(modelTools.map(tool => ({ type: 'function', function: { name: tool.name, description: tool.description, parameters: tool.parameters } }))))
       let overheadTokens = estimateOverhead()
       let memoryForModel = liveContext.memory
-      if (memoryForModel && estimateTokens(session.history) + overheadTokens > this.compaction.contextWindowTokens * this.compaction.hardRatio) {
-        const { memory: _memory, ...withoutMemory } = liveContext
-        supplementalItems.splice(0, dynamicItems.length, ...preferenceItems, ...this.policy.dynamicContextItems(withoutMemory))
-        memoryForModel = undefined
-        overheadTokens = estimateOverhead()
+      const hadMemory=!!memoryForModel
+      let dynamicCount=dynamicItems.length
+      const renderMemory = (snapshot: MemorySnapshot|undefined) => {
+        const {memory:_memory,...withoutMemory}=liveContext
+        const items=[...preferenceItems,...this.policy.dynamicContextItems({...withoutMemory,...snapshot?{memory:snapshot}:{}})]
+        supplementalItems.splice(0,dynamicCount,...items); dynamicCount=items.length
+        memoryForModel=snapshot; overheadTokens=estimateOverhead()
       }
+      // Compact narration before sacrificing core memory. A failed compaction may still fit after optional context is removed.
       const compacted = await compactIfNeeded(session, instructions, model, this.compaction, signals.lifecycle.signal, overheadTokens)
+        .catch((error):CompactionOutcome => { if (!memoryForModel || !(error instanceof HardLimitExceededError)) throw error; return {compacted:false} })
       if (compacted.compacted) {
         session.promptContext.epoch = session.compactionEpoch
         await this.hostFor(work).saveSession(work, session)
@@ -373,6 +380,13 @@ export class AgentRuntime {
           kind: 'session.compacted', stage: 'completed', visibility: 'internal',
           data: { epoch: session.compactionEpoch, ...(compacted.usage ? { usage: compacted.usage } : {}) },
         })
+      }
+      if (memoryForModel && estimateTokens(session.history)+overheadTokens>this.compaction.contextWindowTokens*this.compaction.hardRatio) {
+        const original=memoryForModel
+        renderMemory(undefined)
+        const available=Math.floor(this.compaction.contextWindowTokens*this.compaction.hardRatio)-estimateTokens(session.history)-overheadTokens-512
+        if (available>512) renderMemory(fitMemorySnapshot(original,this.compaction.contextWindowTokens,available))
+        if (estimateTokens(session.history)+overheadTokens>this.compaction.contextWindowTokens*this.compaction.hardRatio) renderMemory(undefined)
       }
       if (estimateTokens(session.history) + overheadTokens > this.compaction.contextWindowTokens * this.compaction.hardRatio) {
         throw new HardLimitExceededError('input and reserved output exceed the context budget; original request was preserved')
@@ -387,7 +401,7 @@ export class AgentRuntime {
       const traceExpiresAt = new Date(Date.now() + this.modelTrace.retentionDays * 86_400_000).toISOString()
       await this.event(work, runId, { kind: 'model.started', stage: 'started', visibility: 'internal', data: {
         hop: hop + 1, callId: modelCallId, ...(memoryForModel ? { memorySnapshotId: memoryForModel.id, memorySnapshot: memoryForModel }
-          : liveContext.memory ? { memoryOmittedForBudget: true } : {}),
+          : hadMemory ? { memoryOmittedForBudget: true } : {}),
         model: model.modelId ?? 'unknown', providerConfigSha256: model.configurationFingerprint ?? 'unknown', inputSha256,
         program: promptProgram(session.promptContext.manifest!, execution, model, inputSha256, liveContext.harness?.hash),
         ...(this.recordModelPayloads && sample ? { input: tracePayload(modelInput) } : {}), traceExpiresAt,

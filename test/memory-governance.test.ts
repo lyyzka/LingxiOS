@@ -1,103 +1,155 @@
 import assert from 'node:assert/strict'
-import { it } from 'node:test'
 import { readFile } from 'node:fs/promises'
+import { it } from 'node:test'
 import { PGlite } from '@electric-sql/pglite'
 import { createLingxiOS } from '../src/app/index.js'
-import { withTransaction, type SqlPool } from '../src/control-plane/pg-store.js'
-import { snapshotRequest } from '../src/context/request.js'
-import { snapshotEvidence } from '../src/context/evidence.js'
-import { createResponseEnvelope } from '../src/outcome/envelope.js'
-import { actionKeyOf, sessionKeyOf, type WorkItem } from '../src/protocol/types.js'
+import { checkStorage } from '../src/app/storage.js'
+import { actionKeyOf,type HostAction,type WorkItem } from '../src/protocol/types.js'
+import { memoryFixture,identity,scope,content } from './memory-fixture.js'
 import { captureMemoryEvidence } from '../src/memory/evidence.js'
-import { executeMemorySynthesis } from '../src/memory/synthesis.js'
-import { memorySynthesisProcessor } from '../src/memory/processor.js'
-import { memoryWriteBody, type MemoryWritePolicy } from '../src/memory/policy.js'
-import type { ToolDefinition } from '../src/tools/definition.js'
-import type { WorkProcessorContext } from '../src/runtime/runtime.js'
+import { reviewedMemoryHost } from '../src/memory/worker-review.js'
+import type { ModelDriver } from '../src/model/driver.js'
 
-it('shares content policy across native notes and twice-approved synthesis, and fences forgetting across retries', async () => {
-  const db = new PGlite()
-  const pool: SqlPool = { query: async (sql, params) => {
-    const result = await db.query<Record<string, unknown>>(sql, params)
-    return { rows: result.rows, rowCount: result.affectedRows ?? result.rows.length }
-  }, connect: async () => ({ query: pool.query, release() {} }) }
-  await db.exec(await readFile(new URL('../../db/schema.sql', import.meta.url), 'utf8'))
-  const scope = { tenantId: 't', scopeType: 'learner', scopeId: 'u' }
-  const policy: MemoryWritePolicy = input => input.body.includes('restricted') ? { action: 'reject', code: 'restricted' }
-    : input.body.includes('private') ? { action: 'redact', body: input.body.replace('private', '[redacted]') } : { action: 'allow' }
-  const tool: ToolDefinition = { name: 'notes__save', action: 'notes.save', description: 'Save a memory', effect: 'transaction', approval: false,
-    parameters: { type: 'object', properties: { body: { type: 'string' } }, required: ['body'], additionalProperties: false },
-    parse: value => { const body = (value as Record<string, unknown>)['body']; if (typeof body !== 'string') throw new Error('invalid body'); return { body } },
-    authorize: async () => {}, execute: async (context, input) => ({ ok: true, value: await context.writeMemory(scope, { method: 'note', body: String(input['body']) }) }) }
-  const app = await createLingxiOS({ database: pool, tools: [tool], memory: {
-    writePolicy: policy, resolveScopes: async work => work.tenantId === 't' && work.principalId === 'u' ? [scope] : [],
-  } })
-  try {
-    await app.enqueue({ id: 'writer', tenantId: 't', agentId: 'a', sessionId: 'writer', principalId: 'u', text: 'Remember this.' })
-    const host = app.connectWorker({ workerId: 'writer-worker', workKinds: ['turn'] })
-    const work = (await host.claimWork())!
-    const request = snapshotRequest(await host.loadContext(work))
-    await host.saveSession(work, { key: sessionKeyOf(work), tenantId: 't', agentId: 'a', sessionId: 'writer',
-      history: [], appliedWorkIds: ['writer'], revision: 0, compactionEpoch: 0, request })
-    const save = (body: string) => { const identity = { runId: work.id, cellId: body, callIndex: 0 }; return host.executeAction(work,
-      { ...identity, idempotencyKey: actionKeyOf(identity), action: tool.action, args: { body } }) }
-    assert.equal((await save('restricted')).executionState, 'no_effect')
-    assert.deepEqual((await db.query('SELECT id FROM lingxios.agent_memories')).rows, [])
-    assert.equal(((await save('private preference')).value as { body: string }).body, '[redacted] preference')
-    await assert.rejects(memoryWriteBody({ scope, principalId: 'u', sourceWorkId: 'writer', origin: 'explicit', kind: 'note', body: 'api_key=abcdef123456' }), /credential policy/)
-    await assert.rejects(memoryWriteBody({ scope, principalId: 'u', sourceWorkId: 'writer', origin: 'explicit', kind: 'note', body: 'ordinary note' },
-      (() => undefined) as unknown as MemoryWritePolicy), /invalid memory write policy decision/)
+function action(work:WorkItem,index:number,method:string,args:Record<string,unknown>):HostAction {
+  const key={runId:work.id,cellId:`memory-${index}`,callIndex:0}
+  return{...key,idempotencyKey:actionKeyOf(key),action:`memory.${method}`,args:{scopeType:scope.scopeType,scopeId:scope.scopeId,...args}}
+}
 
-    let sequence = 0
-    const source = async (capture = true) => {
-      const id = `source-${sequence++}`
-      await db.query(`INSERT INTO lingxios.agent_work_items(id,tenant_id,agent_id,principal_id,session_id,kind,lane,trigger_ref,status)
-        VALUES($1,'t','a','u',$1,'turn','interactive','m','succeeded')`, [id])
-      const sourceWork: WorkItem = { ...work, id, sessionId: id, triggerRef: 'm' }
-      const snapshot = { ...request, workId: id, sessionId: id, sourceRef: 'm' }
-      await db.query(`INSERT INTO lingxios.agent_os_sessions(session_key,tenant_id,agent_id,session_id,request_snapshot)
-        VALUES($1,'t','a',$2,$3::jsonb)`, [sessionKeyOf(sourceWork), id, JSON.stringify(snapshot)])
-      const message = { version: 2 as const, runId: id, agentId: 'a', sessionId: id, body: 'Recorded.',
-        envelope: createResponseEnvelope('Recorded.', { status: 'partial', verification: 'not_run', requestVersion: 1 }, snapshotEvidence('e', [])) }
-      if (capture) await withTransaction(pool, client => captureMemoryEvidence(client, sourceWork, message, [scope]))
-      const job = { ...sourceWork, id: `memory-synthesis:${id}`, kind: 'memory_synthesis', meta: { sourceRunId: id } }
-      if (capture) await db.query("UPDATE lingxios.agent_work_items SET status='leased',fence=1,lease_expires_at=NOW()+INTERVAL '1 hour' WHERE id=$1", [job.id])
-      return { sourceWork, job, message }
-    }
-    const apply = (job: WorkItem, changes: unknown[]) => withTransaction(pool, client => executeMemorySynthesis(client, job, 'apply', { changes, approved: true, confidence: 1 }, [scope], policy))
-    const load = (job: WorkItem) => withTransaction(pool, client => executeMemorySynthesis(client, job, 'load', {}, [scope], policy))
-    const first = await source()
-    let calls = 0
-    const change = { action: 'create', scopeType: scope.scopeType, sourceRunIds: [first.sourceWork.id], body: 'restricted' }
-    const context = { signal: new AbortController().signal, emit: async () => {},
-      host: { executeAction: async (_work: WorkItem, action: { action: string; args: Record<string, unknown> }) => ({ ok: true,
-        value: await withTransaction(pool, client => executeMemorySynthesis(client, first.job, action.action.split('.')[1]!, action.args, [scope], policy)) }) },
-      model: { structured: async () => ({ value: ++calls === 1 ? { changes: [change] } : { approved: true, confidence: 1 },
-        model: 'main', usage: { available: true, inputTokens: 10, outputTokens: 10 } }) },
-    } as unknown as WorkProcessorContext
-    await assert.rejects(memorySynthesisProcessor.process(first.job, context), /content policy/)
-    assert.equal(calls, 2)
-    assert.equal((await db.query('SELECT id FROM lingxios.agent_memories')).rows.length, 1)
-    await apply(first.job, [{ ...change, body: 'Allowed observation' }])
-    await db.exec(`INSERT INTO lingxios.agent_memory_embeddings(tenant_id,memory_id,version,model_key,model,embedding)
-      SELECT tenant_id,id,version,'test','test',ARRAY[1.0] FROM lingxios.agent_memories`)
+it('requires a private reviewer, protects explicit memory, binds reviews to versions and supports native read pagination',async()=>{
+  const f=await memoryFixture()
+  const app=await createLingxiOS({database:f.pool,memory:f.options})
+  try{
+    const saved=(await app.memory!.initialize(identity,{scope,documents:[content('Keep the original preference.')],idempotencyKey:'seed',sourceRef:'settings'})).documents[0]!
+    const {work}=await f.source({leased:true,capture:false,text:'Please change my saved preference to diagrams.'})
+    const host=app.connectWorker({workerId:'test',workKinds:['turn']})
+    const changes=[{action:'update',id:saved.id,expectedVersion:1,content:content('Use diagrams.')}]
+    const unreviewed=await host.executeAction(work,action(work,0,'apply',{changes}))
+    assert.equal(unreviewed.ok,false)
+    assert.match(unreviewed.error!,/review/)
+    const automatic=action(work,1,'apply',{changes})
+    const prepared=(await host.prepareMemoryReview!(work,automatic))!
+    assert.equal(prepared.input.request.originalText,'Please change my saved preference to diagrams.')
+    await host.recordMemoryReview!(work,automatic,prepared.hash,{approved:true,explicit:false,confidence:1})
+    assert.equal((await host.executeAction(work,automatic)).ok,false)
+    assert.equal((await app.memory!.read(identity,scope,saved.id))!.version,1)
+    const explicit=action(work,2,'apply',{changes})
+    const preview=(await host.prepareMemoryReview!(work,explicit))!
+    await host.recordMemoryReview!(work,explicit,preview.hash,{approved:true,explicit:true,confidence:1})
+    const result=await host.executeAction(work,explicit)
+    assert.equal(result.ok,true,result.error)
+    assert.deepEqual(await host.executeAction(work,explicit),result)
+    assert.equal((await app.memory!.read(identity,scope,saved.id))!.version,2)
+    const read=await host.executeAction(work,action(work,3,'read',{id:saved.id,length:4}))
+    assert.equal((read.value as {body:string}).body,'Use ')
+    assert.equal((read.value as {nextOffset:number}).nextOffset,4)
+    const historical=await host.executeAction(work,action(work,30,'read',{id:saved.id,version:1}))
+    assert.equal((historical.value as {body:string}).body,'Keep the original preference.')
+    await f.source({id:'pending-reflection',sessionId:'committed-source'})
+    const reflected=await host.executeAction(work,action(work,31,'reflect',{}))
+    const jobs=(reflected.value as {jobIds:string[]}).jobIds
+    assert.equal(jobs.length,1)
+    assert.deepEqual(await f.api.reflect(identity,scope),{jobIds:jobs})
+    const forged=await host.executeAction(work,action(work,4,'apply',{changes,explicit:true,approved:true}))
+    assert.equal(forged.ok,false)
+    const stale=action(work,5,'apply',{changes:[{...changes[0],expectedVersion:2}]})
+    const stalePreview=(await host.prepareMemoryReview!(work,stale))!
+    await app.memory!.apply(identity,{scope,changes:[{action:'move',id:saved.id,expectedVersion:2,path:'moved.md'}],idempotencyKey:'move',sourceRef:'settings'})
+    await assert.rejects(host.recordMemoryReview!(work,stale,stalePreview.hash,{approved:true,explicit:true,confidence:1}),/stale|superseded/)
+    await f.db.query("UPDATE lingxios.agent_work_items SET meta=jsonb_set(meta,'{mode}','\"read\"') WHERE id=$1",[work.id])
+    const context=await host.loadContext(work)
+    assert.ok(context.tools!.some(tool=>tool.action==='memory.search'))
+    assert.ok(context.tools!.every(tool=>!['memory.apply','memory.restore','memory.forget','memory.reflect'].includes(tool.action)))
+    await assert.rejects(host.prepareMemoryReview!(work,action(work,6,'forget',{})),/unavailable/)
+  }finally{await app.stop();await f.close()}
+})
 
-    const waiting = await source(), late = await source(false)
-    await load(waiting.job)
-    await assert.rejects(app.forgetMemory({ ...work, principalId: 'other' }, scope), /revoked/)
-    assert.deepEqual(await app.forgetMemory(work, scope), { epoch: 1 })
-    assert.deepEqual(await apply(waiting.job, [{ ...change, sourceRunIds: [waiting.sourceWork.id], body: 'Allowed observation' }]), { outcome: 'superseded', changeCount: 0 })
-    await db.query('UPDATE lingxios.agent_work_items SET fence=2 WHERE id=$1', [waiting.job.id])
-    assert.equal(await load({ ...waiting.job, fence: 2 }), null)
-    await withTransaction(pool, client => captureMemoryEvidence(client, late.sourceWork, late.message, [scope]))
-    assert.deepEqual((await db.query('SELECT source_run_id FROM lingxios.agent_memory_evidence WHERE source_run_id=$1', [late.sourceWork.id])).rows, [])
-    assert.deepEqual((await db.query('SELECT id FROM lingxios.agent_memories')).rows, [])
-    assert.deepEqual((await db.query('SELECT memory_id FROM lingxios.agent_memory_embeddings')).rows, [])
-    assert.deepEqual((await db.query('SELECT memory_id FROM lingxios.agent_memory_versions')).rows, [])
-    assert.ok((await db.query<Record<string, unknown>>('SELECT input_text,assistant_text FROM lingxios.agent_memory_evidence')).rows.every(row => !row['input_text'] && !row['assistant_text']))
-    assert.equal((await save('Allowed after forgetting from old request')).executionState, 'no_effect')
-    const fresh = await source()
-    await load(fresh.job)
-    assert.deepEqual(await apply(fresh.job, [{ ...change, sourceRunIds: [fresh.sourceWork.id], body: 'New user observation' }]), { outcome: 'committed', changeCount: 1 })
-  } finally { await app.stop(); await db.close() }
+it('applies privacy policy before searchable history capture without rejecting the committed user result',async()=>{
+  const f=await memoryFixture({writePolicy:input=>input.body.includes('private-code')?{action:'redact',body:input.body.replaceAll('private-code','redacted')}:{action:'allow'}})
+  try{
+    await f.source({text:'api_key=unsafe-value'})
+    assert.equal((await f.api.search(identity,scope,{target:'history',query:''})).items.length,0)
+    await f.source({text:'My private-code is a fictional example.'})
+    assert.equal((await f.api.search(identity,scope,{target:'history',query:'private-code'})).items.length,0)
+    assert.equal((await f.api.search(identity,scope,{target:'history',query:'redacted'})).items.length,2)
+  }finally{await f.close()}
+})
+
+it('runs native memory writes through the budgeted independent reviewer and preserves explicit rejection',async()=>{
+  const f=await memoryFixture(),app=await createLingxiOS({database:f.pool,memory:f.options})
+  try{
+    const {work}=await f.source({leased:true,capture:false,text:'Remember that I like diagrams.'})
+    let calls=0,approved=true
+    const model={structured:async(request:{instructions:string;input:unknown})=>{
+      calls++;assert.match(request.instructions,/Independently review/)
+      return{value:{approved,explicit:true,confidence:1},model:'review-test',usage:{available:true,inputTokens:100,outputTokens:10}}
+    }} as unknown as ModelDriver
+    const host=reviewedMemoryHost(app.connectWorker({workerId:'test',workKinds:['turn']}),model)
+    const first=await host.executeAction(work,action(work,0,'apply',{changes:[{action:'create',content:content()}]}))
+    assert.equal(first.ok,true,first.error)
+    assert.equal(calls,1)
+    assert.deepEqual(await host.executeAction(work,action(work,0,'apply',{changes:[{action:'create',content:content()}]})),first)
+    assert.equal(calls,1)
+    const memory=(await app.memory!.list(identity,scope)).items[0]!
+    assert.equal(memory.origin,'explicit')
+    approved=false
+    const denied=await host.executeAction(work,action(work,1,'forget',{}))
+    assert.equal(denied.ok,false)
+    assert.equal((await app.memory!.list(identity,scope)).items.length,1)
+    assert.equal((await f.db.query('SELECT * FROM lingxios.agent_model_budget_calls')).rows.length,2)
+    assert.ok((await f.db.query<{review:{approved:boolean}}>('SELECT review FROM lingxios.agent_memory_reviews')).rows.some(row=>!row.review.approved))
+  }finally{await app.stop();await f.close()}
+})
+
+it('isolates searchable history by principal, rechecks original session permissions and prevents forgotten evidence from returning',async()=>{
+  let revokedSession=''
+  const f=await memoryFixture({resolveScopes:async actor=>actor.tenantId==='t'&&actor.sessionId!==revokedSession?[scope]:[]})
+  try{
+    const first=await f.source({text:'My preference is diagrams.',sessionId:'old-session'})
+    await f.source({text:'Another person has a secret preference.',principalId:'other',sessionId:'other-session'})
+    const history=await f.api.search(identity,scope,{target:'history',query:'preference'})
+    assert.equal(history.items.length,2)
+    assert.ok(history.items.every(item=>'sourceRunId'in item&&item.sourceRunId===first.work.id))
+    const page=await f.api.search(identity,scope,{target:'history',query:'preference',limit:1})
+    assert.equal(page.items.length,1)
+    assert.equal((page.items[0] as {role:string}).role,'user')
+    const next=await f.api.search(identity,scope,{target:'history',query:'preference',limit:1,cursor:page.nextCursor!})
+    assert.equal(next.items.length,1)
+    assert.equal((next.items[0] as {role:string}).role,'assistant')
+    assert.equal(next.nextCursor,null)
+    assert.equal((await f.api.search(identity,scope,{target:'history',query:'!!!'})).items.length,0)
+    revokedSession='old-session'
+    assert.equal((await f.api.search(identity,scope,{target:'history',query:'preference'})).items.length,0)
+    revokedSession=''
+    const late=await f.source({leased:true,capture:false})
+    await f.api.forget(identity,scope)
+    await captureMemoryEvidence(f.pool,late.work,late.message,[scope])
+    assert.equal((await f.db.query('SELECT source_run_id FROM lingxios.agent_memory_evidence WHERE source_run_id=$1',[late.work.id])).rows.length,0)
+    assert.equal((await f.api.search(identity,scope,{target:'history',query:''})).items.length,0)
+    assert.ok((await f.db.query<{input_text:string;assistant_text:string;search_text:string}>('SELECT input_text,assistant_text,search_text FROM lingxios.agent_memory_evidence')).rows.every(row=>!row.input_text&&!row.assistant_text&&!row.search_text))
+  }finally{await f.close()}
+})
+
+it('resets only schema-8 memory, retains product records and frozen benchmarks, and rejects live workers and reapplication',async()=>{
+  const db=new PGlite()
+  try{
+    await db.exec(await readFile(new URL('../../test/fixtures/schema-8.sql',import.meta.url),'utf8'))
+    await db.exec(`CREATE TABLE public.product_data(value text); INSERT INTO public.product_data VALUES('untouched');
+      INSERT INTO lingxios.agent_evolution_benchmarks(tenant_id,id,hash,definition) VALUES('t','benchmark','hash','{}');
+      INSERT INTO lingxios.agent_work_items(id,tenant_id,agent_id,session_id,kind,lane,trigger_ref,status,lease_expires_at)
+        VALUES('business','t','a','s','turn','interactive','r','leased',NOW()+INTERVAL '1 hour');
+      INSERT INTO lingxios.agent_memories(tenant_id,id,scope_type,scope_id,body,kind,origin,source_refs)
+        VALUES('t','old','user','u','Old memory','observation','explicit','[{}]')`)
+    const reset=await readFile(new URL('../../db/migrations/009-cognitive-memory-reset.sql',import.meta.url),'utf8')
+    await assert.rejects(db.exec(reset),/stop and drain/)
+    await db.exec('ROLLBACK')
+    assert.equal((await db.query('SELECT id FROM lingxios.agent_memories')).rows.length,1)
+    await db.exec("UPDATE lingxios.agent_work_items SET status='succeeded' WHERE id='business'")
+    await db.exec(reset)
+    assert.deepEqual((await db.query('SELECT value FROM public.product_data')).rows,[{value:'untouched'}])
+    assert.deepEqual((await db.query('SELECT id FROM lingxios.agent_work_items')).rows,[{id:'business'}])
+    assert.deepEqual((await db.query('SELECT id FROM lingxios.agent_evolution_benchmarks')).rows,[{id:'benchmark'}])
+    assert.deepEqual((await db.query('SELECT id FROM lingxios.agent_memories')).rows,[])
+    await checkStorage({query:async(sql,params)=>({rows:(await db.query<Record<string,unknown>>(sql,params)).rows,rowCount:null})})
+    await assert.rejects(db.exec(reset),/requires schema version 8/)
+  }finally{await db.close()}
 })

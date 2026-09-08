@@ -47,6 +47,10 @@ import type {
 import { isModelItem } from './stores.js'
 
 export interface ControlPlaneDeps {
+  memory?: {
+    prepareReview(work: Omit<WorkItem,'leaseToken'>,action: HostAction): Promise<import('../memory/types.js').MemoryReviewRequest|null>
+    recordReview(work: Omit<WorkItem,'leaseToken'>,action: HostAction,hash: string,review: import('../memory/types.js').MemoryReview): Promise<void>
+  }
   modelBudget?: Required<import('../model/execution.js').RootModelBudgetOptions>
   verifyCandidate?: (work: Omit<WorkItem, 'leaseToken'>, candidate: Candidate) => Promise<CandidateVerification>
   tools?: readonly ToolDefinition[]
@@ -92,6 +96,24 @@ export function actionFingerprint(work: Pick<WorkItem, 'tenantId' | 'principalId
 }
 
 export class ControlPlaneService {
+  private async memoryReviewWork(proof: LeaseProof,action: HostAction) {
+    const work=await this.requireLease(proof,{rejectCancelled:true})
+    const grants=await this.deps.capabilityResolver.resolve(work)
+    const tool=grantedTools(this.deps.tools ?? [],grants).find(item=>item.action===action?.action)
+    if (!this.deps.memory || !tool || !permitsTool(work,tool)) throw new ControlPlaneError(403,'memory action is unavailable')
+    return work
+  }
+  async prepareMemoryReview(proof: LeaseProof,action: HostAction) {
+    const work=await this.memoryReviewWork(proof,action)
+    const intent=await this.deps.actions.findIntent(action.idempotencyKey)
+    if (intent && intent.workId===work.id && isDeepStrictEqual(intent.action,action) && await this.deps.actions.find(action.idempotencyKey)) return null
+    return this.deps.memory!.prepareReview(work,action)
+  }
+  async recordMemoryReview(proof: LeaseProof,action: HostAction,hash: string,review: import('../memory/types.js').MemoryReview) {
+    const work=await this.memoryReviewWork(proof,action)
+    if (typeof hash!=='string' || !/^[a-f0-9]{64}$/.test(hash)) throw new ControlPlaneError(400,'invalid memory review hash')
+    await this.deps.memory!.recordReview(work,action,hash,review)
+  }
   async verifyCandidate(proof: LeaseProof, candidate: Candidate): Promise<CandidateVerification> {
     const work = await this.requireLease(proof, { rejectCancelled: true })
     if (!candidate || typeof candidate.body !== 'string' || candidate.body.length > 100_000

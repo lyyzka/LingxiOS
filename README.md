@@ -7,7 +7,7 @@ The package has four public entries: `@lyyzka/lingxios`, `@lyyzka/lingxios/worke
 ## Install
 
 ```sh
-npm install @lyyzka/lingxios@3.0.0
+npm install @lyyzka/lingxios@3.1.0
 ```
 
 Configure the GitHub Packages registry for the `@lyyzka` scope before installing:
@@ -71,3 +71,5 @@ Evolution candidates remain inactive until a frozen benchmark improves target ca
 Production Python execution requires OS isolation. The packaged Worker defaults to Linux Bubblewrap in production and fails readiness when the isolation self-check fails. Artifact downloads verify the committed path, size, and SHA-256 digest.
 
 See [runtime and deployment details](docs/packaged-runtime.md), [Harness semantics](docs/harness-v3.md), and [production recovery](deploy/README.md).
+
+Optional `control.memory` provides scoped Markdown documents, always-loaded core memory, Chinese/English PostgreSQL search, committed history, versioned edits, background reflection, diagnostics and rollback. Version 3.1 requires schema 9 and protocol 7. Existing installations must explicitly reset old memory with `packageResources().memoryReset009`; business tasks and results remain intact. See the [memory configuration and cutover procedure](docs/packaged-runtime.md#cognitive-memory).
