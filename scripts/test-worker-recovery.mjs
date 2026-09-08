@@ -10,6 +10,8 @@ import { dirname, join, resolve } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 import { fileURLToPath } from 'node:url'
 import { createLingxiOS, packageResources } from '@lyyzka/lingxios'
+import { snapshotRequest } from '../dist/src/context/request.js'
+import { sessionKeyOf } from '../dist/src/protocol/types.js'
 
 const connectionString = process.env.LINGXIOS_WORKER_TEST_DATABASE_URL
 assert.ok(connectionString, 'configure a fresh disposable PostgreSQL database for worker recovery')
@@ -107,6 +109,40 @@ try {
   // Windows kill() does not deliver a POSIX signal to the JS shutdown handler.
   replacement.child.kill(process.platform === 'win32' ? 'SIGKILL' : 'SIGTERM')
   assert.deepEqual(await replacement.exit, process.platform === 'win32' ? [null, 'SIGKILL'] : [0, null], replacement.stderr)
+  // Restart in the middle of an IM graph: a committed branch is never leased or executed again.
+  await app.conversations.sync({ tenantId: 'im', conversationId: 'room', version: 1, kind: 'group',
+    owner: { kind: 'participant', id: 'human' }, defaultAgentId: 'agent', participants: [
+      { id: 'human', kind: 'human', capabilities: ['read', 'execute'] },
+      { id: 'agent', kind: 'agent', capabilities: ['read', 'execute', 'speak'] }] })
+  const root = (await app.conversations.ingest({ tenantId: 'im', conversationId: 'room', policyVersion: 1,
+    messageId: 'graph', version: 1, author: { id: 'human', kind: 'human' }, text: 'Collaborate to confirm the answer 4.' })).runs[0]
+  const host = app.connectWorker({ workerId: 'graph-coordinator', workKinds: ['turn'] }), parent = await host.claimWork()
+  const context = await host.loadContext(parent)
+  await host.saveSession(parent, { key: sessionKeyOf(parent), tenantId: parent.tenantId, agentId: parent.agentId,
+    sessionId: parent.sessionId, revision: 0, compactionEpoch: 0, history: [], appliedWorkIds: [parent.id], request: snapshotRequest(context) })
+  const graph = await app.graphs.enqueue(root, { id: 'recover', nodes: [
+    { id: 'a', agentId: 'agent', text: 'Write answer.txt containing 4 and attach it.' },
+    { id: 'b', agentId: 'agent', text: 'Confirm the preceding answer is 4.', dependsOn: ['a'] }] })
+  const wait = await app.graphs.waitForChildren(root, graph.nodes.map(node => node.workId))
+  await host.waitWork(parent, { status: 'delegated', taskRef: wait.data.taskRef, requestVersion: 1, verification: 'not_run' })
+  modelCalls = 0; heldCompletion = false; holdCompletion = true
+  const branchWorker = worker('graph-original')
+  await until(() => heldCompletion || branchWorker.child.exitCode !== null)
+  assert.equal(heldCompletion, true, branchWorker.stderr)
+  const before = await app.graphs.read(root, 'recover'), firstResult = before.nodes.find(node => node.id === 'a').resultId
+  assert.ok(firstResult)
+  branchWorker.child.kill('SIGKILL'); await branchWorker.exit
+  holdCompletion = false
+  const graphReplacement = worker('graph-replacement')
+  await until(async () => (await app.readRun(root)).status === 'succeeded' || graphReplacement.child.exitCode !== null)
+  assert.equal((await app.readRun(root)).status, 'succeeded', graphReplacement.stderr)
+  const after = await app.graphs.read(root, 'recover')
+  assert.ok(after.nodes.every(node => node.status === 'succeeded'))
+  assert.equal(after.nodes.find(node => node.id === 'a').resultId, firstResult)
+  assert.equal((await pool.query('SELECT attempts FROM lingxios.agent_work_items WHERE id=$1', [graph.nodes[0].workId])).rows[0].attempts, 1)
+  assert.equal(modelCalls, 4, 'one tool call and response for A, one response each for B and the parent')
+  graphReplacement.child.kill(process.platform === 'win32' ? 'SIGKILL' : 'SIGTERM')
+  assert.deepEqual(await graphReplacement.exit, process.platform === 'win32' ? [null, 'SIGKILL'] : [0, null], graphReplacement.stderr)
   console.log('Worker recovery passed: actual process killed after commit, replacement recovered message/artifact without model replay.')
 } finally {
   for (const entry of children) {

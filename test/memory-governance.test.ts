@@ -149,6 +149,7 @@ it('resets only schema-8 memory, retains product records and frozen benchmarks, 
     assert.deepEqual((await db.query('SELECT id FROM lingxios.agent_work_items')).rows,[{id:'business'}])
     assert.deepEqual((await db.query('SELECT id FROM lingxios.agent_evolution_benchmarks')).rows,[{id:'benchmark'}])
     assert.deepEqual((await db.query('SELECT id FROM lingxios.agent_memories')).rows,[])
+    await db.exec(await readFile(new URL('../../db/migrations/010-im-collaboration.sql',import.meta.url),'utf8'))
     await checkStorage({query:async(sql,params)=>({rows:(await db.query<Record<string,unknown>>(sql,params)).rows,rowCount:null})})
     await assert.rejects(db.exec(reset),/requires schema version 8/)
   }finally{await db.close()}

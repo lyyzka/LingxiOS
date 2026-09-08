@@ -162,6 +162,7 @@ it('migrates existing schema 7 without approving old semantics and rejects accid
     await assert.rejects(db.exec(migration), /requires schema version 7/)
     await db.exec('ROLLBACK')
     await db.exec(await readFile(new URL('../../db/migrations/009-cognitive-memory-reset.sql',import.meta.url),'utf8'))
+    await db.exec(await readFile(new URL('../../db/migrations/010-im-collaboration.sql',import.meta.url),'utf8'))
     await checkStorage({ query: async (sql, params) => ({ rows: (await db.query<Record<string, unknown>>(sql, params)).rows, rowCount: null }) })
   } finally { await db.close() }
 })

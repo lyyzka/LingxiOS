@@ -7,7 +7,7 @@ The package has four public entries: `@lyyzka/lingxios`, `@lyyzka/lingxios/worke
 ## Install
 
 ```sh
-npm install @lyyzka/lingxios@3.1.0
+npm install @lyyzka/lingxios@3.2.0
 ```
 
 Configure the GitHub Packages registry for the `@lyyzka` scope before installing:
@@ -72,4 +72,4 @@ Production Python execution requires OS isolation. The packaged Worker defaults 
 
 See [runtime and deployment details](docs/packaged-runtime.md), [Harness semantics](docs/harness-v3.md), and [production recovery](deploy/README.md).
 
-Optional `control.memory` provides scoped Markdown documents, always-loaded core memory, Chinese/English PostgreSQL search, committed history, versioned edits, background reflection, diagnostics and rollback. Version 3.1 requires schema 9 and protocol 7. Existing installations must explicitly reset old memory with `packageResources().memoryReset009`; business tasks and results remain intact. See the [memory configuration and cutover procedure](docs/packaged-runtime.md#cognitive-memory).
+Optional `control.memory` provides scoped Markdown documents, always-loaded core memory, Chinese/English PostgreSQL search, committed history, versioned edits, background reflection, diagnostics and rollback. Version 3.2 requires schema 10 and protocol 8. Schema-9 installations apply the additive `packageResources().migration010`; existing memory and business records remain intact. IM conversation policy, multi-Agent reply slots, durable DAGs and field-versioned shared state are available through the [IM collaboration API](docs/im-collaboration.md). See the [memory configuration and cutover procedure](docs/packaged-runtime.md#cognitive-memory).

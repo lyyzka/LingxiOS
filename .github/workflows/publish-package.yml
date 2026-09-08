@@ -6,6 +6,7 @@ on:
 
 permissions:
   contents: read
+  actions: read
   packages: write
 
 jobs:
@@ -14,6 +15,19 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+      - name: Require the tagged version and successful main release gates
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { version } = require('./package.json')
+            if (context.ref !== `refs/tags/v${version}`) throw new Error('Tag does not match package version')
+            const runs = await github.rest.actions.listWorkflowRuns({
+              owner: context.repo.owner, repo: context.repo.repo, workflow_id: 'release.yml',
+              branch: 'main', event: 'push', head_sha: context.sha, per_page: 100,
+            })
+            if (!runs.data.workflow_runs.some(run => run.head_sha === context.sha && run.conclusion === 'success')) {
+              throw new Error('This exact commit has no successful main release gates')
+            }
       - uses: actions/setup-node@v4
         with:
           node-version: 22.13.1
