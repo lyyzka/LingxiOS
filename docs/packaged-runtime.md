@@ -12,9 +12,9 @@ The consuming product owns authentication, authorization policy, native services
 
 `packageResources()` returns the schema-10 fresh-install schema, `migration008` for schema 7→8, `memoryReset009` for the explicit schema 8→9 memory reset, `migration010` for the additive schema 9→10 collaboration upgrade, `migration011` for schema-10 notification triggers and unchanged request-snapshot write suppression, required `migration012` for durable memory capture and cancellation notifications, and the Python runner. Apply SQL under the product's migration lock. Fresh installations use only `schema`; existing schema-9 installations first apply `migration010`, then `migration011` and `migration012`; schema-10 installations apply the latter two in order. Older installations apply each intervening migration in order. Application startup performs read-only readiness checks and never executes package DDL. See [performance rollout](performance.md) for switches, pool sizing and validation limits.
 
-Every public entry uses runtime version `3.2.2`, schema `10`, control-plane protocol `9`, Kernel protocol `2`, and assistant message `2`. Protocol 9 requires claim-only admission followed by per-attempt recovery after heartbeat registration; new hosts reject old workers. Pin the exact npm version and run readiness checks, including the new memory-capture table: the schema-10 marker alone is insufficient. Every generation, review, synthesis and compaction call uses the configured primary `model`. Optional embeddings remain a separate vector protocol.
+Every public entry uses runtime version `3.2.3`, schema `10`, control-plane protocol `9`, Kernel protocol `2`, and assistant message `2`. Protocol 9 requires claim-only admission followed by per-attempt recovery after heartbeat registration; new hosts reject old workers. Pin the exact npm version and run readiness checks, including the new memory-capture table: the schema-10 marker alone is insufficient. Every generation, review, synthesis and compaction call uses the configured primary `model`. Optional embeddings remain a separate vector protocol.
 
-Before upgrading, stop ingress, drain running tasks, stop old Workers, and resolve unknown effects and pending approvals. Back up the database and artifact volume and retain the matching old application. Under the product migration lock, run `migration010` against schema 9. It refuses live leases, adds collaboration tables and nullable context/receipt columns, and preserves memory, tasks, results, action ledgers, approvals and product tables. Legacy records are not inferred to be IM conversations. Apply `migration011` then `migration012`, deploy matching v3.2.2 hosts and Workers without mixed-protocol execution, run readiness checks, then resume ingress. Do not apply the fresh schema to an existing database. Schema-8 installations must first apply `memoryReset009`, which explicitly deletes legacy memory; this older reset is not part of the schema-9 upgrade.
+Before upgrading, stop ingress, drain running tasks, stop old Workers, and resolve unknown effects and pending approvals. Back up the database and artifact volume and retain the matching old application. Under the product migration lock, run `migration010` against schema 9. It refuses live leases, adds collaboration tables and nullable context/receipt columns, and preserves memory, tasks, results, action ledgers, approvals and product tables. Legacy records are not inferred to be IM conversations. Apply `migration011` then `migration012`, deploy matching v3.2.3 hosts and Workers without mixed-protocol execution, run readiness checks, then resume ingress. Do not apply the fresh schema to an existing database. Schema-8 installations must first apply `memoryReset009`, which explicitly deletes legacy memory; this older reset is not part of the schema-9 upgrade.
 
 For rollback, stop ingress and Workers again. Restore the matching old application, database and artifact backup together after reconciling effects committed outside PostgreSQL since the backup. There is no automatic down migration or conversion of new IM records. Existing Harness profile and approval bindings still apply; never fabricate a new hash for an old approval or replay an unknown effect. See [IM collaboration](im-collaboration.md) for authenticated ingress and transport contracts.
 
@@ -51,6 +51,8 @@ The browser consumes committed messages and ordered events through `@lyyzka/ling
 
 ## Cognitive memory
 
+`control.memory.scopes(identity)` returns the current authorized effective scopes. Authenticate the identity at the host boundary. For IM administration, include the original run's `workId` (the ingest result's `runId`), tenant, Agent, principal, native session and optional thread. Treat returned scope IDs as opaque: IM scopes bind the frozen audience and policy version as well as the conversation and identity. Pass a returned scope to the administration methods; each operation reauthorizes access, so discovery is not a lasting grant. An empty array means no product-authorized scopes. Do not omit `workId` or reconstruct the digest to access an IM run's memory.
+
 Memory is optional. The product resolves scopes from authenticated identities, including original source identities during history search and maintenance. Administrative calls require no Worker lease; authenticate the caller before constructing `MemoryIdentity`. Scope names remain product-defined. Initialization saves only the supplied content.
 
 ```ts
@@ -67,7 +69,8 @@ const control = await createLingxiOS({
   },
 })
 const identity = { tenantId, agentId, principalId, sessionId }
-const scope = { tenantId, scopeType: 'workspace', scopeId: workspaceId }
+const [scope] = await control.memory!.scopes(identity)
+if (!scope) throw new Error('No authorized memory scope')
 const saved = await control.memory!.initialize(identity, {
   scope, sourceRef: 'authenticated-settings', idempotencyKey: requestId,
   documents: [{ path: 'preferences/learning.md', title: 'Learning preference',
