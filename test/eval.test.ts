@@ -1,6 +1,44 @@
 import assert from 'node:assert/strict'
 import { it } from 'node:test'
-import { gradeResources } from '../src/eval/index.js'
+import { executeRequest, gradeResources } from '../src/eval/index.js'
+import { readFile } from 'node:fs/promises'
+import { PGlite } from '@electric-sql/pglite'
+import { createLingxiOS } from '../src/index.js'
+import { createWorker } from '../src/worker/index.js'
+import type { SqlPool } from '../src/control-plane/pg-store.js'
+
+it('observes committed authenticated evaluation results with and without a thread', async () => {
+  const db = new PGlite()
+  const pool: SqlPool = { query: async (sql, params) => {
+    const result = await db.query<Record<string, unknown>>(sql, params)
+    return { rows: result.rows, rowCount: result.affectedRows ?? result.rows.length }
+  }, connect: async () => ({ query: pool.query, release() {} }) }
+  await db.exec(await readFile(new URL('../../db/schema.sql', import.meta.url), 'utf8'))
+  const app = await createLingxiOS({ database: pool })
+  const usage = { available: false, inputTokens: 0, outputTokens: 0 }
+  const worker = createWorker({ controlPlane: app, model: {
+    run: async () => ({ text: 'Hello.', output: [{ role: 'assistant', content: 'Hello.' }], usage }),
+    structured: async () => ({ value: { missing: [] }, model: 'fixture', usage }),
+    compact: async () => { throw new Error('unexpected compaction') },
+  } })
+  try {
+    for (const thread of [{}, { threadId: 'thread' }]) {
+      const identity = { runId: thread.threadId ?? 'unthreaded', tenantId: 'tenant', agentId: 'agent',
+        principalId: 'principal', sessionId: 'session', ...thread }
+      const result = await executeRequest(app, worker, { id: identity.runId, ...identity, text: 'Say hello.' })
+      assert.deepEqual(result.identity, identity)
+      assert.equal(result.workDequeued, true)
+      assert.equal(result.message?.body, 'Hello.')
+      assert.equal(result.outcome?.status, 'satisfied')
+      assert.equal(result.delivery, 'observed')
+      assert.equal(result.externalDelivery, 'not_observed')
+      assert.deepEqual(await app.readMessage(identity), result.message)
+      assert.deepEqual(await app.readOutcome(identity), result.outcome)
+      assert.equal(await app.readRun({ ...identity, principalId: 'other' }), null)
+      assert.equal(await app.readRun({ ...identity, threadId: 'other' }), null)
+    }
+  } finally { await worker.stop(); await app.stop(); await db.close() }
+})
 
 it('grades observed resource state without treating missing or stale evidence as success', () => {
   const expected = [{ id: 'persisted', resource: 'document:1', expected: { body: 'complete answer', saved: true } }]

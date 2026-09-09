@@ -2,7 +2,7 @@ import { withTransaction, type SqlPool, type SqlQueryable } from '../control-pla
 import type { ActionContext, ToolDefinition } from '../tools/definition.js'
 import type { WorkItem } from '../protocol/types.js'
 import { requestSnapshot } from '../app/jobs.js'
-import { authorizeScope, identityOf, memorySettings, type MemoryOptions } from './access.js'
+import { authorizedScopes, authorizeScope, identityOf, memorySettings, type MemoryOptions } from './access.js'
 import { applyMemoryChanges, listMemories, memoryEntry, memoryVersions, readMemory, restoreMemory, scopeParams, searchMemories } from './store.js'
 import { lockMemoryScopes, forgetMemoryScope } from './forget.js'
 import { searchMemoryHistory, scheduleMemoryReflection, scheduleMemoryReflectionInTransaction } from './evidence.js'
@@ -41,6 +41,7 @@ export function createMemoryService(database: SqlPool,options: MemoryOptions,sem
       AND memory_ids ?| $4::text[]`,[...scopeParams(scope),ids])
   }
   const api = {
+    scopes: (identity: MemoryIdentity) => authorizedScopes(options,identity,database),
     async list(identity: MemoryIdentity,scope: MemoryScope,query: MemoryListQuery={}) {
       await access(identity,scope)
       const page = await listMemories(database,scope,query)

@@ -1,6 +1,7 @@
 export { summarizeCalibration } from './calibration.js'
 export { reviewAnswer } from './review.js'
 import type { createLingxiOS, RequestInput } from '../app/index.js'
+import type { RunIdentity } from '../app/jobs.js'
 import { isDeepStrictEqual } from 'node:util'
 
 /** Expected values come from the original-input test case, not the agent's task plan. */
@@ -38,7 +39,9 @@ export function gradeResources(requestVersion: number, expectations: readonly Re
 export async function executeRequest(app: Awaited<ReturnType<typeof createLingxiOS>>, worker: { runNext(): Promise<boolean> }, input: RequestInput) {
   const work = await app.enqueue(input)
   if (work.deduplicated) throw new Error('evaluation request already exists; use a new request identity for a fresh execution')
-  const identity = { runId: work.id, tenantId: input.tenantId, agentId: input.agentId, sessionId: input.sessionId }
+  const identity: RunIdentity = { runId: work.id, tenantId: input.tenantId, agentId: input.agentId, sessionId: input.sessionId,
+    principalId: input.principalId,
+    ...input.threadId === undefined ? {} : { threadId: input.threadId } }
   const workDequeued = await worker.runNext()
   const [message, outcome, externalDelivery] = await Promise.all([app.readMessage(identity), app.readOutcome(identity), app.readDelivery(identity)])
   return { mode: 'runtime_execution' as const, identity, workDequeued, message, outcome, externalDelivery,

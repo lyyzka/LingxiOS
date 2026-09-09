@@ -3,7 +3,7 @@ import { readFile } from 'node:fs/promises'
 import { setTimeout as delay } from 'node:timers/promises'
 import { it } from 'node:test'
 import { PGlite } from '@electric-sql/pglite'
-import { createLingxiOS, type LingxiOSOptions } from '../src/app/index.js'
+import { createLingxiOS, type LingxiOSOptions } from '../src/index.js'
 import type { SqlPool } from '../src/control-plane/pg-store.js'
 import { resumeDependents } from '../src/control-plane/dependencies.js'
 import { checkStorage } from '../src/app/storage.js'
@@ -205,6 +205,50 @@ it('partitions IM memory by principal and revokes restored sessions', async () =
     const revoked = structuredClone(policy); revoked.version = 2; revoked.participants = revoked.participants.filter(member => member.id !== 'v')
     await f.control.conversations.sync(revoked)
     await assert.rejects(f.host.loadSession(b, sessionKeyOf(b)), /capability/)
+  } finally { await f.close() }
+})
+
+it('discovers effective memory scopes through the public app and reauthorizes their use', async () => {
+  const productScope = { tenantId: 'tenant', scopeType: 'shared', scopeId: 'legacy' }
+  let allowed = true
+  const f = await setup({ memory: { resolveScopes: async () => allowed ? [productScope] : [] } })
+  try {
+    const memory = f.control.memory!
+    const legacy = { tenantId: 'tenant', agentId: 'lead', principalId: 'u', sessionId: 'legacy' }
+    assert.deepEqual(await memory.scopes(legacy), [productScope])
+    await f.control.conversations.registerThread({ tenantId: 'tenant', conversationId: 'room', threadId: 't', policyVersion: 1 })
+    const run = (await f.control.conversations.ingest(message('memory', { threadId: 't' }))).runs[0]!
+    const { runId, ...actor } = run, identity = { ...actor, principalId: 'u', workId: runId }
+    const scopes = await memory.scopes(identity), scope = scopes[0]!
+    assert.equal(scopes.length, 1)
+    assert.match(scope.scopeId, /^im-memory:/)
+    const saved = await memory.initialize(identity, { scope, sourceRef: 'settings', idempotencyKey: 'initialize',
+      documents: [{ path: 'preferences.md', title: 'Preferences', description: 'Output preferences', body: 'Use diagrams.', layer: 'reference' }] })
+    assert.deepEqual((await memory.list(identity, scope)).items.map(item => item.id), saved.documents.map(item => item.id))
+    assert.equal((await memory.read(identity, scope, saved.documents[0]!.id))?.body, 'Use diagrams.')
+    await assert.rejects(memory.list(identity, productScope), /revoked/)
+    for (const field of ['tenantId', 'principalId', 'agentId', 'sessionId', 'threadId'] as const) {
+      await assert.rejects(memory.scopes({ ...identity, [field]: 'mismatch' }), /identity differs/)
+    }
+    const privateRun = (await f.control.conversations.ingest(message('private-memory', { threadId: 't',
+      audience: { visibility: 'participants', participantIds: ['u', 'lead'] } }))).runs[0]!
+    const privateIdentity = { ...privateRun, principalId: 'u', workId: privateRun.runId }
+    assert.notDeepEqual(await memory.scopes(privateIdentity), scopes)
+    await assert.rejects(memory.list(privateIdentity, scope), /revoked/)
+    const updated = structuredClone(policy); updated.version = 2
+    await f.control.conversations.sync(updated)
+    const next = (await f.control.conversations.ingest(message('new-policy-memory', { threadId: 't', policyVersion: 2 }))).runs[0]!
+    const nextIdentity = { ...next, principalId: 'u', workId: next.runId }
+    assert.notDeepEqual(await memory.scopes(nextIdentity), scopes)
+    await assert.rejects(memory.read(nextIdentity, scope, saved.documents[0]!.id), /revoked/)
+    allowed = false
+    assert.deepEqual(await memory.scopes(identity), [])
+    await assert.rejects(memory.list(identity, scope), /revoked/)
+    allowed = true
+    updated.version = 3; updated.participants[0]!.capabilities = []
+    await f.control.conversations.sync(updated)
+    await assert.rejects(memory.scopes(identity), /capability/)
+    await assert.rejects(memory.read(identity, scope, saved.documents[0]!.id), /capability/)
   } finally { await f.close() }
 })
 
