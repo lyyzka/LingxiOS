@@ -126,13 +126,19 @@ export interface MessageIdentity {
   tenantId: string
   agentId: string
   sessionId: string
-  /** Required for IM content reads; legacy server reads keep their existing contract. */
+  /** Must match ordinary jobs; IM readers must belong to the frozen audience. */
   principalId?: string
   threadId?: string
 }
 
 export type ActionResolutionInput = ActionResolution & Pick<RequestInput,
   'tenantId' | 'agentId' | 'sessionId' | 'principalId' | 'threadId'>
+
+// IM content is checked by authorizeRunRead; ordinary results require the original identity.
+const resultReadScope = `work.id=$1 AND work.tenant_id=$2 AND work.agent_id=$3 AND work.session_id=$4
+  AND (work.conversation IS NOT NULL OR (work.principal_id IS NOT DISTINCT FROM $5 AND work.thread_id IS NOT DISTINCT FROM $6))`
+const resultReadParams = (identity: MessageIdentity) =>
+  [identity.runId, identity.tenantId, identity.agentId, identity.sessionId, identity.principalId ?? null, identity.threadId ?? null]
 
 export interface RunVerificationContext {
   candidate: import('../outcome/verification.js').Candidate
@@ -709,16 +715,16 @@ export async function createLingxiOS(options: LingxiOSOptions) {
       await authorizeRunRead(options.database, identity)
       const { rows } = await options.database.query(
         `SELECT result.message FROM lingxios.agent_work_items work JOIN lingxios.agent_results result ON result.id=work.result_id
-          WHERE work.id=$1 AND work.tenant_id=$2 AND work.agent_id=$3 AND work.session_id=$4`,
-        [identity.runId, identity.tenantId, identity.agentId, identity.sessionId],
+          WHERE ${resultReadScope}`,
+        resultReadParams(identity),
       )
       return (rows[0]?.['message'] as AssistantMessage | undefined) ?? null
     },
     async readOutcome(identity: MessageIdentity): Promise<GoalOutcome | null> {
       await authorizeRunRead(options.database, identity)
       const { rows } = await options.database.query(
-        'SELECT goal_outcome FROM lingxios.agent_work_items WHERE id=$1 AND tenant_id=$2 AND agent_id=$3 AND session_id=$4',
-        [identity.runId, identity.tenantId, identity.agentId, identity.sessionId],
+        `SELECT goal_outcome FROM lingxios.agent_work_items work WHERE ${resultReadScope}`,
+        resultReadParams(identity),
       )
       return (rows[0]?.['goal_outcome'] as GoalOutcome | undefined) ?? null
     },
@@ -728,9 +734,9 @@ export async function createLingxiOS(options: LingxiOSOptions) {
       const { rows } = await options.database.query(`SELECT event.* FROM lingxios.agent_run_events event
         JOIN lingxios.agent_work_items work ON work.id=event.run_id
           AND work.tenant_id=event.tenant_id AND work.agent_id=event.agent_id
-        WHERE work.id=$1 AND work.tenant_id=$2 AND work.agent_id=$3 AND work.session_id=$4
-          AND event.visibility='user' AND event.seq>$5 ORDER BY event.seq LIMIT 100`,
-      [identity.runId, identity.tenantId, identity.agentId, identity.sessionId, afterSeq])
+        WHERE ${resultReadScope}
+          AND event.visibility='user' AND event.seq>$7 ORDER BY event.seq LIMIT 100`,
+      [...resultReadParams(identity), afterSeq])
       const events = rows.map(row => ({ runId: String(row['run_id']), seq: Number(row['seq']), kind: String(row['kind']),
         stage: row['stage'] as RunEvent['stage'], visibility: 'user' as const, data: row['data'] as Record<string, unknown> }))
       return { events, nextSeq: events.at(-1)?.seq ?? afterSeq }
@@ -744,8 +750,8 @@ export async function createLingxiOS(options: LingxiOSOptions) {
         COALESCE(SUM(calls.input_tokens),0) AS input_tokens,COALESCE(SUM(calls.output_tokens),0) AS output_tokens,
         COALESCE(SUM(COALESCE(calls.cost_micros,calls.reserved_cost_micros)),0) AS cost_micros
         FROM lingxios.agent_work_items work LEFT JOIN lingxios.agent_model_budget_calls calls ON calls.work_id=work.id
-        WHERE work.id=$1 AND work.tenant_id=$2 AND work.agent_id=$3 AND work.session_id=$4 GROUP BY work.id`,
-        [identity.runId,identity.tenantId,identity.agentId,identity.sessionId])
+        WHERE ${resultReadScope} GROUP BY work.id`,
+        resultReadParams(identity))
       const row = rows[0]
       return row ? { lastSeq: Number(row['last_seq']), calls: Number(row['calls']), pendingCalls: Number(row['pending_calls']),
         estimatedCalls: Number(row['estimated_calls']), inputTokens: Number(row['input_tokens']), outputTokens: Number(row['output_tokens']), costMicros: Number(row['cost_micros']) } : null
@@ -757,8 +763,8 @@ export async function createLingxiOS(options: LingxiOSOptions) {
            WHEN outbox.failed_at IS NOT NULL THEN 'failed' WHEN outbox.delivered_at IS NULL THEN 'pending' ELSE 'delivered' END AS state
          FROM lingxios.agent_work_items work
          LEFT JOIN lingxios.agent_delivery_outbox outbox ON outbox.result_id=work.result_id
-         WHERE work.id=$1 AND work.tenant_id=$2 AND work.agent_id=$3 AND work.session_id=$4 AND work.result_id IS NOT NULL`,
-        [identity.runId, identity.tenantId, identity.agentId, identity.sessionId])
+         WHERE ${resultReadScope} AND work.result_id IS NOT NULL`,
+        resultReadParams(identity))
       return rows[0]?.['state'] as 'pending' | 'delivered' | 'failed' | 'not_observed' | undefined ?? null
     },
     retryDelivery: (identity: RunIdentity, channel: 'message' | 'events' | 'usage' = 'message') => retryDelivery(options.database,identity,channel),

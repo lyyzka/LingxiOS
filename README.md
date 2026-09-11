@@ -7,7 +7,7 @@ The package has four public entries: `@lyyzka/lingxios`, `@lyyzka/lingxios/worke
 ## Install
 
 ```sh
-npm install @lyyzka/lingxios@3.2.3
+npm install @lyyzka/lingxios@3.2.4
 ```
 
 Configure the GitHub Packages registry for the `@lyyzka` scope before installing:
@@ -74,4 +74,4 @@ Production Python execution requires OS isolation. The packaged Worker defaults 
 
 See [runtime and deployment details](docs/packaged-runtime.md), [Harness semantics](docs/harness-v3.md), and [production recovery](deploy/README.md).
 
-Optional `control.memory` provides scoped Markdown documents, always-loaded core memory, Chinese/English PostgreSQL search, committed history, versioned edits, background reflection, diagnostics and rollback. Version 3.2.3 requires schema 10, the memory-capture table, and protocol 9. Schema-9 installations apply `packageResources().migration010`, then `migration011` and `migration012` (schema-10 installations need the latter two); existing memory and business records remain intact. IM conversation policy, multi-Agent reply slots, durable DAGs and field-versioned shared state are available through the [IM collaboration API](docs/im-collaboration.md). See the [memory configuration and cutover procedure](docs/packaged-runtime.md#cognitive-memory).
+Optional `control.memory` provides scoped Markdown documents, always-loaded core memory, Chinese/English PostgreSQL search, committed history, versioned edits, background reflection, diagnostics and rollback. Version 3.2.4 requires schema 10, the memory-capture table, and protocol 9. Schema-9 installations apply `packageResources().migration010`, then `migration011` and `migration012` (schema-10 installations need the latter two); existing memory and business records remain intact. IM conversation policy, multi-Agent reply slots, durable DAGs and field-versioned shared state are available through the [IM collaboration API](docs/im-collaboration.md). See the [memory configuration and cutover procedure](docs/packaged-runtime.md#cognitive-memory).

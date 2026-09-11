@@ -3,7 +3,7 @@ import { it } from 'node:test'
 import { executeRequest, gradeResources } from '../src/eval/index.js'
 import { readFile } from 'node:fs/promises'
 import { PGlite } from '@electric-sql/pglite'
-import { createLingxiOS } from '../src/index.js'
+import { createLingxiOS, type MessageIdentity } from '../src/index.js'
 import { createWorker } from '../src/worker/index.js'
 import type { SqlPool } from '../src/control-plane/pg-store.js'
 
@@ -34,6 +34,19 @@ it('observes committed authenticated evaluation results with and without a threa
       assert.equal(result.externalDelivery, 'not_observed')
       assert.deepEqual(await app.readMessage(identity), result.message)
       assert.deepEqual(await app.readOutcome(identity), result.outcome)
+      const readResults = async (actor: MessageIdentity) => Promise.all([
+        app.readMessage(actor), app.readOutcome(actor), app.readEvents(actor, 1), app.readUsage(actor), app.readDelivery(actor),
+      ])
+      const visible = await readResults(identity)
+      assert.ok(visible[2].events.length > 0)
+      assert.ok(visible[3]!.calls > 0)
+      const { principalId: _principal, ...anonymous } = identity
+      const { threadId: _thread, ...unthreaded } = identity
+      for (const actor of [anonymous, { ...identity, principalId: 'other' }, { ...identity, threadId: 'other' },
+        ...identity.threadId ? [unthreaded] : []]) {
+        assert.deepEqual(await readResults(actor), [null, null, { events: [], nextSeq: 1 }, null, null])
+      }
+      if (!identity.threadId) assert.deepEqual(await readResults(unthreaded), visible)
       assert.equal(await app.readRun({ ...identity, principalId: 'other' }), null)
       assert.equal(await app.readRun({ ...identity, threadId: 'other' }), null)
     }
