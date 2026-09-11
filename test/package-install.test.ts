@@ -109,7 +109,7 @@ for (const operation of [application.conversations.ingest, application.conversat
 const localWorker = createWorker({ controlPlane: application, model: { id: 'fixture', apiKey: 'fixture', baseUrl: 'http://127.0.0.1:' + modelServer.address().port },
   kernel: { homesRoot: join(process.cwd(), 'app-homes') } })
 try {
-  const identity = { runId: 'packaged-work', tenantId: 'tenant', agentId: 'agent', sessionId: 'session' }
+  const identity = { runId: 'packaged-work', tenantId: 'tenant', agentId: 'agent', sessionId: 'session', principalId: 'user' }
   await application.enqueue({ ...identity, id: identity.runId, principalId: 'user', text: 'Calculate six times seven using Python.' })
   assert.equal(application.runNext, undefined)
   assert.equal(await localWorker.runNext(), true)

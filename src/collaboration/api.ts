@@ -17,7 +17,7 @@ async function parentWork(database: SqlQueryable, identity: RunIdentity, write =
   return { work, version }
 }
 
-/** Preserve legacy trusted reads, but require an authenticated reader for IM content. */
+/** IM audience authorization; ordinary reads enforce principal/thread in their SQL predicates. */
 export async function authorizeRunRead(database: SqlQueryable, identity: { runId: string; tenantId: string; agentId: string; sessionId: string; principalId?: string; threadId?: string }, operation: 'read' | 'execute' = 'read') {
   const { rows } = await database.query(`SELECT * FROM lingxios.agent_work_items WHERE id=$1 AND tenant_id=$2 AND agent_id=$3 AND session_id=$4`,
     [identity.runId, identity.tenantId, identity.agentId, identity.sessionId])

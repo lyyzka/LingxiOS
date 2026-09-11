@@ -98,6 +98,35 @@ it('binds IM ownership, audiences, targeted reply slots, causal identities and e
   } finally { await f.close() }
 })
 
+it('keeps public IM result reads bound to the frozen audience and exact thread', async () => {
+  const f = await setup()
+  try {
+    await f.control.conversations.registerThread({ tenantId: 'tenant', conversationId: 'room', threadId: 't', policyVersion: 1 })
+    const readers = [f.control.readMessage, f.control.readOutcome, f.control.readEvents, f.control.readUsage, f.control.readDelivery]
+    for (const privateAudience of [false, true]) {
+      const run = (await f.control.conversations.ingest(message(`result-${privateAudience}`, { threadId: 't',
+        ...privateAudience ? { audience: { visibility: 'participants', participantIds: ['u', 'lead'] } } : {} }))).runs[0]!
+      await f.commit((await f.host.claimWork())!, 'Verified answer.')
+      const { principalId: _principal, ...anonymous } = run
+      const { threadId: _thread, ...unthreaded } = run
+      for (const read of readers) {
+        const visible = await read(run)
+        assert.ok(visible)
+        if (privateAudience) await assert.rejects(read({ ...run, principalId: 'v' }), /audience/)
+        else assert.deepEqual(await read({ ...run, principalId: 'v' }), visible)
+        await assert.rejects(read(anonymous), /authenticated/)
+        await assert.rejects(read(unthreaded), /exact thread/)
+        await assert.rejects(read({ ...run, threadId: 'wrong' }), /exact thread/)
+      }
+    }
+    const revoked = structuredClone(policy); revoked.version = 2; revoked.participants[1]!.capabilities = []
+    const run = (await f.control.conversations.ingest(message('revoked-result'))).runs[0]!
+    await f.commit((await f.host.claimWork())!, 'Verified answer.')
+    await f.control.conversations.sync(revoked)
+    for (const read of readers) await assert.rejects(read({ ...run, principalId: 'v' }), /capability/)
+  } finally { await f.close() }
+})
+
 it('merges independent state fields, preserves tombstone versions and audits deduplicated conflicts', async () => {
   const f = await setup(), scope = { tenantId: 'tenant', conversationId: 'room', stateId: 'canvas', principalId: 'u' }
   try {

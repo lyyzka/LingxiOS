@@ -1,6 +1,6 @@
 # 性能优化实施与验证
 
-对应《LingxiOS_v3.1.0_性能优化简案》和《LingxiOS_async_blocking_audit》；当前版本 **3.2.3 / schema 10 / control-plane protocol 9**。框架回归、受控基准和产品端到端验收是不同的证据，不能互相替代。
+对应《LingxiOS_v3.1.0_性能优化简案》和《LingxiOS_async_blocking_audit》；当前版本 **3.2.4 / schema 10 / control-plane protocol 9**。框架回归、受控基准和产品端到端验收是不同的证据，不能互相替代。
 
 ## 实现与边界
 
@@ -49,13 +49,13 @@ HTTP 路由须从认证上下文构造完整 identity，再返回 `control.strea
 
 前端用 `@lyyzka/lingxios/ui` 的 `createRunView/consumeRunStreamEvent` 消费 `state/event/preview/reset`；`draft` 明确标草稿，只有 `message` 是提交结果。waiting 不是终态；真正终态再关闭 EventSource。重连读取持久事件/当前快照，临时草稿不逐 token 持久化。输出按文本转义。
 
-**消费端升级不是 SDK 提交能替代的工作。** 本地 `E:/lyyzka/LingxiLoop` 根目录和 server 仍声明 `lingxios@2.1.0`、导入旧 `lingxios`，delivery 仍走 `model.delta → assistant-stream/Redis`。该独立仓库未在本 SDK 提交中修改或部署。产品须更换为精确版本 `@lyyzka/lingxios@3.2.3`、升级 Worker/迁移/接入 API，配置 allowDraft 与独立 preview，再验收实际 Redis/IM/UI、代理与身份边界；不能把内部推理 delta 接成公开正文。
+**消费端升级不是 SDK 提交能替代的工作。** 本地 `E:/lyyzka/LingxiLoop` 根目录和 server 仍声明 `lingxios@2.1.0`、导入旧 `lingxios`，delivery 仍走 `model.delta → assistant-stream/Redis`。该独立仓库未在本 SDK 提交中修改或部署。产品须更换为精确版本 `@lyyzka/lingxios@3.2.4`、升级 Worker/迁移/接入 API，配置 allowDraft 与独立 preview，再验收实际 Redis/IM/UI、代理与身份边界；不能把内部推理 delta 接成公开正文。
 
 ## 数据库升级与回退
 
 新安装只应用 `packageResources().schema`。已有 schema 10 必须在产品迁移锁下按序应用 **migration011 → migration012**；schema 9 先应用 migration010。012 添加 durable memory-capture 表并扩展 cancel/preempt 通知，保持 schema marker 10；启动额外检查新表，因此不能只看旧的 schema marker。迁移不自动执行、不删除业务/记忆数据。
 
-先暂停 ingress、排空并停止旧 Worker、保留数据库及 artifact 备份；迁移后同时部署匹配的 3.2.3 host/Worker，readiness 后恢复。**protocol 9 是领取/恢复分阶段合约**；新宿主以 409/protocol_mismatch 拒绝旧 Worker，不能依赖混版滚动运行。自定义 HostPort 应按 `claim → 注册/心跳 → recoverWork → 执行` 接入，不要重新把恢复放回 claim。
+先暂停 ingress、排空并停止旧 Worker、保留数据库及 artifact 备份；迁移后同时部署匹配的 3.2.4 host/Worker，readiness 后恢复。**protocol 9 是领取/恢复分阶段合约**；新宿主以 409/protocol_mismatch 拒绝旧 Worker，不能依赖混版滚动运行。自定义 HostPort 应按 `claim → 注册/心跳 → recoverWork → 执行` 接入，不要重新把恢复放回 claim。
 
 LISTEN 占传入 pool 的一个专用连接，失联后丢弃该连接；总上限仍由同一个产品 pool 控制。为 listener、前台事务及后台查询预留容量，依据连接等待指标调 outbox 并发。事务代理/单连接适配器设置 notifications:false。外部事务通知提交后才生效，丢失时由周期扫描修复。
 
@@ -76,7 +76,7 @@ LISTEN 占传入 pool 的一个专用连接，失联后丢弃该连接；总上�
 
 `npm run bench:performance` 使用同一 OpenAI-compatible SSE stub、真实 worker HTTP/浏览器 HTTP 和 UI reducer，对比同版本功能开关；默认每场景每配置 20 次和 8 请求积压。不是历史版本或真实模型 A/B。
 
-[performance-benchmark.json](performance-benchmark.json) 是 **修复前 v3.2.1 的历史基准**，不是 3.2.3 的复测结果。其 2026-09-08 本机 p50（关闭 → 开启）：短对话正文 TTFT 772→110ms，多 hop 1533→355ms，附件 773→380ms，长历史 1530→137ms；只说明当时受控环境，不可当本提交或生产 SLO 的证明。
+[performance-benchmark.json](performance-benchmark.json) 是 **修复前 v3.2.1 的历史基准**，不是 3.2.4 的复测结果。其 2026-09-08 本机 p50（关闭 → 开启）：短对话正文 TTFT 772→110ms，多 hop 1533→355ms，附件 773→380ms，长历史 1530→137ms；只说明当时受控环境，不可当本提交或生产 SLO 的证明。
 
 跨进程计时须校准；SQL 发送次数不等于 WAL/磁盘写入；stub token 不等于真实费用；PGlite/WASM 进程内存不等于生产峰值。真实环境必须补测 PostgreSQL 跨进程通知/重连、后台满载、父任务接续、慢收方、取消实际释放、代理缓冲、浏览器绘制、生产 EXPLAIN 和相同模型/预算的质量 A/B。候选 provider 已公开正文→UI p95 ≤100/200ms、入队→领取 p95 ≤100ms 均仍是验收目标，不是保证。
 

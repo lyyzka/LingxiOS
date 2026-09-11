@@ -40,7 +40,7 @@ it('asks through real Python, exposes the question and continues after a human r
   const app = await createLingxiOS({ database: pool })
   const worker = createWorker({ controlPlane: app, model: { id: 'test', apiKey: 'test', baseUrl: `http://127.0.0.1:${address.port}` } })
   try {
-    const identity = { runId: 'ask-work', tenantId: 't', agentId: 'a', sessionId: 's' }
+    const identity = { runId: 'ask-work', tenantId: 't', agentId: 'a', sessionId: 's', principalId: 'u' }
     const attachment = { id: 'guide', sourceVersion: 'sha256:content-version', name: 'guide.txt', mimeType: 'text/plain', size: 17, text: 'Prefer quiet parks' }
     await app.enqueue({ ...identity, id: identity.runId, principalId: 'u', text: 'Plan a visit in my city.', attachments: [attachment] })
     attachment.text = 'Changed after submission'

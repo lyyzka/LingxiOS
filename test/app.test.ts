@@ -112,7 +112,7 @@ it('assembles the public app through HTTP model and Python, persisting results a
     await assert.rejects(fetch(`http://127.0.0.1:${closedPort}/healthz`))
     app = await createLingxiOS(options)
     worker = createWorker({ ...options, controlPlane: app })
-    const identity = { runId: 'request', tenantId: 'tenant', agentId: 'assistant', sessionId: 'session' }
+    const identity = { runId: 'request', tenantId: 'tenant', agentId: 'assistant', sessionId: 'session', principalId: 'user' }
     const evaluation = await executeRequest(app, worker, { id: identity.runId, ...identity, principalId: 'user', text: 'Calculate 2 + 2 using Python.' })
     assert.equal(evaluation.mode, 'runtime_execution')
     assert.equal(evaluation.workDequeued, true)
